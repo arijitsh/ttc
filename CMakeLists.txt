@@ -91,6 +91,16 @@ if(NOT CMS_LIB)
   message(STATUS "CryptoMiniSat library not found; continuing without explicit linkage")
   set(CMS_LIB "")
 endif()
+
+# cddlib (double precision) for polytope canonicalization in the LRA volume path.
+find_path(CDD_INCLUDE_DIR cddlib/cdd.h)
+find_library(CDD_LIB NAMES cdd)
+if(NOT CDD_INCLUDE_DIR OR NOT CDD_LIB)
+  message(FATAL_ERROR "cddlib not found. Install libcdd-dev (provides cddlib/cdd.h and libcdd).")
+endif()
+message(STATUS "cddlib include: ${CDD_INCLUDE_DIR}")
+message(STATUS "cddlib library: ${CDD_LIB}")
+include_directories(${CDD_INCLUDE_DIR})
 find_library(COLAMD_LIB colamd)
 if(NOT COLAMD_LIB)
   message(WARNING "COLAMD library not found; continuing without explicit linkage")
@@ -257,6 +267,7 @@ target_link_libraries(ttc
     ${PICPOLY_LIB}
     ${CADICAL_LIB}
     ${CMS_LIB}
+    ${CDD_LIB}
     ${Boost_LIBRARIES}
     ${STP_LIB}
     ${LPSOLVE_LIB}

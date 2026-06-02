@@ -25,6 +25,15 @@
 #include "volume/sampling_policies.hpp"
 #include "volume/volume_cooling_gaussians.hpp"
 
+// cddlib (double precision) for polytope canonicalization, mirroring the
+// Python prototype's use of pycddlib (src/polytope_operations.py::canonicalize).
+#define set_int cdd_set_int
+extern "C" {
+#include <cddlib/setoper.h>
+#include <cddlib/cdd.h>
+}
+#undef set_int
+
 namespace ttc
 {
 namespace
@@ -432,6 +441,89 @@ PolytopeMatrices buildPolytopeMatrices(const Polytope& poly,
   return matrices;
 }
 
+// Canonicalizes the polytope {x : A x <= b} with cddlib, mirroring the Python
+// prototype (src/polytope_operations.py::canonicalize -> cdd.matrix_canonicalize).
+// Redundant inequalities are removed in place.  Returns false when the polytope
+// is empty or has implicit equalities (i.e. it is lower-dimensional, so its
+// full-dimensional volume is zero) -- the same cases where the Python code
+// returns -1 / skips the polytope.  On any cddlib error the matrices are left
+// unchanged and true is returned (fall back to the raw representation).
+bool canonicalizePolytope(Eigen::MatrixXd& A, Eigen::VectorXd& b)
+{
+  const long m = A.rows();
+  const long n = A.cols();
+  if (m == 0)
+  {
+    return true;
+  }
+
+  dd_set_global_constants();
+
+  // cddlib H-representation: row (g_0, g_1, ..., g_n) means
+  // g_0 + g_1 x_1 + ... + g_n x_n >= 0.  For A x <= b that is b - A x >= 0,
+  // so the row is (b_i, -A_i1, ..., -A_in).
+  dd_MatrixPtr M = dd_CreateMatrix(m, n + 1);
+  M->representation = dd_Inequality;
+  for (long i = 0; i < m; ++i)
+  {
+    dd_set_d(M->matrix[i][0], b(i));
+    for (long j = 0; j < n; ++j)
+    {
+      dd_set_d(M->matrix[i][j + 1], -A(i, j));
+    }
+  }
+
+  dd_rowset implLin = nullptr;
+  dd_rowset redset = nullptr;
+  dd_rowindex newpos = nullptr;
+  dd_ErrorType err = dd_NoError;
+  dd_MatrixCanonicalize(&M, &implLin, &redset, &newpos, &err);
+
+  bool keep = true;
+  bool replace = false;
+  Eigen::MatrixXd newA;
+  Eigen::VectorXd newB;
+
+  if (err != dd_NoError || M == nullptr)
+  {
+    // Leave the raw matrices untouched.
+    keep = true;
+  }
+  else if (set_card(M->linset) > 0)
+  {
+    // Implicit equalities => measure-zero in the full dimension.
+    keep = false;
+  }
+  else
+  {
+    long rows = M->rowsize;
+    newA = Eigen::MatrixXd(rows, n);
+    newB = Eigen::VectorXd(rows);
+    for (long i = 0; i < rows; ++i)
+    {
+      newB(i) = dd_get_d(M->matrix[i][0]);
+      for (long j = 0; j < n; ++j)
+      {
+        newA(i, j) = -dd_get_d(M->matrix[i][j + 1]);
+      }
+    }
+    replace = true;
+  }
+
+  if (implLin != nullptr) set_free(implLin);
+  if (redset != nullptr) set_free(redset);
+  if (newpos != nullptr) free(newpos);
+  if (M != nullptr) dd_FreeMatrix(M);
+  dd_free_global_constants();
+
+  if (replace)
+  {
+    A = std::move(newA);
+    b = std::move(newB);
+  }
+  return keep;
+}
+
 // Stores the running set of sample points "X" used by the union-volume
 // (Karp-Luby style) estimator.  Mirrors the behaviour of the reference Python
 // implementation in src/cube_processor_nondis.py.
@@ -579,6 +671,14 @@ VolumeComputationResult computeLraVolume(
       ++numZeroVolume;
       continue;
     }
+    // Canonicalize (remove redundant constraints, detect equalities) with
+    // cddlib, exactly as the Python prototype does before volume/sampling.
+    long rawFacets = matrices.A.rows();
+    if (!canonicalizePolytope(matrices.A, matrices.b))
+    {
+      ++numZeroVolume;
+      continue;
+    }
     HPolytope hpoly(static_cast<unsigned>(dimension), matrices.A, matrices.b);
     if (hpoly.ComputeInnerBall().second <= 0.0)
     {
@@ -591,8 +691,8 @@ VolumeComputationResult computeLraVolume(
     double volumeComputeElapsed = Log.elapsed() - volumeComputeStart;
     totalVolumeTime += volumeComputeElapsed;
     Log(2) << "polytope volume " << volume << " (" << matrices.A.rows()
-           << " facets, dim " << dimension << ") in " << volumeComputeElapsed
-           << "s" << std::endl;
+           << " facets, was " << rawFacets << ", dim " << dimension << ") in "
+           << volumeComputeElapsed << "s" << std::endl;
     if (!std::isfinite(volume) || volume <= 0.0)
     {
       ++numZeroVolume;
