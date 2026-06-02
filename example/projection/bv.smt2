@@ -1,0 +1,6 @@
+(set-logic QF_BV)
+(declare-fun proj_x () (_ BitVec 4))
+(declare-fun y () (_ BitVec 4))
+(assert (= y #b0011))
+(assert (= (bvand proj_x y) #b0001))
+(check-sat)
