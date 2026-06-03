@@ -289,8 +289,9 @@ std::uint64_t Pact::count()
   double lastProgress = -progress_interval;
   std::size_t currentRound = 0;
 
-  // Emits one progress row per saturating-count evaluation, throttled by
-  // progress_interval. `nextHash` is where the galloping search will jump next.
+  // Emits one row for every saturating-count evaluation (one per hash count
+  // tried by the galloping search). `nextHash` is where the search will jump
+  // next.
   auto report = [&](std::size_t hashCount,
                     const std::optional<std::size_t>& sols,
                     std::int64_t nextHash) {
@@ -299,10 +300,6 @@ std::uint64_t Pact::count()
       return;
     }
     double elapsed = Log.elapsed() - startTime;
-    if (elapsed - lastProgress < progress_interval)
-    {
-      return;
-    }
     lastProgress = elapsed;
     std::ostringstream countStream;
     if (sols.has_value())
@@ -317,8 +314,8 @@ std::uint64_t Pact::count()
     line << std::fixed << std::setprecision(3);
     line << "c " << std::setw(8) << elapsed;
     line << "  " << std::setw(6) << currentRound;
-    line << "  " << std::setw(8) << hashCount;
-    line << "  " << std::setw(16) << countStream.str();
+    line << "  " << std::setw(6) << hashCount;
+    line << "  " << std::setw(10) << countStream.str();
     line << "  " << std::setw(9) << nextHash;
     std::cout << line.str() << std::endl;
   };
@@ -373,8 +370,8 @@ std::uint64_t Pact::count()
       line << std::fixed << std::setprecision(3);
       line << "c " << std::setw(8) << elapsed;
       line << "  " << std::setw(6) << currentRound;
-      line << "  " << std::setw(8) << m.hashCount;
-      line << "  " << std::setw(16) << m.cellCount;
+      line << "  " << std::setw(6) << m.hashCount;
+      line << "  " << std::setw(10) << m.cellCount;
       line << "  " << std::setw(9) << "winner";
       line << "  " << std::setw(16) << approx;
       std::cout << line.str() << std::endl;
@@ -457,6 +454,10 @@ Pact::MeasurementResult Pact::oneMeasurement(
     std::vector<HashConstraint> active = activeHashes(hashCnt);
     Trace("pact") << "[pact] Evaluating hash count " << hashCnt << std::endl;
     std::optional<std::size_t> attempt = d_counter.count(active, threshold);
+    Trace("pact") << "[pact]   level " << hashCnt << " -> "
+        << (attempt.has_value() ? std::to_string(*attempt)
+                                : std::string(">=threshold"))
+        << std::endl;
     const bool below = attempt.has_value();
     const std::int64_t numSols = below
                                      ? static_cast<std::int64_t>(*attempt)

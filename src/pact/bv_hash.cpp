@@ -2,10 +2,8 @@
 
 #include "features.hpp"
 
-#include <algorithm>
 #include <cstdint>
 #include <random>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -35,57 +33,59 @@ std::optional<XorClause> BvHash::randomClause(std::mt19937& rng) const
 
   auto& tm = ttc::getTermBuilder(d_solver);
 
-  std::size_t maxBits = std::min<std::size_t>(d_totalBits, static_cast<std::size_t>(4));
-  std::uniform_int_distribution<std::size_t> countDist(1, maxBits);
-  std::size_t targetCount = countDist(rng);
-
-  std::vector<cvc5::Term> bits;
-  bits.reserve(targetCount);
-  std::unordered_set<std::uint64_t> seen;
-
-  std::uniform_int_distribution<std::size_t> varDist(0, d_vars.size() - 1);
-
-  auto encode = [](std::size_t varIndex, std::size_t bitIndex) {
-    return (static_cast<std::uint64_t>(varIndex) << 32)
-           | static_cast<std::uint64_t>(bitIndex);
-  };
-
-  std::size_t attempts = 0;
-  while (bits.size() < targetCount && attempts < targetCount * 16)
-  {
-    ++attempts;
-    std::size_t varIdx = varDist(rng);
-    const cvc5::Term& var = d_vars[varIdx];
-    std::size_t width = var.getSort().getBitVectorSize();
-    if (width == 0)
-    {
-      continue;
-    }
-    std::uniform_int_distribution<std::size_t> bitDist(0, width - 1);
-    std::size_t bitIndex = bitDist(rng);
-    std::uint64_t key = encode(varIdx, bitIndex);
-    if (!seen.insert(key).second)
-    {
-      continue;
-    }
+  // A proper pairwise-independent hash includes each projection bit in the
+  // parity independently with probability 1/2 (ApproxMC-style XOR hashing).
+  // Sampling only a handful of bits (as an earlier version did) yields
+  // degenerate hashes for formulas with few wide projection variables: once a
+  // few XORs are added the surviving models become correlated on those few
+  // bits, so the next low-bit parity either keeps every model or kills every
+  // model instead of roughly halving the count.
+  auto makeBit = [&](const cvc5::Term& var, std::size_t bitIndex) {
     std::vector<uint32_t> params = {static_cast<uint32_t>(bitIndex),
                                     static_cast<uint32_t>(bitIndex)};
     cvc5::Op extract = tm.mkOp(cvc5::Kind::BITVECTOR_EXTRACT, params);
-    bits.push_back(tm.mkTerm(extract, {var}));
+    return tm.mkTerm(extract, {var});
+  };
+
+  std::vector<cvc5::Term> bits;
+  bits.reserve(d_totalBits);
+  std::bernoulli_distribution coin(0.5);
+  for (const cvc5::Term& var : d_vars)
+  {
+    if (!var.getSort().isBitVector())
+    {
+      continue;
+    }
+    std::size_t width = var.getSort().getBitVectorSize();
+    for (std::size_t b = 0; b < width; ++b)
+    {
+      if (coin(rng))
+      {
+        bits.push_back(makeBit(var, b));
+      }
+    }
   }
 
+  // The coin flips can leave the parity empty; fall back to a single random bit
+  // so the hash still constrains the space.
   if (bits.empty())
   {
-    const cvc5::Term& var = d_vars.front();
-    std::size_t width = var.getSort().getBitVectorSize();
-    if (width == 0)
+    std::uniform_int_distribution<std::size_t> varDist(0, d_vars.size() - 1);
+    while (bits.empty())
     {
-      return std::nullopt;
+      const cvc5::Term& var = d_vars[varDist(rng)];
+      if (!var.getSort().isBitVector())
+      {
+        continue;
+      }
+      std::size_t width = var.getSort().getBitVectorSize();
+      if (width == 0)
+      {
+        continue;
+      }
+      std::uniform_int_distribution<std::size_t> bitDist(0, width - 1);
+      bits.push_back(makeBit(var, bitDist(rng)));
     }
-    std::vector<uint32_t> params = {static_cast<uint32_t>(width - 1),
-                                    static_cast<uint32_t>(width - 1)};
-    cvc5::Op extract = tm.mkOp(cvc5::Kind::BITVECTOR_EXTRACT, params);
-    bits.push_back(tm.mkTerm(extract, {var}));
   }
 
   cvc5::Term parity = bits.size() == 1 ? bits.front() : ttc::mkBvXor(tm, bits);

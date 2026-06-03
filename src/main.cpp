@@ -910,8 +910,18 @@ int main(int argc, char *argv[]) {
     std::cout << "c" << std::endl;
 
     print_section("approximate counting");
-    std::cout << "c seconds   round   #hashes   saturatingcount   nexthash   count"
-              << std::endl;
+    // Column widths must match the data rows emitted by Pact::count so the
+    // headings line up over their values.
+    {
+      std::ostringstream hdr;
+      hdr << "c " << std::setw(8) << "sec";
+      hdr << "  " << std::setw(6) << "round";
+      hdr << "  " << std::setw(6) << "hashes";
+      hdr << "  " << std::setw(10) << "saturating";
+      hdr << "  " << std::setw(9) << "nexthash";
+      hdr << "  " << std::setw(16) << "count";
+      std::cout << hdr.str() << std::endl;
+    }
     Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact);
     double countStart = Log.elapsed();
     std::uint64_t res = counter.count();

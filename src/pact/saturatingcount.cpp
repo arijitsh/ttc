@@ -78,11 +78,6 @@ std::optional<std::size_t> SaturatingCounter::count(
       d_projectionVars->cend(),
       [](const cvc5::Term& term) { return term.getSort().isBoolean(); });
   auto& tm = ttc::getTermBuilder(d_solver);
-  if (std::getenv("TTC_NO_CACHE") != nullptr)
-  {
-    d_cachedConstraints.clear();
-    d_cachedModels.clear();
-  }
   d_solver.push();
   for (const HashConstraint& constraint : additionalConstraints)
   {
