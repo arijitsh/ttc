@@ -207,6 +207,55 @@ Pact::Pact(cvc5::Solver& solver,
   {
     d_maxHashes = 1;
   }
+
+  d_baseAssertions = d_solver.getAssertions();
+}
+
+void Pact::rebuildCountSolver()
+{
+  // Build a fresh solver on the same term manager so the previously asserted
+  // hash terms (and their accumulated bit-blasting in the SAT backend) are
+  // discarded. Reusing one solver makes each round progressively slower.
+  cvc5::TermManager& tm = d_solver.getTermManager();
+  d_countSolver.emplace(tm);
+  cvc5::Solver& cs = *d_countSolver;
+
+  // Mirror the solving-relevant options from the original solver so the count
+  // solver behaves identically (logic, incrementality, model production and the
+  // bit-vector / XOR backend selection set up by main).
+  static constexpr const char* kOptions[] = {
+      "print-success",  "incremental",        "produce-models",
+      "bv-sat-solver",  "bv-to-bool",         "sat-use-native-xor",
+  };
+  for (const char* name : kOptions)
+  {
+    try
+    {
+      cs.setOption(name, d_solver.getOption(name));
+    }
+    catch (const cvc5::CVC5ApiException&)
+    {
+    }
+  }
+  try
+  {
+    std::string logic = d_solver.getLogic();
+    if (!logic.empty())
+    {
+      cs.setLogic(logic);
+    }
+  }
+  catch (const cvc5::CVC5ApiException&)
+  {
+  }
+
+  for (const cvc5::Term& assertion : d_baseAssertions)
+  {
+    cs.assertFormula(assertion);
+  }
+
+  d_counter.setSolver(cs);
+  d_counter.resetCache();
 }
 
 Pact::Parameters Pact::getParameters() const
@@ -323,6 +372,7 @@ std::uint64_t Pact::count()
   // Base count with no hashing. If the formula has fewer than `threshold`
   // models in total the count is exact and we are done -- this mirrors ApproxMC
   // "counting without XORs".
+  rebuildCountSolver();
   std::vector<HashConstraint> empty;
   std::optional<std::size_t> base = d_counter.count(empty, params.threshold);
   report(0, base, 0);
@@ -348,6 +398,10 @@ std::uint64_t Pact::count()
     currentRound = iter + 1;
     Trace("pact") << "[pact] Iteration " << (iter + 1) << " of "
         << params.iterations << std::endl;
+
+    // Rebuild the counting solver from scratch so each round solves at a stable
+    // speed instead of degrading as hash clauses accumulate over time.
+    rebuildCountSolver();
 
     // Each measurement draws a fresh pool of random parity hashes; within the
     // measurement the pool is reused so re-evaluating the same hash count is

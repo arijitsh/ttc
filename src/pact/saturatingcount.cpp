@@ -12,7 +12,7 @@
 
 SaturatingCounter::SaturatingCounter(
     cvc5::Solver& solver, const std::vector<cvc5::Term>* projectionVars)
-    : d_solver(solver), d_projectionVars(projectionVars)
+    : d_solver(&solver), d_projectionVars(projectionVars)
 {}
 
 void SaturatingCounter::setProjectionVars(
@@ -24,6 +24,12 @@ void SaturatingCounter::setProjectionVars(
 void SaturatingCounter::resetStatistics()
 {
   d_smtCalls = 0;
+}
+
+void SaturatingCounter::resetCache()
+{
+  d_cachedConstraints.clear();
+  d_cachedModels.clear();
 }
 
 std::optional<std::size_t> SaturatingCounter::count(
@@ -47,14 +53,14 @@ std::optional<std::size_t> SaturatingCounter::count(
   {
     Trace("saturating") << "No projection variables; single satisfiability"
         << " check" << std::endl;
-    d_solver.push();
+    d_solver->push();
     for (const HashConstraint& constraint : additionalConstraints)
     {
-      constraint.assertToSolver(d_solver, d_useNativeXor);
+      constraint.assertToSolver(*d_solver, d_useNativeXor);
     }
     ++d_smtCalls;
-    cvc5::Result res = d_solver.checkSat();
-    d_solver.pop();
+    cvc5::Result res = d_solver->checkSat();
+    d_solver->pop();
     if (res.isSat())
     {
       Trace("saturating") << "Formula is SAT without projections" << std::endl;
@@ -77,11 +83,11 @@ std::optional<std::size_t> SaturatingCounter::count(
       d_projectionVars->cbegin(),
       d_projectionVars->cend(),
       [](const cvc5::Term& term) { return term.getSort().isBoolean(); });
-  auto& tm = ttc::getTermBuilder(d_solver);
-  d_solver.push();
+  auto& tm = ttc::getTermBuilder(*d_solver);
+  d_solver->push();
   for (const HashConstraint& constraint : additionalConstraints)
   {
-    constraint.assertToSolver(d_solver, d_useNativeXor);
+    constraint.assertToSolver(*d_solver, d_useNativeXor);
   }
 
   std::optional<std::size_t> result;
@@ -187,16 +193,16 @@ std::optional<std::size_t> SaturatingCounter::count(
       survivors.reserve(d_cachedModels.size());
       for (const auto& model : d_cachedModels)
       {
-        d_solver.push();
+        d_solver->push();
         for (std::size_t i = 0; i < model.size(); ++i)
         {
           cvc5::Term eq = tm.mkTerm(
               cvc5::Kind::EQUAL, {(*d_projectionVars)[i], model[i]});
-          d_solver.assertFormula(eq);
+          d_solver->assertFormula(eq);
         }
         ++d_smtCalls;
-        cvc5::Result res = d_solver.checkSat();
-        d_solver.pop();
+        cvc5::Result res = d_solver->checkSat();
+        d_solver->pop();
         if (!res.isSat())
         {
           continue;
@@ -205,7 +211,7 @@ std::optional<std::size_t> SaturatingCounter::count(
         survivors.push_back(model);
         currentModels.push_back(model);
         cvc5::Term blocking = buildBlocking(model, modelCount);
-        d_solver.assertFormula(blocking);
+        d_solver->assertFormula(blocking);
         if (modelCount >= threshold)
         {
           Trace("saturating") << "Cached models reached threshold "
@@ -223,7 +229,7 @@ std::optional<std::size_t> SaturatingCounter::count(
         ++modelCount;
         currentModels.push_back(model);
         cvc5::Term blocking = buildBlocking(model, modelCount);
-        d_solver.assertFormula(blocking);
+        d_solver->assertFormula(blocking);
         if (modelCount >= threshold)
         {
           Trace("saturating") << "Cached models reached threshold "
@@ -242,7 +248,7 @@ std::optional<std::size_t> SaturatingCounter::count(
       std::size_t callIndex = modelCount + 1;
       Trace("saturating") << "checkSat call " << callIndex << std::endl;
       ++d_smtCalls;
-      cvc5::Result res = d_solver.checkSat();
+      cvc5::Result res = d_solver->checkSat();
       if (res.isUnsat())
       {
         Trace("saturating") << "UNSAT after " << modelCount
@@ -272,15 +278,15 @@ std::optional<std::size_t> SaturatingCounter::count(
       modelValues.reserve(d_projectionVars->size());
       for (const cvc5::Term& var : *d_projectionVars)
       {
-        modelValues.push_back(d_solver.getValue(var));
+        modelValues.push_back(d_solver->getValue(var));
       }
       currentModels.push_back(modelValues);
       cvc5::Term blockingConstraint = buildBlocking(modelValues, modelCount);
-      d_solver.assertFormula(blockingConstraint);
+      d_solver->assertFormula(blockingConstraint);
     }
   }
 
-  d_solver.pop();
+  d_solver->pop();
   d_cachedConstraints.assign(additionalConstraints.begin(),
                              additionalConstraints.end());
   d_cachedModels = currentModels;

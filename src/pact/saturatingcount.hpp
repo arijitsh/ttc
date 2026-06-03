@@ -22,9 +22,17 @@ class SaturatingCounter
 
   void setProjectionVars(const std::vector<cvc5::Term>* projectionVars);
 
+  // Rebind the counter to a different solver instance. Used to swap in a fresh
+  // solver between rounds so accumulated incremental SAT state does not pile up.
+  void setSolver(cvc5::Solver& solver) { d_solver = &solver; }
+
   void setUseNativeXor(bool useNativeXor) { d_useNativeXor = useNativeXor; }
 
   void resetStatistics();
+
+  // Drops the incremental model/constraint cache. Call this after the solver's
+  // assertion stack has been reset out from under the counter.
+  void resetCache();
 
   std::uint64_t getSmtCallCount() const { return d_smtCalls; }
 
@@ -33,7 +41,7 @@ class SaturatingCounter
       std::size_t threshold);
 
  private:
-  cvc5::Solver& d_solver;
+  cvc5::Solver* d_solver;
   const std::vector<cvc5::Term>* d_projectionVars;
   std::vector<HashConstraint> d_cachedConstraints;
   std::vector<std::vector<cvc5::Term>> d_cachedModels;

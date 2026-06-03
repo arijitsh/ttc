@@ -77,5 +77,18 @@ class Pact
   // Upper bound on the number of useful hashes (total projection bits); the
   // galloping search's hiIndex sentinel.
   std::size_t d_maxHashes = 1;
+
+  // The base formula (after any BV-PACT substitution), captured once so we can
+  // rebuild a fresh counting solver between measurements.
+  std::vector<cvc5::Term> d_baseAssertions;
+
+  // A dedicated solver (sharing d_solver's term manager) on which all hashed
+  // counting happens. It is rebuilt from scratch each round: cvc5's incremental
+  // SAT backend accumulates the bit-blasted hash clauses of every round and
+  // never reclaims them across push/pop or resetAssertions, so reusing one
+  // solver makes each successive round dramatically slower. Discarding the
+  // solver per round keeps the per-round cost flat.
+  std::optional<cvc5::Solver> d_countSolver;
+  void rebuildCountSolver();
 };
 
