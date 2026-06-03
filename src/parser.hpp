@@ -62,6 +62,12 @@ public:
         return d_nonProjVars;
     }
     const std::vector<cvc5::Term>& assertions() const { return d_assertions; }
+    // All terms declared in the input (via declare-fun/declare-const),
+    // including variables that never appear in an assertion.
+    const std::vector<cvc5::Term>& declaredVariables() const
+    {
+        return d_declaredVars;
+    }
     const cvc5::Term& formula() const { return d_formula; }
 
     // If all variables are Boolean or bit-vector, check satisfiability with STP.
@@ -82,6 +88,9 @@ private:
 
     // Individual assertions
     std::vector<cvc5::Term> d_assertions;
+
+    // All declared terms (declare-fun/declare-const), even unused ones.
+    std::vector<cvc5::Term> d_declaredVars;
 
     // List of projection variables (Boolean terms starting with "proj").
     std::vector<cvc5::Term> d_projVars;

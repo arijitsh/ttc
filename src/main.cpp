@@ -23,6 +23,7 @@
 #include "parser.hpp"
 #include "profiler.hpp"
 #include "tocnf/tocnf.hpp"
+#include "eager/bvcnf.hpp"
 #if defined(TTC_ENABLE_DDNNF)
 #include "var_order.hpp"
 #endif
@@ -302,6 +303,9 @@ int main(int argc, char *argv[]) {
        "Seed for randomized approximate counting")
       ("tocnf",
        "Convert assertions to CNF")
+      ("bvcnf", po::value<std::string>(),
+       "Eagerly bit-blast a QF_BV formula to a model-preserving CNF, write it "
+       "to the given file, and run ApproxMC to count its bit-vector models")
 #if defined(TTC_ENABLE_DDNNF)
       ("d4,D", "Use D4 for model counting on CNF abstraction")
       ("full-decomp",
@@ -401,6 +405,7 @@ int main(int argc, char *argv[]) {
   bool countUnsatAssignments = vm.count("unsat") > 0 || useUnsatQuant;
   bool requestNativeXor = vm["xor"].as<bool>();
   bool useToCNF = vm.count("tocnf") > 0;
+  bool useBvCnf = vm.count("bvcnf") > 0;
   bool writeFB = vm.count("FB") > 0;
   bool useMono = vm.count("mono") > 0 || vm.count("mono-true") > 0;
   bool monoTrue = vm.count("mono-true") > 0;
@@ -413,7 +418,7 @@ int main(int argc, char *argv[]) {
   bool useD4 = false;
   bool fullDecompose = false;
 #endif
-  if (!ttc::ddnnfEnabled() && !useToCNF)
+  if (!ttc::ddnnfEnabled() && !useToCNF && !useBvCnf)
   {
     useApprox = true;
   }
@@ -623,6 +628,58 @@ int main(int argc, char *argv[]) {
   if (parser.numProjVars() == 0)
   {
     parser.promoteBooleanAndBvToProjection();
+  }
+
+  // Eager bit-blasting BV model counter: write a model-preserving CNF and run
+  // ApproxMC over the bits of the bit-vector variables.
+  if (useBvCnf)
+  {
+    const std::string bvCnfPath = vm["bvcnf"].as<std::string>();
+
+    // Sampling set: every declared bit-vector variable, including those that
+    // do not occur in any assertion (counted as free bits), so the projected
+    // count matches the bit-vector model count of the formula.
+    std::vector<cvc5::Term> bvVars;
+    std::unordered_set<cvc5::Term> seenVars;
+    for (const cvc5::Term& v : parser.declaredVariables())
+    {
+      if (v.getSort().isBitVector() && seenVars.insert(v).second)
+      {
+        bvVars.push_back(v);
+      }
+    }
+
+    try
+    {
+      double bbStart = Log.elapsed();
+      ttc::eager::BvCnfResult cnf = ttc::eager::writeBvCnf(
+          parser.solver(), parser.assertions(), bvVars, bvCnfPath);
+      double bbEnd = Log.elapsed();
+
+      std::cout << "c [ttc->bvcnf] wrote model-preserving CNF to '" << cnf.path
+                << "'" << std::endl;
+      std::cout << "c [ttc->bvcnf] variables: " << cnf.numVars
+                << " clauses: " << cnf.numClauses
+                << " sampling: " << cnf.numSamplingVars << std::endl;
+      std::cout << "c [ttc->bvcnf] bit-blasted in " << std::fixed
+                << std::setprecision(2) << (bbEnd - bbStart) << " seconds"
+                << std::endl;
+
+      std::optional<std::string> count =
+          ttc::eager::runApproxMc(bvCnfPath, approxSeed, verbosity);
+      if (count.has_value())
+      {
+        std::cout << "s mc " << *count << std::endl;
+        return 0;
+      }
+      std::cerr << "Error: ApproxMC did not produce a count" << std::endl;
+      return 1;
+    }
+    catch (const std::exception& ex)
+    {
+      std::cerr << "Error: --bvcnf failed: " << ex.what() << std::endl;
+      return 1;
+    }
   }
 
   bool isLraInput = false;

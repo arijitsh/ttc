@@ -141,6 +141,53 @@ BooleanAbstractionData getBooleanAbstraction(SolverT& solver, const cvc5::Term& 
   return BooleanAbstractionHelper<SolverT>::get(solver, term);
 }
 
+struct BitblastedCnfData
+{
+  std::vector<uint32_t> clauses;          // 0-separated DIMACS literals
+  uint32_t numVars = 0;                   // number of CNF variables
+  std::vector<uint32_t> samplingVars;     // 1-based projection/independent set
+};
+
+template <typename SolverT, typename = void>
+struct BitblastedCnfHelper
+{
+  static BitblastedCnfData get(SolverT&,
+                               const cvc5::Term&,
+                               const std::vector<cvc5::Term>&)
+  {
+    throw std::runtime_error(
+        "cvc5 bit-blasted CNF extraction is not supported in this build");
+  }
+};
+
+template <typename SolverT>
+struct BitblastedCnfHelper<
+    SolverT,
+    std::void_t<decltype(std::declval<SolverT&>().getBitblastedCnf(
+        std::declval<cvc5::Term>(),
+        std::declval<std::vector<cvc5::Term>>()))>>
+{
+  static BitblastedCnfData get(SolverT& solver,
+                               const cvc5::Term& term,
+                               const std::vector<cvc5::Term>& projectionVars)
+  {
+    auto result = solver.getBitblastedCnf(term, projectionVars);
+    BitblastedCnfData data;
+    data.clauses = std::get<0>(result);
+    data.numVars = std::get<1>(result);
+    data.samplingVars = std::get<2>(result);
+    return data;
+  }
+};
+
+template <typename SolverT>
+BitblastedCnfData getBitblastedCnf(SolverT& solver,
+                                   const cvc5::Term& term,
+                                   const std::vector<cvc5::Term>& projectionVars)
+{
+  return BitblastedCnfHelper<SolverT>::get(solver, term, projectionVars);
+}
+
 template <typename SolverT, typename = void>
 struct BooleanAbstractionAigHelper
 {

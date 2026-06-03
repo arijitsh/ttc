@@ -62,6 +62,15 @@ void TTCParser::parseFormula(const std::string &smtFormula) {
     Log(3) << "Commands processed" << std::endl;
     auto assertions = d_solver.getAssertions();
     d_assertions = assertions;
+    d_declaredVars.clear();
+    if (d_parser != nullptr)
+    {
+        cvc5::parser::SymbolManager* sm = d_parser->getSymbolManager();
+        if (sm != nullptr)
+        {
+            d_declaredVars = sm->getDeclaredTerms();
+        }
+    }
     d_projVars.clear();
     d_nonProjVars.clear();
     d_boolVars.clear();
