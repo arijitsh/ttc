@@ -571,8 +571,11 @@ int main(int argc, char *argv[]) {
   Profile.addParse(parseEnd - parseStart);
   Log(3) << "Parsing complete" << std::endl;
 
-  if ((useProjectionBoost || useProjectionEnumerate) &&
-      parser.numProjVars() == 0)
+  // When no explicit projection variables (prefixed "proj_") were declared,
+  // default to projected counting over the Boolean and bit-vector variables of
+  // the formula. This mirrors cvc5's sampling-set behaviour for benchmarks that
+  // mix Booleans/bit-vectors with other theories.
+  if (parser.numProjVars() == 0)
   {
     parser.promoteBooleanAndBvToProjection();
   }
@@ -600,6 +603,14 @@ int main(int argc, char *argv[]) {
     isLraInput = true;
   }
   if (isLraInput && parser.formula().isNull())
+  {
+    isLraInput = false;
+  }
+  // Projection-based counting modes (--PB / --PE) count over the Boolean /
+  // bit-vector support of the formula, not the LRA volume. Even for pure-LRA
+  // logics they must run projected counting (pact) rather than fall into the
+  // volume-computation path below.
+  if (useProjectionBoost || useProjectionEnumerate)
   {
     isLraInput = false;
   }

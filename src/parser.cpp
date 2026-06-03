@@ -72,8 +72,10 @@ void TTCParser::parseFormula(const std::string &smtFormula) {
     if (!assertions.empty())
     {
         auto& tm = ttc::getTermBuilder(d_solver);
-        d_formula = assertions.size() == 1 ? assertions[0] : tm.mkTerm(cvc5::Kind::AND, assertions);
-        d_formula = d_solver.simplify(d_formula);
+        cvc5::Term rawFormula = assertions.size() == 1
+                                    ? assertions[0]
+                                    : tm.mkTerm(cvc5::Kind::AND, assertions);
+        d_formula = d_solver.simplify(rawFormula);
 
         // Count top-level constraints recursively.
         std::function<std::size_t(const cvc5::Term&)> countConstraints = [&](const cvc5::Term& t) {
@@ -132,7 +134,11 @@ void TTCParser::parseFormula(const std::string &smtFormula) {
                 collect(t[i]);
             }
         };
-        collect(d_formula);
+        // Collect projection-variable candidates from the unsimplified formula
+        // so that variables which survive in the asserted constraints but are
+        // rewritten away by simplification (e.g. when the formula reduces to a
+        // tautology over them) are still recognised as part of the support.
+        collect(rawFormula);
     }
 }
 
