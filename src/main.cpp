@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <boost/program_options.hpp>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <optional>
 #include <utility>
@@ -24,6 +26,7 @@
 #include "profiler.hpp"
 #include "tocnf/tocnf.hpp"
 #include "eager/bvcnf.hpp"
+#include "weighted/tounweighted.hpp"
 #if defined(TTC_ENABLE_DDNNF)
 #include "var_order.hpp"
 #endif
@@ -38,6 +41,16 @@ using boost::multiprecision::cpp_int;
 bool g_useNativeXor = false;
 bool g_hasCadicalXorSupport = false;
 bool g_xorTraceEnabled = false;
+
+void printWeightedCount(long double value)
+{
+  std::ios::fmtflags oldFlags = std::cout.flags();
+  std::streamsize oldPrecision = std::cout.precision();
+  std::cout.unsetf(std::ios::floatfield);
+  std::cout << std::setprecision(15) << static_cast<double>(value);
+  std::cout.flags(oldFlags);
+  std::cout.precision(oldPrecision);
+}
 
 void markPactRunningInBanner()
 {
@@ -126,6 +139,214 @@ std::optional<cpp_int> computeTotalAssignments(
     }
   }
   return total;
+}
+
+struct WeightedPbResult
+{
+  long double weightedCount = 0.0L;
+  std::uint64_t unweightedCount = 0;
+  std::uint64_t smtCalls = 0;
+  int originalVars = 0;
+  int originalClauses = 0;
+  int convertedVars = 0;
+  int convertedClauses = 0;
+  int samplingVars = 0;
+  int divisorPower = 0;
+  long double multiplier = 1.0L;
+};
+
+int findOrAddCnfVar(ToCNF::CNFFormula& cnf, const cvc5::Term& term)
+{
+  auto termIt = cnf.termToIdx.find(term);
+  if (termIt != cnf.termToIdx.end())
+  {
+    return termIt->second;
+  }
+
+  auto strIt = cnf.varToIdx.find(term.toString());
+  if (strIt != cnf.varToIdx.end())
+  {
+    cnf.termToIdx.emplace(term, strIt->second);
+    return strIt->second;
+  }
+
+  if (term.hasSymbol())
+  {
+    auto symIt = cnf.varToIdx.find(term.getSymbol());
+    if (symIt != cnf.varToIdx.end())
+    {
+      cnf.termToIdx.emplace(term, symIt->second);
+      return symIt->second;
+    }
+  }
+
+  int id = ++cnf.varCount;
+  if (static_cast<int>(cnf.idxToTerm.size()) <= id)
+  {
+    cnf.idxToTerm.resize(id + 1);
+  }
+  cnf.idxToTerm[id] = term;
+  cnf.termToIdx.emplace(term, id);
+  cnf.varToIdx.emplace(term.toString(), id);
+  if (term.hasSymbol())
+  {
+    cnf.varToIdx.emplace(term.getSymbol(), id);
+  }
+  return id;
+}
+
+void configureWeightedPbSolver(cvc5::Solver& solver,
+                               bool useBvPact,
+                               bool useNativeXor)
+{
+  try { solver.setOption("print-success", "false"); }
+  catch (const cvc5::CVC5ApiException&) {}
+  try { solver.setOption("incremental", "true"); }
+  catch (const cvc5::CVC5ApiException&) {}
+  try { solver.setOption("produce-models", "true"); }
+  catch (const cvc5::CVC5ApiException&) {}
+  try { solver.setOption("produce-learned-literals", "true"); }
+  catch (const cvc5::CVC5ApiException&) {}
+  try { solver.setOption("bv-sat-solver", "cryptominisat"); }
+  catch (const cvc5::CVC5ApiException&) {}
+  if (useBvPact)
+  {
+    try { solver.setOption("bv-to-bool", "false"); }
+    catch (const cvc5::CVC5ApiException&) {}
+  }
+  try { solver.setLogic("QF_BV"); }
+  catch (const cvc5::CVC5ApiException&) {}
+  try { applyNativeXor(solver, useNativeXor); }
+  catch (const cvc5::CVC5ApiException&) {}
+}
+
+void assertCnf(cvc5::Solver& solver,
+               const std::vector<cvc5::Term>& variables,
+               const std::vector<std::vector<int>>& clauses)
+{
+  auto& tm = ttc::getTermBuilder(solver);
+  for (const auto& clause : clauses)
+  {
+    if (clause.empty())
+    {
+      solver.assertFormula(tm.mkBoolean(false));
+      continue;
+    }
+
+    std::vector<cvc5::Term> terms;
+    terms.reserve(clause.size());
+    for (int lit : clause)
+    {
+      int var = std::abs(lit);
+      if (var <= 0 || var >= static_cast<int>(variables.size()))
+      {
+        throw std::runtime_error("CNF literal is outside the variable range");
+      }
+      cvc5::Term term = variables[var];
+      if (lit < 0)
+      {
+        term = tm.mkTerm(cvc5::Kind::NOT, {term});
+      }
+      terms.push_back(term);
+    }
+
+    if (terms.size() == 1)
+    {
+      solver.assertFormula(terms[0]);
+    }
+    else
+    {
+      solver.assertFormula(tm.mkTerm(cvc5::Kind::OR, terms));
+    }
+  }
+}
+
+WeightedPbResult runWeightedProjectionBoost(TTCParser& parser,
+                                            std::uint64_t seed,
+                                            bool useNativeXor,
+                                            bool useBvPact)
+{
+  for (const cvc5::Term& term : parser.projectionVars())
+  {
+    if (!term.getSort().isBoolean())
+    {
+      throw std::runtime_error(
+          "weighted --PB currently supports Boolean projection variables only");
+    }
+  }
+
+  ToCNF cnfBuilder(parser.solver(), parser.assertions());
+  ToCNF::CNFFormula cnf = cnfBuilder.build();
+
+  ttc::weighted::WeightedCnf weighted;
+  weighted.clauses = cnf.clauses;
+  std::unordered_set<int> seenSampling;
+  const auto& weights = parser.literalWeights();
+  for (const cvc5::Term& term : parser.projectionVars())
+  {
+    int id = findOrAddCnfVar(cnf, term);
+    if (seenSampling.insert(id).second)
+    {
+      weighted.samplingVars.push_back(id);
+    }
+
+    TTCParser::LiteralWeight literalWeight;
+    auto weightIt = weights.find(term);
+    if (weightIt != weights.end())
+    {
+      literalWeight = weightIt->second;
+    }
+    weighted.weights.push_back(
+        {id,
+         static_cast<long double>(literalWeight.positive),
+         static_cast<long double>(literalWeight.negative)});
+  }
+  weighted.varCount = cnf.varCount;
+
+  ttc::weighted::ToUnweightedConverter converter;
+  ttc::weighted::UnweightedCnf unweighted = converter.convert(weighted);
+
+  ttc::TermBuilderHelper<cvc5::Solver>::storage_type storage;
+  cvc5::Solver solver = ttc::createSolverWithStorage<cvc5::Solver>(storage);
+  configureWeightedPbSolver(solver, useBvPact, useNativeXor);
+  auto& tm = ttc::getTermBuilder(solver);
+  cvc5::Sort boolSort = tm.getBooleanSort();
+  std::vector<cvc5::Term> cnfVars(unweighted.varCount + 1);
+  for (int i = 1; i <= unweighted.varCount; ++i)
+  {
+    cnfVars[i] = tm.mkConst(boolSort, "__ttc_w2u_" + std::to_string(i));
+  }
+  assertCnf(solver, cnfVars, unweighted.clauses);
+
+  std::vector<cvc5::Term> projectionVars;
+  projectionVars.reserve(unweighted.samplingVars.size());
+  for (int var : unweighted.samplingVars)
+  {
+    if (var <= 0 || var > unweighted.varCount)
+    {
+      throw std::runtime_error("converted sampling variable is out of range");
+    }
+    projectionVars.push_back(cnfVars[var]);
+  }
+
+  Pact counter(solver, projectionVars, seed, useNativeXor, useBvPact);
+  std::uint64_t unweightedCount = counter.count();
+
+  WeightedPbResult result;
+  result.unweightedCount = unweightedCount;
+  result.smtCalls = counter.getSmtCallCount();
+  result.originalVars = unweighted.originalVarCount;
+  result.originalClauses = unweighted.originalClauseCount;
+  result.convertedVars = unweighted.varCount;
+  result.convertedClauses = static_cast<int>(unweighted.clauses.size());
+  result.samplingVars = static_cast<int>(unweighted.samplingVars.size());
+  result.divisorPower = unweighted.divisorPower;
+  result.multiplier = unweighted.multiplier;
+  result.weightedCount =
+      std::ldexp(static_cast<long double>(unweightedCount) *
+                     unweighted.multiplier,
+                 -unweighted.divisorPower);
+  return result;
 }
 
 cpp_int clampNonNegative(cpp_int value)
@@ -621,13 +842,25 @@ int main(int argc, char *argv[]) {
   Profile.addParse(parseEnd - parseStart);
   Log(3) << "Parsing complete" << std::endl;
 
-  // When no explicit projection variables (prefixed "proj_") were declared,
-  // default to projected counting over the Boolean and bit-vector variables of
-  // the formula. This mirrors cvc5's sampling-set behaviour for benchmarks that
-  // mix Booleans/bit-vectors with other theories.
-  if (parser.numProjVars() == 0)
+  // When no projection variables were declared explicitly, default to projected
+  // counting over the Boolean and bit-vector variables of the formula. This
+  // mirrors cvc5's sampling-set behaviour for benchmarks that mix
+  // Booleans/bit-vectors with other theories.
+  if (!parser.hasExplicitProjectionVars() && parser.numProjVars() == 0)
   {
     parser.promoteBooleanAndBvToProjection();
+  }
+  if (parser.hasWeights() && !useProjectionEnumerate && !useProjectionBoost)
+  {
+    std::cerr << "Error: declare-weight is currently supported only with --PE"
+              << " or --PB" << std::endl;
+    return 1;
+  }
+  if (parser.hasWeights() && countUnsatAssignments)
+  {
+    std::cerr << "Error: --unsat is not supported with declare-weight"
+              << std::endl;
+    return 1;
   }
 
   // Eager bit-blasting BV model counter: write a model-preserving CNF and run
@@ -835,8 +1068,18 @@ int main(int argc, char *argv[]) {
     ProjectedEnumerator enumerator(parser.solver(), parser.projectionVars());
     if (verbosity == 0)
     {
-      std::uint64_t res = enumerator.count();
-      std::cout << "s mc " << res << std::endl;
+      if (parser.hasWeights())
+      {
+        long double res = enumerator.countWeighted(parser.literalWeights());
+        std::cout << "s wmc ";
+        printWeightedCount(res);
+        std::cout << std::endl;
+      }
+      else
+      {
+        std::uint64_t res = enumerator.count();
+        std::cout << "s mc " << res << std::endl;
+      }
       return 0;
     }
 
@@ -849,7 +1092,10 @@ int main(int argc, char *argv[]) {
     std::cout << "c" << std::endl;
 
     print_section("options");
-    std::cout << "c counting: projected enumeration" << std::endl;
+    std::cout << "c counting: "
+              << (parser.hasWeights() ? "weighted projected enumeration"
+                                      : "projected enumeration")
+              << std::endl;
     std::cout << "c projection boost: "
               << (useProjectionBoost ? "yes" : "no") << std::endl;
     std::cout << "c xor: " << (g_useNativeXor ? "yes" : "no") << std::endl;
@@ -872,11 +1118,29 @@ int main(int argc, char *argv[]) {
 
     print_section("projected enumeration");
     double countStart = Log.elapsed();
-    std::uint64_t res = enumerator.count();
+    std::uint64_t res = 0;
+    long double weightedRes = 0.0L;
+    if (parser.hasWeights())
+    {
+      weightedRes = enumerator.countWeighted(parser.literalWeights());
+    }
+    else
+    {
+      res = enumerator.count();
+    }
     double countEnd = Log.elapsed();
     Profile.addSearch(countEnd - countStart);
     std::uint64_t smtCalls = enumerator.getSmtCallCount();
-    std::cout << "c enumerated models: " << res << std::endl;
+    if (parser.hasWeights())
+    {
+      std::cout << "c weighted count   : ";
+      printWeightedCount(weightedRes);
+      std::cout << std::endl;
+    }
+    else
+    {
+      std::cout << "c enumerated models: " << res << std::endl;
+    }
     std::cout << "c smt calls       : " << smtCalls << std::endl;
     std::cout << "c elapsed time    : " << std::fixed << std::setprecision(2)
               << (countEnd - countStart) << " seconds" << std::endl;
@@ -885,7 +1149,16 @@ int main(int argc, char *argv[]) {
     std::cout << "c" << std::endl;
 
     print_section("result");
-    std::cout << "s mc " << res << std::endl;
+    if (parser.hasWeights())
+    {
+      std::cout << "s wmc ";
+      printWeightedCount(weightedRes);
+      std::cout << std::endl;
+    }
+    else
+    {
+      std::cout << "s mc " << res << std::endl;
+    }
     std::cout << "c" << std::endl;
 
     double totalTime = Log.elapsed();
@@ -897,6 +1170,27 @@ int main(int argc, char *argv[]) {
 
   if (useApprox) {
     if (verbosity == 0) {
+      if (parser.hasWeights() && useProjectionBoost)
+      {
+        try
+        {
+          WeightedPbResult weighted =
+              runWeightedProjectionBoost(parser,
+                                         approxSeed,
+                                         g_useNativeXor,
+                                         useBvPact);
+          std::cout << "s wmc ";
+          printWeightedCount(weighted.weightedCount);
+          std::cout << std::endl;
+          return 0;
+        }
+        catch (const std::exception& ex)
+        {
+          std::cerr << "Error: weighted --PB failed: " << ex.what()
+                    << std::endl;
+          return 1;
+        }
+      }
       Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact);
       std::uint64_t res = counter.count();
       cpp_int unsatTotal;
@@ -940,7 +1234,11 @@ int main(int argc, char *argv[]) {
     std::cout << "c" << std::endl;
 
     print_section("options");
-    std::cout << "c counting: approximate" << std::endl;
+    std::cout << "c counting: "
+              << (parser.hasWeights() && useProjectionBoost
+                      ? "weighted approximate"
+                      : "approximate")
+              << std::endl;
     std::cout << "c bv-pact: " << (useBvPact ? "yes (XOR hashes to BV SAT backend)"
                                              : "no (Boolean hashing backup)")
               << std::endl;
@@ -966,7 +1264,9 @@ int main(int argc, char *argv[]) {
     }
     std::cout << "c" << std::endl;
 
-    print_section("approximate counting");
+    print_section(parser.hasWeights() && useProjectionBoost
+                      ? "weighted approximate counting"
+                      : "approximate counting");
     // Column widths must match the data rows emitted by Pact::count so the
     // headings line up over their values.
     {
@@ -979,12 +1279,34 @@ int main(int argc, char *argv[]) {
       hdr << "  " << std::setw(16) << "count";
       std::cout << hdr.str() << std::endl;
     }
-    Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact);
     double countStart = Log.elapsed();
-    std::uint64_t res = counter.count();
+    std::uint64_t res = 0;
+    WeightedPbResult weighted;
+    try
+    {
+      if (parser.hasWeights() && useProjectionBoost)
+      {
+        weighted = runWeightedProjectionBoost(parser,
+                                             approxSeed,
+                                             g_useNativeXor,
+                                             useBvPact);
+      }
+      else
+      {
+        Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact);
+        res = counter.count();
+        weighted.smtCalls = counter.getSmtCallCount();
+      }
+    }
+    catch (const std::exception& ex)
+    {
+      std::cerr << "Error: approximate counting failed: " << ex.what()
+                << std::endl;
+      return 1;
+    }
     double countEnd = Log.elapsed();
     Profile.addSearch(countEnd - countStart);
-    std::uint64_t totalSmtCalls = counter.getSmtCallCount();
+    std::uint64_t totalSmtCalls = weighted.smtCalls;
     cpp_int unsatTotal;
     bool haveUnsat = false;
     if (countUnsatAssignments) {
@@ -1019,13 +1341,42 @@ int main(int argc, char *argv[]) {
       }
     }
     print_section("result");
-    std::cout << "s mc " << res << std::endl;
+    if (parser.hasWeights() && useProjectionBoost)
+    {
+      std::cout << "s wmc ";
+      printWeightedCount(weighted.weightedCount);
+      std::cout << std::endl;
+    }
+    else
+    {
+      std::cout << "s mc " << res << std::endl;
+    }
     if (countUnsatAssignments) {
       std::cout << "s unsat-mc " << unsatTotal << std::endl;
     }
     std::cout << "c" << std::endl;
 
     print_section("statistics");
+    if (parser.hasWeights() && useProjectionBoost)
+    {
+      std::cout << "c weighted-to-unweighted original vars: "
+                << weighted.originalVars << std::endl;
+      std::cout << "c weighted-to-unweighted original clauses: "
+                << weighted.originalClauses << std::endl;
+      std::cout << "c weighted-to-unweighted converted vars: "
+                << weighted.convertedVars << std::endl;
+      std::cout << "c weighted-to-unweighted converted clauses: "
+                << weighted.convertedClauses << std::endl;
+      std::cout << "c weighted-to-unweighted sampling vars: "
+                << weighted.samplingVars << std::endl;
+      std::cout << "c weighted-to-unweighted divisor: 2^"
+                << weighted.divisorPower << std::endl;
+      std::cout << "c weighted-to-unweighted multiplier: ";
+      printWeightedCount(weighted.multiplier);
+      std::cout << std::endl;
+      std::cout << "c unweighted count: "
+                << weighted.unweightedCount << std::endl;
+    }
     std::cout << "c smt calls: " << totalSmtCalls << std::endl;
     std::cout << "c" << std::endl;
 

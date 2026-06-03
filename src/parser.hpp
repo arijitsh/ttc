@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
 #include <optional>
 #include "cache_mode.hpp"
@@ -14,6 +15,14 @@
 
 class TTCParser {
 public:
+    struct LiteralWeight
+    {
+        bool hasPositive = false;
+        bool hasNegative = false;
+        double positive = 0.5;
+        double negative = 0.5;
+    };
+
     TTCParser();
     ~TTCParser();
 
@@ -53,6 +62,12 @@ public:
     // Promote all Boolean and bit-vector variables to projection variables when
     // no explicit projection variables were provided.
     void promoteBooleanAndBvToProjection();
+    bool hasExplicitProjectionVars() const { return d_hasExplicitProjectionVars; }
+    bool hasWeights() const { return d_hasWeights; }
+    const std::unordered_map<cvc5::Term, LiteralWeight>& literalWeights() const
+    {
+        return d_literalWeights;
+    }
 
     // Access solver and projection variables for external algorithms.
     cvc5::Solver& solver() { return d_solver; }
@@ -92,9 +107,13 @@ private:
     // All declared terms (declare-fun/declare-const), even unused ones.
     std::vector<cvc5::Term> d_declaredVars;
 
-    // List of projection variables (Boolean terms starting with "proj").
+    // List of projection variables (declared with declare-projvar, or Boolean
+    // terms starting with "proj_" when no explicit declaration is present).
     std::vector<cvc5::Term> d_projVars;
     std::vector<cvc5::Term> d_nonProjVars;
+    bool d_hasExplicitProjectionVars = false;
+    bool d_hasWeights = false;
+    std::unordered_map<cvc5::Term, LiteralWeight> d_literalWeights;
     std::size_t d_projVarsBefore = 0;
     std::size_t d_projVarsAfter = 0;
 

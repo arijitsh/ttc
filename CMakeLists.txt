@@ -157,6 +157,7 @@ set(SOURCES
     src/csb/stp_sat.cpp
     src/tocnf/tocnf.cpp
     src/eager/bvcnf.cpp
+    src/weighted/tounweighted.cpp
     src/volume/allsat_volume.cpp
     src/volume/lra_volume.cpp
     src/allsat-circuits/src/AllSatAlgo/AllSatAlgoBase.cpp
