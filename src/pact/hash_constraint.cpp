@@ -22,7 +22,19 @@ bool HashConstraint::hasXorClauses() const
 
 void HashConstraint::assertToSolver(cvc5::Solver& solver, bool useNativeXor) const
 {
-  if (useNativeXor && !d_xorClauses.empty())
+  bool canGoNative = useNativeXor && !d_xorClauses.empty();
+  for (const XorClause& clause : d_xorClauses)
+  {
+    if (clause.terms.empty())
+    {
+      // An empty parity cannot be expressed as a native XOR clause; fall back
+      // to the Boolean/bit-vector encoding for the whole hash.
+      canGoNative = false;
+      break;
+    }
+  }
+
+  if (canGoNative)
   {
     for (const XorClause& clause : d_xorClauses)
     {
@@ -31,7 +43,10 @@ void HashConstraint::assertToSolver(cvc5::Solver& solver, bool useNativeXor) con
         Trace("xor") << "assertXorClause " << clauseToString(clause)
                       << std::endl;
       }
-      // solver.assertXorClause(clause.terms, clause.rhs);
+      // Hand the parity directly to the SAT solver (CaDiCaL) as a native XOR
+      // clause so it is solved by Gauss-Jordan elimination rather than a
+      // Tseitin CNF expansion.
+      solver.assertXorClause(clause.terms, clause.rhs);
     }
     return;
   }

@@ -3,6 +3,7 @@
 #include "features.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <random>
 #include <utility>
 #include <vector>
@@ -49,7 +50,10 @@ std::optional<XorClause> BvHash::randomClause(std::mt19937& rng) const
 
   std::vector<cvc5::Term> bits;
   bits.reserve(d_totalBits);
-  std::bernoulli_distribution coin(0.5);
+  double density = std::getenv("TTC_XOR_DENSITY")
+                       ? std::atof(std::getenv("TTC_XOR_DENSITY"))
+                       : 0.5;
+  std::bernoulli_distribution coin(density);
   for (const cvc5::Term& var : d_vars)
   {
     if (!var.getSort().isBitVector())

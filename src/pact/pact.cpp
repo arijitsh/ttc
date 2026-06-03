@@ -185,6 +185,7 @@ Pact::Pact(cvc5::Solver& solver,
 
   d_counter.setProjectionVars(&d_projectionVars);
   d_counter.setUseNativeXor(useNativeXor);
+  d_useNativeXor = useNativeXor;
 
   // The galloping search needs an upper sentinel on the number of useful hash
   // constraints. Each parity hash roughly halves the model space, so no more
@@ -226,12 +227,35 @@ void Pact::rebuildCountSolver()
   static constexpr const char* kOptions[] = {
       "print-success",  "incremental",        "produce-models",
       "bv-sat-solver",  "bv-to-bool",         "sat-use-native-xor",
+      "sat-solver",
   };
   for (const char* name : kOptions)
   {
     try
     {
       cs.setOption(name, d_solver.getOption(name));
+    }
+    catch (const cvc5::CVC5ApiException&)
+    {
+    }
+  }
+
+  if (d_useNativeXor)
+  {
+    // Native XOR clauses (assertXorClause) are only supported when the core SAT
+    // solver is CaDiCaL; Minisat aborts on them. Force CaDiCaL on the counting
+    // solver so the parity hashes are solved by Gauss-Jordan elimination.
+    try
+    {
+      cs.setOption("sat-solver", "cadical");
+      cs.setOption("sat-use-native-xor", "true");
+    }
+    catch (const cvc5::CVC5ApiException&)
+    {
+    }
+    try
+    {
+      cs.setXorAssertionVerbose(false);
     }
     catch (const cvc5::CVC5ApiException&)
     {
@@ -440,7 +464,8 @@ std::uint64_t Pact::count()
   {
     try
     {
-      std::string stats = d_solver.getStatistics().toString();
+      cvc5::Solver& statSolver = d_countSolver ? *d_countSolver : d_solver;
+      std::string stats = statSolver.getStatistics().toString();
       std::istringstream iss(stats);
       std::string line;
       while (std::getline(iss, line))
@@ -448,6 +473,8 @@ std::uint64_t Pact::count()
         if (line.find("cryptominisat") != std::string::npos
             || line.find("BVSolverBitblast") != std::string::npos
             || line.find("cadical") != std::string::npos
+            || line.find("gauss") != std::string::npos
+            || line.find("xor") != std::string::npos
             || line.find("bitblast") != std::string::npos)
         {
           std::cerr << "[stat] " << line << std::endl;

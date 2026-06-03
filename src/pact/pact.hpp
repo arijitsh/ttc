@@ -78,6 +78,11 @@ class Pact
   // galloping search's hiIndex sentinel.
   std::size_t d_maxHashes = 1;
 
+  // Whether parity hashes are handed to the SAT solver as native XOR clauses
+  // (CaDiCaL Gauss-Jordan) instead of CNF. Requires the core SAT solver to be
+  // CaDiCaL, which rebuildCountSolver enforces on the counting solver.
+  bool d_useNativeXor = false;
+
   // The base formula (after any BV-PACT substitution), captured once so we can
   // rebuild a fresh counting solver between measurements.
   std::vector<cvc5::Term> d_baseAssertions;
