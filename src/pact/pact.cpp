@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <optional>
@@ -49,7 +51,8 @@ ProjectionSplit splitProjectionVars(const std::vector<cvc5::Term>& vars)
 Pact::Pact(cvc5::Solver& solver,
            const std::vector<cvc5::Term>& projectionVars,
            std::uint64_t seed,
-           bool useNativeXor)
+           bool useNativeXor,
+           bool bvPact)
     : d_solver(solver),
       d_rng(static_cast<std::mt19937::result_type>(seed)),
       d_counter(solver),
@@ -103,27 +106,107 @@ Pact::Pact(cvc5::Solver& solver,
 
   d_booleanBvVars.clear();
   d_booleanBvVars.reserve(d_booleanVars.size());
-  if (!d_booleanVars.empty())
+
+  if (bvPact && !d_booleanVars.empty())
   {
+    // BV-PACT mode: replace each Boolean projection variable with a fresh 1-bit
+    // bit-vector variable and substitute (= bv #b1) for the Boolean throughout
+    // the asserted formula.  The bit-vectors become the *primary* variables, so
+    // the parity (XOR) hash constraints are genuine bit-vector constraints that
+    // are routed to the bit-vector SAT backend (CryptoMiniSat) rather than being
+    // folded back into the core SAT solver.
     auto& tm = ttc::getTermBuilder(d_solver);
     cvc5::Sort bvSort = tm.mkBitVectorSort(1);
     cvc5::Term bvOne = tm.mkBitVector(1, 1);
-    cvc5::Term bvZero = tm.mkBitVector(1, 0);
+
+    std::vector<cvc5::Term> from;
+    std::vector<cvc5::Term> to;
+    std::vector<cvc5::Term> eqTerms;
+    from.reserve(d_booleanVars.size());
+    to.reserve(d_booleanVars.size());
+    eqTerms.reserve(d_booleanVars.size());
     for (std::size_t i = 0; i < d_booleanVars.size(); ++i)
     {
-      std::string name = "__ttc_bool_proj_bv_" + std::to_string(i);
+      std::string name = "__ttc_pbv_" + std::to_string(i);
       cvc5::Term bvVar = tm.mkConst(bvSort, name);
-      cvc5::Term ite = tm.mkTerm(cvc5::Kind::ITE, {d_booleanVars[i], bvOne, bvZero});
-      cvc5::Term eq = tm.mkTerm(cvc5::Kind::EQUAL, {bvVar, ite});
-      d_solver.assertFormula(eq);
+      cvc5::Term eq = tm.mkTerm(cvc5::Kind::EQUAL, {bvVar, bvOne});
+      from.push_back(d_booleanVars[i]);
+      to.push_back(eq);
       d_booleanBvVars.push_back(bvVar);
+      eqTerms.push_back(eq);
     }
+
+    // Re-assert the formula with the Boolean projection variables substituted
+    // out.  resetAssertions() keeps options and declarations intact.
+    std::vector<cvc5::Term> assertions = d_solver.getAssertions();
+    d_solver.resetAssertions();
+    for (cvc5::Term& assertion : assertions)
+    {
+      d_solver.assertFormula(assertion.substitute(from, to));
+    }
+
+    // Count and hash over the fresh bit-vector projection variables.
+    d_projectionVars.clear();
+    d_projectionVars.reserve(d_booleanBvVars.size() + d_bitvectorVars.size());
+    d_projectionVars.insert(
+        d_projectionVars.end(), d_booleanBvVars.begin(), d_booleanBvVars.end());
+    d_projectionVars.insert(
+        d_projectionVars.end(), d_bitvectorVars.begin(), d_bitvectorVars.end());
+
+    // BoolHash builds a ~0.5-density parity over the bit-vector parity terms; we
+    // pass the (= bv #b1) literals for the (unused) native-XOR representation and
+    // the bit-vectors themselves for the asserted bit-vector parity constraint.
+    d_boolHash.setVariables(eqTerms, d_booleanBvVars);
+    d_bvHash.setVariables(d_bitvectorVars);
+  }
+  else
+  {
+    // Boolean-PACT (backup) mode: keep the Boolean projection variables primary
+    // and slave a 1-bit bit-vector to each one via (= bv (ite bool #b1 #b0)).
+    if (!d_booleanVars.empty())
+    {
+      auto& tm = ttc::getTermBuilder(d_solver);
+      cvc5::Sort bvSort = tm.mkBitVectorSort(1);
+      cvc5::Term bvOne = tm.mkBitVector(1, 1);
+      cvc5::Term bvZero = tm.mkBitVector(1, 0);
+      for (std::size_t i = 0; i < d_booleanVars.size(); ++i)
+      {
+        std::string name = "__ttc_bool_proj_bv_" + std::to_string(i);
+        cvc5::Term bvVar = tm.mkConst(bvSort, name);
+        cvc5::Term ite = tm.mkTerm(cvc5::Kind::ITE, {d_booleanVars[i], bvOne, bvZero});
+        cvc5::Term eq = tm.mkTerm(cvc5::Kind::EQUAL, {bvVar, ite});
+        d_solver.assertFormula(eq);
+        d_booleanBvVars.push_back(bvVar);
+      }
+    }
+    d_boolHash.setVariables(d_booleanVars, d_booleanBvVars);
+    d_bvHash.setVariables(d_bitvectorVars);
   }
 
   d_counter.setProjectionVars(&d_projectionVars);
   d_counter.setUseNativeXor(useNativeXor);
-  d_boolHash.setVariables(d_booleanVars, d_booleanBvVars);
-  d_bvHash.setVariables(d_bitvectorVars);
+
+  // The galloping search needs an upper sentinel on the number of useful hash
+  // constraints. Each parity hash roughly halves the model space, so no more
+  // than the total number of projection bits can ever help: Booleans contribute
+  // one bit each and bit-vectors their width.
+  d_maxHashes = 0;
+  for (const cvc5::Term& var : d_projectionVars)
+  {
+    cvc5::Sort sort = var.getSort();
+    if (sort.isBoolean())
+    {
+      d_maxHashes += 1;
+    }
+    else if (sort.isBitVector())
+    {
+      d_maxHashes += sort.getBitVectorSize();
+    }
+  }
+  if (d_maxHashes == 0)
+  {
+    d_maxHashes = 1;
+  }
 }
 
 Pact::Parameters Pact::getParameters() const
@@ -204,43 +287,27 @@ std::uint64_t Pact::count()
 
   double startTime = Log.elapsed();
   double lastProgress = -progress_interval;
-  auto getNextHashDelta = [&](std::size_t currentHashes) -> std::size_t {
-    if (!d_nextIndex.needsRefinement())
-    {
-      return 0;
-    }
-    std::optional<std::size_t> nextLevel = d_nextIndex.previewNextCandidate();
-    if (!nextLevel.has_value())
-    {
-      return 0;
-    }
-    if (*nextLevel > currentHashes)
-    {
-      return *nextLevel - currentHashes;
-    }
-    return 0;
-  };
-  auto printProgress = [&](std::size_t round,
-                           std::size_t hashCount,
-                           const std::optional<std::size_t>& countResult,
-                           std::size_t nextHashDelta,
-                           bool force,
-                           const std::optional<std::uint64_t>& roundEstimate) -> bool {
+  std::size_t currentRound = 0;
+
+  // Emits one progress row per saturating-count evaluation, throttled by
+  // progress_interval. `nextHash` is where the galloping search will jump next.
+  auto report = [&](std::size_t hashCount,
+                    const std::optional<std::size_t>& sols,
+                    std::int64_t nextHash) {
     if (Log.getVerbosity() == 0)
     {
-      return false;
+      return;
     }
     double elapsed = Log.elapsed() - startTime;
-    bool shouldPrint = force || countResult.has_value();
-    if (!shouldPrint && (elapsed - lastProgress < progress_interval))
+    if (elapsed - lastProgress < progress_interval)
     {
-      return false;
+      return;
     }
     lastProgress = elapsed;
     std::ostringstream countStream;
-    if (countResult.has_value())
+    if (sols.has_value())
     {
-      countStream << *countResult;
+      countStream << *sols;
     }
     else
     {
@@ -249,163 +316,247 @@ std::uint64_t Pact::count()
     std::ostringstream line;
     line << std::fixed << std::setprecision(3);
     line << "c " << std::setw(8) << elapsed;
-    line << "  " << std::setw(6) << round;
+    line << "  " << std::setw(6) << currentRound;
     line << "  " << std::setw(8) << hashCount;
     line << "  " << std::setw(16) << countStream.str();
-    line << "  " << std::setw(9) << nextHashDelta;
-    std::string estimateStr;
-    if (roundEstimate.has_value())
-    {
-      std::ostringstream estStream;
-      estStream << *roundEstimate;
-      estimateStr = estStream.str();
-    }
-    line << "  " << std::setw(16) << estimateStr;
+    line << "  " << std::setw(9) << nextHash;
     std::cout << line.str() << std::endl;
-    return true;
   };
 
+  // Base count with no hashing. If the formula has fewer than `threshold`
+  // models in total the count is exact and we are done -- this mirrors ApproxMC
+  // "counting without XORs".
   std::vector<HashConstraint> empty;
-  std::size_t initialLevel = d_nextIndex.initial();
   std::optional<std::size_t> base = d_counter.count(empty, params.threshold);
-  std::optional<std::uint64_t> baseEstimate;
+  report(0, base, 0);
   if (base.has_value())
   {
-    baseEstimate = static_cast<std::uint64_t>(*base);
-  }
-  printProgress(0, 0, base, getNextHashDelta(0), true, baseEstimate);
-  if (base.has_value())
-  {
-    Trace("pact") << "[pact] Base model count succeeded without hashing: " << *base
-        << std::endl;
+    Trace("pact") << "[pact] Base model count succeeded without hashing: "
+        << *base << std::endl;
     return static_cast<std::uint64_t>(*base);
   }
   Trace("pact")
       << "[pact] Base count reached saturation; introducing random hashes"
       << std::endl;
-  d_nextIndex.updateOnSaturation(initialLevel);
 
   std::vector<std::uint64_t> estimates;
   estimates.reserve(params.iterations);
 
+  // Carries the winning hash count between measurements (ApproxMC's
+  // prev_measure) so later rounds start their galloping search near the answer.
+  std::int64_t prevMeasure = 0;
+
   for (std::size_t iter = 0; iter < params.iterations; ++iter)
   {
+    currentRound = iter + 1;
     Trace("pact") << "[pact] Iteration " << (iter + 1) << " of "
         << params.iterations << std::endl;
-    d_nextIndex.startRound();
+
+    // Each measurement draws a fresh pool of random parity hashes; within the
+    // measurement the pool is reused so re-evaluating the same hash count is
+    // deterministic.
     std::vector<HashConstraint> hashPool;
-    std::vector<HashConstraint> activeHashes;
-    std::unordered_map<std::size_t, std::optional<std::size_t>> levelResults;
-    std::optional<std::size_t> bestCount;
-    std::size_t bestLevel = 0;
+    MeasurementResult m =
+        oneMeasurement(iter, prevMeasure, hashPool, params.threshold, report);
 
-    auto prepareHashes = [&](std::size_t level) {
-      if (level > hashPool.size())
-      {
-        while (hashPool.size() < level)
-        {
-          HashConstraint h = generateHashConstraint();
-          hashPool.push_back(h);
-        }
-      }
-      activeHashes.assign(hashPool.begin(), hashPool.begin() + level);
-    };
-
-    while (true)
-    {
-      std::size_t level = d_nextIndex.nextCandidate();
-      auto cacheIt = levelResults.find(level);
-      if (cacheIt != levelResults.end())
-      {
-        Trace("pact") << "[pact] Reusing cached result for hash level " << level
-            << std::endl;
-        const std::optional<std::size_t>& cached = cacheIt->second;
-        if (cached.has_value())
-        {
-          bestCount = cached;
-          bestLevel = level;
-          d_nextIndex.updateOnSatisfying(level);
-          if (!d_nextIndex.needsRefinement())
-          {
-            break;
-          }
-        }
-        else
-        {
-          d_nextIndex.updateOnSaturation(level);
-        }
-        continue;
-      }
-
-      prepareHashes(level);
-      Trace("pact") << "[pact] Evaluating hash level " << level << std::endl;
-      std::optional<std::size_t> attempt =
-          d_counter.count(activeHashes, params.threshold);
-      levelResults.emplace(level, attempt);
-      std::optional<std::uint64_t> roundEstimate;
-      if (attempt.has_value())
-      {
-        bestCount = attempt;
-        bestLevel = level;
-        Trace("pact") << "[pact] Hash level " << level << " yielded " << *attempt
-            << " models" << std::endl;
-        d_nextIndex.updateOnSatisfying(level);
-        bool done = !d_nextIndex.needsRefinement();
-        if (done)
-        {
-          roundEstimate = static_cast<std::uint64_t>(*attempt) << level;
-        }
-        bool forcePrint = roundEstimate.has_value();
-        printProgress(iter + 1,
-                      activeHashes.size(),
-                      attempt,
-                      getNextHashDelta(activeHashes.size()),
-                      forcePrint,
-                      roundEstimate);
-        if (done)
-        {
-          break;
-        }
-      }
-      else
-      {
-        Trace("pact") << "[pact] Hash level " << level
-            << " saturated pivot " << params.threshold << std::endl;
-        d_nextIndex.updateOnSaturation(level);
-        bool done = bestCount.has_value() && !d_nextIndex.needsRefinement();
-        if (done)
-        {
-          roundEstimate = static_cast<std::uint64_t>(*bestCount) << bestLevel;
-        }
-        bool forcePrint = true;
-        printProgress(iter + 1,
-                      activeHashes.size(),
-                      attempt,
-                      getNextHashDelta(activeHashes.size()),
-                      forcePrint,
-                      roundEstimate);
-        if (done)
-        {
-          break;
-        }
-      }
-    }
-
-    std::uint64_t approx = static_cast<std::uint64_t>(*bestCount);
-    approx <<= bestLevel;
-    Trace("pact") << "[pact] Iteration " << (iter + 1)
-        << " estimate: " << approx << std::endl;
+    std::uint64_t approx = static_cast<std::uint64_t>(m.cellCount);
+    approx <<= m.hashCount;
+    Trace("pact") << "[pact] Iteration " << (iter + 1) << " estimate: "
+        << approx << " (" << m.cellCount << " << " << m.hashCount << ")"
+        << std::endl;
     estimates.push_back(approx);
-    d_nextIndex.finishRound();
-    if (bestCount.has_value())
+
+    if (Log.getVerbosity() != 0)
     {
-      d_nextIndex.updateOnSatisfying(bestLevel);
+      double elapsed = Log.elapsed() - startTime;
+      std::ostringstream line;
+      line << std::fixed << std::setprecision(3);
+      line << "c " << std::setw(8) << elapsed;
+      line << "  " << std::setw(6) << currentRound;
+      line << "  " << std::setw(8) << m.hashCount;
+      line << "  " << std::setw(16) << m.cellCount;
+      line << "  " << std::setw(9) << "winner";
+      line << "  " << std::setw(16) << approx;
+      std::cout << line.str() << std::endl;
+      lastProgress = elapsed;
     }
   }
 
   std::uint64_t result = median(estimates);
   Trace("pact") << "[pact] Median estimate across iterations: " << result
       << std::endl;
+  if (std::getenv("TTC_PACT_STATS") != nullptr)
+  {
+    try
+    {
+      std::string stats = d_solver.getStatistics().toString();
+      std::istringstream iss(stats);
+      std::string line;
+      while (std::getline(iss, line))
+      {
+        if (line.find("cryptominisat") != std::string::npos
+            || line.find("BVSolverBitblast") != std::string::npos
+            || line.find("cadical") != std::string::npos
+            || line.find("bitblast") != std::string::npos)
+        {
+          std::cerr << "[stat] " << line << std::endl;
+        }
+      }
+    }
+    catch (const std::exception& ex)
+    {
+      std::cerr << "[stat] unavailable: " << ex.what() << std::endl;
+    }
+  }
   return result;
+}
+
+Pact::MeasurementResult Pact::oneMeasurement(
+    std::size_t iter,
+    std::int64_t& prevMeasure,
+    std::vector<HashConstraint>& hashPool,
+    std::size_t threshold,
+    const ReportFn& report)
+{
+  // Galloping search over the number of hash constraints, mirroring ApproxMC's
+  // one_measurement_count. The two sentinels lowerFib (loIndex) and upperFib
+  // (hiIndex) always bracket the answer: lowerFib is the largest hash count
+  // known to saturate the pivot, upperFib the smallest known to fall below it.
+  // We search exponentially until the bracket is small enough, then binary.
+  const std::int64_t totalMaxHashes = static_cast<std::int64_t>(d_maxHashes);
+  std::int64_t lowerFib = 0;
+  std::int64_t upperFib = totalMaxHashes;
+  std::int64_t numExplored = 0;
+  std::int64_t hashCnt = prevMeasure;
+  std::int64_t hashPrev = hashCnt;
+
+  // thresholdSols[h] == true  : `h` hashes saturated the pivot (>= threshold)
+  // thresholdSols[h] == false : `h` hashes gave an exact count (< threshold)
+  // solsForHash[h]            : the exact count recorded when below the pivot
+  std::unordered_map<std::int64_t, bool> thresholdSols;
+  std::unordered_map<std::int64_t, std::int64_t> solsForHash;
+  thresholdSols[totalMaxHashes] = false;
+  solsForHash[totalMaxHashes] = 1;
+
+  auto activeHashes = [&](std::int64_t level) {
+    while (static_cast<std::int64_t>(hashPool.size()) < level)
+    {
+      hashPool.push_back(generateHashConstraint());
+    }
+    return std::vector<HashConstraint>(hashPool.begin(),
+                                       hashPool.begin() + level);
+  };
+
+  while (numExplored < totalMaxHashes)
+  {
+    if (hashCnt < 0)
+    {
+      hashCnt = 0;
+    }
+    const std::int64_t curHashCnt = hashCnt;
+    std::vector<HashConstraint> active = activeHashes(hashCnt);
+    Trace("pact") << "[pact] Evaluating hash count " << hashCnt << std::endl;
+    std::optional<std::size_t> attempt = d_counter.count(active, threshold);
+    const bool below = attempt.has_value();
+    const std::int64_t numSols = below
+                                     ? static_cast<std::int64_t>(*attempt)
+                                     : static_cast<std::int64_t>(threshold) + 1;
+
+    if (below)
+    {
+      // Found an exact count here. If one fewer hash saturated, the boundary is
+      // right here and this is the answer.
+      numExplored = lowerFib + totalMaxHashes - hashCnt;
+      auto prev = thresholdSols.find(hashCnt - 1);
+      if (hashCnt == 0 || (prev != thresholdSols.end() && prev->second))
+      {
+        prevMeasure = hashCnt;
+        report(static_cast<std::size_t>(hashCnt), attempt, hashCnt);
+        Trace("pact") << "[pact] Winner at " << hashCnt << " with " << numSols
+            << " models" << std::endl;
+        return {static_cast<std::size_t>(hashCnt),
+                static_cast<std::size_t>(numSols)};
+      }
+
+      thresholdSols[hashCnt] = false;
+      solsForHash[hashCnt] = numSols;
+
+      std::int64_t nextHash;
+      if (iter > 0 && std::llabs(hashCnt - prevMeasure) <= 2)
+      {
+        // Close to last round's answer: step linearly (re-count) downward.
+        upperFib = hashCnt;
+        nextHash = hashCnt - 1;
+      }
+      else
+      {
+        if (hashPrev > hashCnt)
+        {
+          hashPrev = 0;
+        }
+        upperFib = hashCnt;
+        if (hashPrev > lowerFib)
+        {
+          lowerFib = hashPrev;
+        }
+        nextHash = (upperFib + lowerFib) / 2;
+      }
+      report(static_cast<std::size_t>(hashCnt), attempt, nextHash);
+      hashPrev = curHashCnt;
+      hashCnt = nextHash;
+    }
+    else
+    {
+      // Saturated the pivot here. If one more hash fell below, the boundary is
+      // there and that count is the answer.
+      numExplored = hashCnt + totalMaxHashes - upperFib;
+      auto above = thresholdSols.find(hashCnt + 1);
+      if (above != thresholdSols.end() && !above->second)
+      {
+        prevMeasure = hashCnt + 1;
+        report(static_cast<std::size_t>(hashCnt), std::nullopt, hashCnt + 1);
+        Trace("pact") << "[pact] Winner at " << (hashCnt + 1) << " with "
+            << solsForHash[hashCnt + 1] << " models" << std::endl;
+        return {static_cast<std::size_t>(hashCnt + 1),
+                static_cast<std::size_t>(solsForHash[hashCnt + 1])};
+      }
+
+      thresholdSols[hashCnt] = true;
+      solsForHash[hashCnt] = static_cast<std::int64_t>(threshold) + 1;
+
+      std::int64_t nextHash;
+      if (iter > 0 && std::llabs(hashCnt - prevMeasure) < 2)
+      {
+        // Close to last round's answer: step linearly (re-count) upward.
+        lowerFib = hashCnt;
+        nextHash = hashCnt + 1;
+      }
+      else if (lowerFib + (hashCnt - lowerFib) * 2 >= upperFib - 1)
+      {
+        // Bracket is tight enough: switch to binary search.
+        lowerFib = hashCnt;
+        nextHash = (lowerFib + upperFib) / 2;
+      }
+      else
+      {
+        // Exponential (galloping) growth away from lowerFib.
+        nextHash = lowerFib + (hashCnt - lowerFib) * 2;
+        if (nextHash == hashCnt)
+        {
+          ++nextHash;
+        }
+      }
+      report(static_cast<std::size_t>(hashCnt), std::nullopt, nextHash);
+      hashPrev = curHashCnt;
+      hashCnt = nextHash;
+    }
+  }
+
+  // Bracket fully explored without a sharp boundary (e.g. tiny variable sets):
+  // fall back to the smallest hash count known to fall below the pivot.
+  prevMeasure = upperFib;
+  auto it = solsForHash.find(upperFib);
+  std::int64_t cell = (it != solsForHash.end()) ? it->second : 1;
+  return {static_cast<std::size_t>(upperFib), static_cast<std::size_t>(cell)};
 }
 

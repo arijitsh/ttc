@@ -153,7 +153,6 @@ set(SOURCES
     src/pact/hash_constraint.cpp
     src/pact/bool_hash.cpp
     src/pact/bv_hash.cpp
-    src/pact/next_index.cpp
     src/projected_enumerator.cpp
     src/csb/stp_sat.cpp
     src/tocnf/tocnf.cpp

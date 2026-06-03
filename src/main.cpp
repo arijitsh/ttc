@@ -334,6 +334,10 @@ int main(int argc, char *argv[]) {
       ("unsat-q",
        "Use quantified reasoning when counting unsatisfied projection assignments")
       ("PB", "Enable projection-based approximate counting mode")
+      ("no-bv-pact",
+       "In --PB mode, keep Boolean projection variables (and route XOR hashes "
+       "through the core SAT solver) instead of substituting fresh 1-bit "
+       "bit-vector variables that send the XOR hashes to the BV SAT backend")
       ("PE", "Enumerate projected assignments exactly")
       ("xor",
        po::bool_switch()->default_value(false),
@@ -388,6 +392,10 @@ int main(int argc, char *argv[]) {
   bool useApprox = vm.count("approx") > 0;
   bool useProjectionBoost = vm.count("PB") > 0;
   bool useProjectionEnumerate = vm.count("PE") > 0;
+  // BV-PACT is the default for --PB: substitute fresh 1-bit bit-vectors for the
+  // Boolean projection variables so the XOR hashes reach the BV SAT backend.
+  // --no-bv-pact restores the Boolean-hashing backup for cross-checking.
+  bool useBvPact = useProjectionBoost && vm.count("no-bv-pact") == 0;
   std::uint64_t approxSeed = vm["seed"].as<std::uint64_t>();
   bool useUnsatQuant = vm.count("unsat-q") > 0;
   bool countUnsatAssignments = vm.count("unsat") > 0 || useUnsatQuant;
@@ -518,6 +526,11 @@ int main(int argc, char *argv[]) {
 
   TTCParser parser;
   cvc5::Solver& mainSolver = parser.solver();
+  if (std::getenv("TTC_PACT_STATS") != nullptr)
+  {
+    try { mainSolver.setOption("stats-internal", "true"); }
+    catch (const cvc5::CVC5ApiException&) {}
+  }
   try
   {
     mainSolver.setOption("bv-sat-solver", "cryptominisat");
@@ -526,6 +539,21 @@ int main(int argc, char *argv[]) {
   {
     Log(1) << "Warning: unable to select CryptoMiniSat backend: " << ex.getMessage()
            << std::endl;
+  }
+  if (useBvPact)
+  {
+    // Keep the fresh 1-bit projection bit-vectors as genuine bit-vectors so the
+    // XOR hashes are solved by the BV SAT backend; otherwise cvc5 folds them
+    // back into Booleans (bv-to-bool) and the core SAT solver handles them.
+    try
+    {
+      mainSolver.setOption("bv-to-bool", "false");
+    }
+    catch (const cvc5::CVC5ApiException& ex)
+    {
+      Log(1) << "Warning: unable to disable bv-to-bool: " << ex.getMessage()
+             << std::endl;
+    }
   }
 
 
@@ -558,6 +586,23 @@ int main(int argc, char *argv[]) {
     }
   }
   // mainSolver.setXorAssertionVerbose(true);
+  if (useBvPact && g_hasCadicalXorSupport)
+  {
+    // BV-PACT routes the parity (XOR) hashes through the bit-vector SAT backend
+    // (CryptoMiniSat).  Enabling native XOR makes cvc5's CNF stream hand each
+    // bit-blasted XOR to the SAT solver as a single native XOR clause instead of
+    // a Tseitin clause expansion.  This is independent of the (broken) ttc-level
+    // hash_constraint native path, so we keep d_counter's useNativeXor disabled.
+    try
+    {
+      applyNativeXor(mainSolver, true);
+    }
+    catch (const cvc5::CVC5ApiException& ex)
+    {
+      Log(1) << "Warning: unable to enable native XOR for BV-PACT: "
+             << ex.getMessage() << std::endl;
+    }
+  }
   std::string solverInfo = "solver: cvc5";
   if (g_hasCadicalXorSupport)
   {
@@ -795,7 +840,7 @@ int main(int argc, char *argv[]) {
 
   if (useApprox) {
     if (verbosity == 0) {
-      Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor);
+      Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact);
       std::uint64_t res = counter.count();
       cpp_int unsatTotal;
       bool haveUnsat = false;
@@ -839,6 +884,9 @@ int main(int argc, char *argv[]) {
 
     print_section("options");
     std::cout << "c counting: approximate" << std::endl;
+    std::cout << "c bv-pact: " << (useBvPact ? "yes (XOR hashes to BV SAT backend)"
+                                             : "no (Boolean hashing backup)")
+              << std::endl;
     std::cout << "c contract: " << (noContract ? "no" : "yes") << std::endl;
     std::cout << "c arjun: " << (doArjun ? "yes" : "no") << std::endl;
     std::cout << "c xor: " << (g_useNativeXor ? "yes" : "no") << std::endl;
@@ -864,7 +912,7 @@ int main(int argc, char *argv[]) {
     print_section("approximate counting");
     std::cout << "c seconds   round   #hashes   saturatingcount   nexthash   count"
               << std::endl;
-    Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor);
+    Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact);
     double countStart = Log.elapsed();
     std::uint64_t res = counter.count();
     double countEnd = Log.elapsed();
