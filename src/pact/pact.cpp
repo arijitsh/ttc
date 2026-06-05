@@ -221,6 +221,40 @@ void Pact::rebuildCountSolver()
   d_countSolver.emplace(tm);
   cvc5::Solver& cs = *d_countSolver;
 
+  if (d_useNativeXor)
+  {
+    // Must be set before the solver is otherwise initialised. The native XOR is
+    // asserted over the SAT literals of the projection booleans. cvc5
+    // preprocessing substitutes top-level equality definitions (e.g.
+    // '(= b (>= x 0))' -> b := (>= x 0)), which removes b's own literal from the
+    // formula; the XOR then constrains b's now-free literal while the reported
+    // model reconstructs b from its definition. They desync and the XOR is
+    // silently not enforced on the counted assignment. Disabling this
+    // substitution keeps the projection booleans as real variables.
+    if (const char* spec = std::getenv("TTC_PP"))
+    {
+      // TTC_PP="opt1=val1,opt2=val2" for experimenting with preprocessing opts.
+      std::string s(spec), cur;
+      std::vector<std::string> parts;
+      for (char c : s) { if (c == ',') { parts.push_back(cur); cur.clear(); } else cur += c; }
+      if (!cur.empty()) parts.push_back(cur);
+      for (const std::string& p : parts)
+      {
+        auto eq = p.find('=');
+        if (eq == std::string::npos) continue;
+        try { cs.setOption(p.substr(0, eq), p.substr(eq + 1)); }
+        catch (const cvc5::CVC5ApiException&) {}
+      }
+    }
+    else if (!std::getenv("TTC_NO_SIMP_NONE"))
+    {
+      try { cs.setOption("simplification", "none"); }
+      catch (const cvc5::CVC5ApiException&) {}
+    }
+    try { cs.setOption("simplification-bcp", "false"); }
+    catch (const cvc5::CVC5ApiException&) {}
+  }
+
   // Mirror the solving-relevant options from the original solver so the count
   // solver behaves identically (logic, incrementality, model production and the
   // bit-vector / XOR backend selection set up by main).
@@ -291,6 +325,10 @@ Pact::Parameters Pact::getParameters() const
   if (pivot == 0)
   {
     pivot = 1;
+  }
+  if (const char* e = std::getenv("TTC_PIVOT"))
+  {
+    pivot = static_cast<std::size_t>(std::atoll(e));
   }
   std::size_t iterations = static_cast<std::size_t>(
       std::ceil(25.0 * std::log(3.0 / delta)));
@@ -534,6 +572,16 @@ Pact::MeasurementResult Pact::oneMeasurement(
     const std::int64_t curHashCnt = hashCnt;
     std::vector<HashConstraint> active = activeHashes(hashCnt);
     Trace("pact") << "[pact] Evaluating hash count " << hashCnt << std::endl;
+    // Native XOR clauses are added to CaDiCaL's Gaussian engine, which has no
+    // per-scope retraction (an activation-guarded XOR cannot be deactivated --
+    // forcing the activation only flips the parity). Reusing the solver across
+    // galloping levels would therefore accumulate every level's hashes and
+    // over-constrain the formula. Rebuild a fresh counting solver per level so
+    // each count sees only its own hashes.
+    if (d_useNativeXor && !std::getenv("TTC_NO_PERLEVEL_REBUILD"))
+    {
+      rebuildCountSolver();
+    }
     std::optional<std::size_t> attempt = d_counter.count(active, threshold);
     Trace("pact") << "[pact]   level " << hashCnt << " -> "
         << (attempt.has_value() ? std::to_string(*attempt)

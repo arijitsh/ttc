@@ -458,6 +458,59 @@ std::string overrideLogicForQuantifiers(std::string input)
   return input;
 }
 
+// Decide the default --PB backend by peeking at the input file. cvcxor
+// (Gauss-Jordan in cvc5's propagator) is much faster on LRA/theory inputs, but
+// it is NOT a safe blanket default:
+//   * bit-vector inputs are far better served by BV-PACT (bit-blast XOR into
+//     the BV SAT solver); cvcxor stalls on them (e.g. gaussj).
+//   * cvcxor runs the count solver with simplification=none, which does not
+//     inline define-fun bodies, so inputs that use define-fun error out
+//     ("Function terms are only supported with higher-order logic").
+// We therefore default to cvcxor only when the input has no bit-vectors and no
+// define-fun, and fall back to BV-PACT otherwise. --cvcxor / --bv-pact still
+// force either backend explicitly.
+bool preferCvcXorDefault(const std::string& filename)
+{
+  std::ifstream in(filename);
+  if (!in)
+  {
+    return false;
+  }
+  std::string input((std::istreambuf_iterator<char>(in)),
+                    std::istreambuf_iterator<char>());
+  // define-fun (function terms) are incompatible with simplification=none.
+  if (input.find("define-fun") != std::string::npos)
+  {
+    return false;
+  }
+  // Inspect the (set-logic ...) directive for bit-vectors.
+  const std::string directive = "(set-logic";
+  std::size_t pos = input.find(directive);
+  if (pos != std::string::npos)
+  {
+    std::size_t start = pos + directive.size();
+    start = input.find_first_not_of(" \t\r\n", start);
+    if (start != std::string::npos)
+    {
+      std::size_t end = input.find_first_of(" \t\r\n)", start);
+      if (end != std::string::npos)
+      {
+        std::string logic = input.substr(start, end - start);
+        std::transform(logic.begin(), logic.end(), logic.begin(),
+                       [](unsigned char ch) {
+                         return static_cast<char>(std::toupper(ch));
+                       });
+        // "ALL" may admit bit-vectors: be conservative and prefer BV-PACT.
+        if (logic == "ALL" || logic.find("BV") != std::string::npos)
+        {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
 std::string ensureLogicIncludesBv(std::string input)
 {
   const std::string directive = "(set-logic";
@@ -563,10 +616,19 @@ int main(int argc, char *argv[]) {
        "In --PB mode, keep Boolean projection variables (and route XOR hashes "
        "through the core SAT solver) instead of substituting fresh 1-bit "
        "bit-vector variables that send the XOR hashes to the BV SAT backend")
+      ("bv-pact",
+       "In --PB mode, force the BV-PACT backend (substitute fresh 1-bit "
+       "bit-vectors so XOR hashes reach the BV SAT backend). This was the old "
+       "default; --cvcxor is now the default, so use this to opt back in")
       ("PE", "Enumerate projected assignments exactly")
       ("xor",
        po::bool_switch()->default_value(false),
        "Enable CaDiCaL native XOR support when available")
+      ("cvcxor",
+       "In --PB mode, solve the XOR (parity) hashes with a Gauss-Jordan engine "
+       "inside cvc5's own CadicalPropagator (theory + parity share one "
+       "propagator) instead of handing them to CaDiCaL's native XOR engine. "
+       "Implies --xor and --no-bv-pact")
       ("verbose,v", po::value<int>()->default_value(1),
        "Verbosity level (0-10)")
       ("verbosity-time,vt",
@@ -617,14 +679,42 @@ int main(int argc, char *argv[]) {
   bool useApprox = vm.count("approx") > 0;
   bool useProjectionBoost = vm.count("PB") > 0;
   bool useProjectionEnumerate = vm.count("PE") > 0;
-  // BV-PACT is the default for --PB: substitute fresh 1-bit bit-vectors for the
-  // Boolean projection variables so the XOR hashes reach the BV SAT backend.
-  // --no-bv-pact restores the Boolean-hashing backup for cross-checking.
-  bool useBvPact = useProjectionBoost && vm.count("no-bv-pact") == 0;
   std::uint64_t approxSeed = vm["seed"].as<std::uint64_t>();
   bool useUnsatQuant = vm.count("unsat-q") > 0;
   bool countUnsatAssignments = vm.count("unsat") > 0 || useUnsatQuant;
   bool requestNativeXor = vm["xor"].as<bool>();
+  // --cvcxor: Gauss-Jordan parity solving inside cvc5's CadicalPropagator (a
+  // single propagator does theory + parity, and GJ propagation prunes the
+  // search like CMS/ApproxMC). This is now the DEFAULT backend for --PB; opt
+  // out with --bv-pact (old default: route XOR hashes through the BV SAT
+  // backend) or the other experimental paths --no-bv-pact / --xor.
+  bool useCvcXor = vm.count("cvcxor") > 0;
+  if (useProjectionBoost && !useCvcXor && vm.count("bv-pact") == 0
+      && vm.count("no-bv-pact") == 0 && !requestNativeXor)
+  {
+    // Smart default: cvcxor for LRA/theory inputs (where its GJ propagation is
+    // ~27x faster), BV-PACT for bit-vector or define-fun inputs (where cvcxor
+    // stalls or cannot run). Explicit --cvcxor / --bv-pact override this.
+    useCvcXor = preferCvcXorDefault(filename);
+  }
+  // BV-PACT substitutes fresh 1-bit bit-vectors for the Boolean projection
+  // variables so the XOR hashes reach the BV SAT backend.
+  bool useBvPact =
+      useProjectionBoost && !useCvcXor && vm.count("no-bv-pact") == 0;
+  if (useCvcXor)
+  {
+    requestNativeXor = true;
+    useBvPact = false;
+    setenv("CVC5_XOR_GAUSS", "1", 1);
+    // Enable Gauss-Jordan *propagation* (not just conflict detection) by
+    // default: it prunes the search like CMS/ApproxMC and is the whole point
+    // (~27x on case89). Set CVC5_XOR_GAUSS_NOPROP=1 to fall back to
+    // conflict-only for A/B comparison.
+    if (!getenv("CVC5_XOR_GAUSS_NOPROP"))
+    {
+      setenv("CVC5_XOR_GAUSS_PROP", "1", 1);
+    }
+  }
   bool useToCNF = vm.count("tocnf") > 0;
   bool useBvCnf = vm.count("bvcnf") > 0;
   bool writeFB = vm.count("FB") > 0;

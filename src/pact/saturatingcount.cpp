@@ -6,6 +6,7 @@
 #include <optional>
 #include <stdexcept>
 #include <utility>
+#include <set>
 #include <vector>
 
 #include "logger.hpp"
@@ -94,6 +95,7 @@ std::optional<std::size_t> SaturatingCounter::count(
   std::size_t modelCount = 0;
   std::vector<std::vector<cvc5::Term>> currentModels;
   currentModels.reserve(threshold);
+  std::set<std::string> dupSeen;  // within-count duplicate detection (debug)
 
   auto buildBlocking = [&](const std::vector<cvc5::Term>& modelValues,
                            std::size_t index) {
@@ -280,6 +282,38 @@ std::optional<std::size_t> SaturatingCounter::count(
       {
         modelValues.push_back(d_solver->getValue(var));
       }
+      if (std::getenv("TTC_DUP_DEBUG"))
+      {
+        std::string key;
+        for (const auto& v : modelValues) key += v.toString() + ",";
+        if (!dupSeen.insert(key).second)
+          std::cerr << "[dup] WITHIN-COUNT duplicate at model " << modelCount
+                    << " (distinct=" << dupSeen.size() << ")" << std::endl;
+      }
+      if (std::getenv("TTC_XOR_VERIFY"))
+      {
+        for (const HashConstraint& hc : additionalConstraints)
+        {
+          for (const XorClause& xc : hc.xorClauses())
+          {
+            if (xc.terms.empty()) continue;
+            bool parity = false;
+            for (const cvc5::Term& t : xc.terms)
+            {
+              cvc5::Term val = d_solver->getValue(t);
+              if (val.isBooleanValue() && val.getBooleanValue())
+                parity = !parity;
+            }
+            if (parity != xc.rhs)
+            {
+              std::cerr << "[xorverify] model " << modelCount
+                        << " VIOLATES a hash XOR (parity=" << parity
+                        << " rhs=" << xc.rhs << ")" << std::endl;
+              break;
+            }
+          }
+        }
+      }
       currentModels.push_back(modelValues);
       cvc5::Term blockingConstraint = buildBlocking(modelValues, modelCount);
       d_solver->assertFormula(blockingConstraint);
@@ -287,6 +321,12 @@ std::optional<std::size_t> SaturatingCounter::count(
   }
 
   d_solver->pop();
+  if (std::getenv("TTC_COUNT_DEBUG"))
+    std::cerr << "[count] hashes=" << additionalConstraints.size()
+              << " modelCount=" << modelCount << " result="
+              << (result.has_value() ? std::to_string(*result)
+                                      : std::string("saturated"))
+              << std::endl;
   d_cachedConstraints.assign(additionalConstraints.begin(),
                              additionalConstraints.end());
   d_cachedModels = currentModels;
