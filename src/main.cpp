@@ -11,6 +11,7 @@
 #include <optional>
 #include <utility>
 #include <cctype>
+#include <unistd.h>
 
 #include <boost/multiprecision/cpp_int.hpp>
 
@@ -559,27 +560,208 @@ std::string ensureLogicIncludesBv(std::string input)
   return input;
 }
 
+// ---------------------------------------------------------------------------
+// Automatic engine dispatch helpers.
+//
+// ttc selects one of three counting engines from the (set-logic ...) directive
+// and the projection variables of the input:
+//   1. logic BV / UFBV                          -> eager bit-blast + ApproxMC
+//   2. other theories, BV/Bool projection vars  -> projection counting (--PB)
+//   3. QF_LRA with no projection variables       -> LRA volume computation
+//   4. otherwise                                 -> unsupported (reported)
+// ---------------------------------------------------------------------------
+
+// Read the upper-cased logic token from the input's (set-logic ...) directive.
+// Returns the empty string when no directive is present.
+std::string extractLogicUpper(const std::string& filename)
+{
+  std::ifstream in(filename);
+  if (!in)
+  {
+    return std::string();
+  }
+  std::string input((std::istreambuf_iterator<char>(in)),
+                    std::istreambuf_iterator<char>());
+  const std::string directive = "(set-logic";
+  std::size_t pos = input.find(directive);
+  if (pos == std::string::npos)
+  {
+    return std::string();
+  }
+  std::size_t start = input.find_first_not_of(" \t\r\n", pos + directive.size());
+  if (start == std::string::npos)
+  {
+    return std::string();
+  }
+  std::size_t end = input.find_first_of(" \t\r\n)", start);
+  if (end == std::string::npos)
+  {
+    return std::string();
+  }
+  std::string logic = input.substr(start, end - start);
+  std::transform(logic.begin(), logic.end(), logic.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+  return logic;
+}
+
+// Remove every occurrence of token from s (in place).
+void eraseLogicToken(std::string& s, const std::string& token)
+{
+  std::size_t pos;
+  while ((pos = s.find(token)) != std::string::npos)
+  {
+    s.erase(pos, token.size());
+  }
+}
+
+// True when the logic is a pure bit-vector logic (BV / UFBV / QF_BV / QF_UFBV);
+// arrays, floating point, arithmetic, etc. are NOT pure-BV.
+bool logicIsPureBv(const std::string& logicUpper)
+{
+  if (logicUpper.empty())
+  {
+    return false;
+  }
+  std::string t = logicUpper;
+  if (t.rfind("QF_", 0) == 0)
+  {
+    t = t.substr(3);
+  }
+  eraseLogicToken(t, "UF");
+  bool hadBv = t.find("BV") != std::string::npos;
+  eraseLogicToken(t, "BV");
+  return hadBv && t.empty();
+}
+
+// True when every projection variable is Boolean or a bit-vector.
+bool projVarsAreBvOrBool(const std::vector<cvc5::Term>& projVars)
+{
+  for (const cvc5::Term& v : projVars)
+  {
+    cvc5::Sort sort = v.getSort();
+    if (!sort.isBoolean() && !sort.isBitVector())
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Build a writable path for the intermediate model-preserving CNF that the
+// bit-vector ApproxMC path produces under automatic dispatch (the user did not
+// supply one via --bvcnf <file>).
+std::string makeAutoCnfPath(const std::string& filename)
+{
+  const char* tmp = std::getenv("TMPDIR");
+  std::string dir = (tmp != nullptr && *tmp != '\0') ? tmp : "/tmp";
+  std::string base = filename;
+  std::size_t slash = base.find_last_of("/\\");
+  if (slash != std::string::npos)
+  {
+    base = base.substr(slash + 1);
+  }
+  if (base.empty())
+  {
+    base = "ttc";
+  }
+  return dir + "/" + base + "." + std::to_string(static_cast<long>(::getpid())) +
+         ".bvcnf";
+}
+
+// Report that the input matches none of the auto-dispatch engine classes and
+// explain how the engine is chosen.
+void printUnsupportedEngine(const std::string& logicUpper,
+                            std::size_t numProjVars)
+{
+  std::cerr
+      << "Error: unsupported input for automatic engine selection.\n"
+      << "  logic                : "
+      << (logicUpper.empty() ? "(none)" : logicUpper) << "\n"
+      << "  projection variables : " << numProjVars << "\n\n"
+      << "ttc selects a counting engine from the logic and projection variables:\n"
+      << "  1. logic BV / UFBV                          -> bit-vector ApproxMC "
+         "(eager bit-blast)\n"
+      << "  2. other theories with BV/Bool projection   -> projection counting "
+         "(--pact)\n"
+      << "  3. QF_LRA with no projection variables       -> LRA volume "
+         "computation\n\n"
+      << "This input matches none of these. Declare BV/Bool projection "
+         "variables,\n"
+      << "use a supported logic, or force an engine explicitly (e.g. --pact, "
+         "--bvcnf, --enum)."
+      << std::endl;
+}
+
 }  // namespace
 
 int main(int argc, char *argv[]) {
-  po::options_description desc("Allowed options");
-  desc.add_options()
+  // General options shared by every engine. By default ttc auto-selects an
+  // engine from the (set-logic ...) directive and the projection variables;
+  // the options below are grouped by the engine they configure.
+  po::options_description general("General options");
+  general.add_options()
       ("help,h", "Display help information")
-      ("rewrite-prop", "Use rewrite-based propagation instead of cvc5 simplify")
-      ("no-contract",
-       "Do not contract to projection variables for tree decomposition")
-      ("netrel", "Apply netlist relevance reduction before contraction")
-      ("arjun", "Minimize projection set before counting")
       ("approx,a",
        "Use approximate model counting")
       ("seed,s",
        po::value<std::uint64_t>()->default_value(42),
        "Seed for randomized approximate counting")
-      ("tocnf",
-       "Convert assertions to CNF")
+      ("verbose,v", po::value<int>()->default_value(1),
+       "Verbosity level (0-10)")
+      ("verbosity-time,vt",
+       po::value<double>()->default_value(5.0),
+       "Print progress every K seconds")
+      ("trace,t",
+       po::value<std::vector<std::string>>()->composing()->multitoken(),
+       "Enable tracing for selected components");
+
+  // Engine 1: pure bit-vector logics (BV / UFBV) -> eager bit-blast + ApproxMC.
+  po::options_description classBv(
+      "Engine 1 -- bit-vector counting (auto: logic BV / UFBV)");
+  classBv.add_options()
       ("bvcnf", po::value<std::string>(),
        "Eagerly bit-blast a QF_BV formula to a model-preserving CNF, write it "
-       "to the given file, and run ApproxMC to count its bit-vector models")
+       "to the given file, and run ApproxMC to count its bit-vector models "
+       "(forces this engine; auto-selected for BV/UFBV logics)");
+
+  // Engine 2: other theories with BV/Bool projection variables -> --pact.
+  po::options_description classPb(
+      "Engine 2 -- projection counting (auto: other theories, BV/Bool "
+      "projection vars)");
+  classPb.add_options()
+      ("pact,P",
+       "Enable projection-based approximate counting (forces this engine; "
+       "auto-selected for non-BV/non-LRA logics with BV/Bool projection "
+       "variables)")
+      ("enum,E", "Enumerate projected assignments exactly")
+      ("xor", po::value<std::string>(),
+       "XOR (parity hash) backend: 'cvc' = Gauss-Jordan inside cvc5's "
+       "propagator (default mode); 'cadical' = CaDiCaL native XOR engine; "
+       "'cms' = route to the bit-vector SAT solver (CryptoMiniSat); "
+       "'blast' = Tseitin-blast to CNF for plain CaDiCaL. Unset: 'cvc' for "
+       "LRA/theory inputs, auto-fallback to 'cms' for bit-vector inputs.");
+
+  // Engine 3: pure QF_LRA with no projection variables -> LRA volume.
+  po::options_description classLra(
+      "Engine 3 -- LRA volume computation (auto: QF_LRA, no projection vars; "
+      "fully automatic, no tunable options)");
+
+  // Engine 4 (d-DNNF / exact CNF counting) and its tuning knobs are inactive by
+  // default and hidden from --help. They are still accepted on the command line
+  // so existing invocations keep working.
+  po::options_description advanced("Advanced / exact counting options");
+  advanced.add_options()
+      ("arjun", "Minimize projection set before counting")
+      ("unsat",
+       "Count projection assignments that make the constraints unsatisfiable")
+      ("unsat-q",
+       "Use quantified reasoning when counting unsatisfied projection assignments")
+      ("rewrite-prop", "Use rewrite-based propagation instead of cvc5 simplify")
+      ("no-contract",
+       "Do not contract to projection variables for tree decomposition")
+      ("netrel", "Apply netlist relevance reduction before contraction")
+      ("tocnf",
+       "Convert assertions to CNF")
 #if defined(TTC_ENABLE_DDNNF)
       ("d4,D", "Use D4 for model counting on CNF abstraction")
       ("full-decomp",
@@ -607,37 +789,19 @@ int main(int argc, char *argv[]) {
       ("no-res-simp",
        "Disable residual SMT simplification before D4 decomposition")
 #endif
-      ("unsat",
-       "Count projection assignments that make the constraints unsatisfiable")
-      ("unsat-q",
-       "Use quantified reasoning when counting unsatisfied projection assignments")
-      ("PB", "Enable projection-based approximate counting mode")
-      ("no-bv-pact",
-       "In --PB mode, keep Boolean projection variables (and route XOR hashes "
-       "through the core SAT solver) instead of substituting fresh 1-bit "
-       "bit-vector variables that send the XOR hashes to the BV SAT backend")
-      ("bv-pact",
-       "In --PB mode, force the BV-PACT backend (substitute fresh 1-bit "
-       "bit-vectors so XOR hashes reach the BV SAT backend). This was the old "
-       "default; --cvcxor is now the default, so use this to opt back in")
-      ("PE", "Enumerate projected assignments exactly")
-      ("xor",
-       po::bool_switch()->default_value(false),
-       "Enable CaDiCaL native XOR support when available")
-      ("cvcxor",
-       "In --PB mode, solve the XOR (parity) hashes with a Gauss-Jordan engine "
-       "inside cvc5's own CadicalPropagator (theory + parity share one "
-       "propagator) instead of handing them to CaDiCaL's native XOR engine. "
-       "Implies --xor and --no-bv-pact")
-      ("verbose,v", po::value<int>()->default_value(1),
-       "Verbosity level (0-10)")
-      ("verbosity-time,vt",
-       po::value<double>()->default_value(5.0),
-       "Print progress every K seconds")
-      ("trace,t",
-       po::value<std::vector<std::string>>()->composing()->multitoken(),
-       "Enable tracing for selected components")
+      ;
+
+  po::options_description hidden;
+  hidden.add_options()
       ("input-file", po::value<std::string>(), "SMT2 file");
+
+  // Visible help groups the options by the three active engines; the advanced
+  // (engine 4 / exact CNF) options and the positional input-file are accepted
+  // by the parser but hidden from --help.
+  po::options_description visible("Allowed options");
+  visible.add(general).add(classBv).add(classPb).add(classLra);
+  po::options_description all;
+  all.add(visible).add(advanced).add(hidden);
 
   po::positional_options_description p;
   p.add("input-file", 1);
@@ -650,13 +814,13 @@ int main(int argc, char *argv[]) {
       std::string a(argv[i]);
       if (a == "-vt")
         a = "--verbosity-time";
-      else if (a == "-PB")
-        a = "--PB";
-      else if (a == "-PE")
-        a = "--PE";
+      else if (a == "-PB" || a == "--PB")  // legacy aliases for --pact
+        a = "--pact";
+      else if (a == "-PE" || a == "--PE")  // legacy aliases for --enum
+        a = "--enum";
       args.push_back(a);
     }
-    po::store(po::command_line_parser(args).options(desc).positional(p).run(),
+    po::store(po::command_line_parser(args).options(all).positional(p).run(),
               vm);
     po::notify(vm);
   } catch (const std::exception &ex) {
@@ -667,7 +831,18 @@ int main(int argc, char *argv[]) {
   if (vm.count("help") || !vm.count("input-file")) {
     std::cout << "Usage: " << argv[0] << " [options] filename.smt2"
               << std::endl;
-    std::cout << desc << std::endl;
+    std::cout << visible << std::endl;
+    std::cout
+        << "Automatic engine selection (when no engine is forced):\n"
+        << "  1. logic BV / UFBV                          -> bit-vector "
+           "ApproxMC (eager bit-blast)\n"
+        << "  2. other theories with BV/Bool projection   -> projection "
+           "counting (--pact)\n"
+        << "  3. QF_LRA with no projection variables       -> LRA volume "
+           "computation\n"
+        << "  4. otherwise                                 -> unsupported "
+           "(reports an error and exits)\n"
+        << std::endl;
     return 1;
   }
 
@@ -677,30 +852,98 @@ int main(int argc, char *argv[]) {
   bool useNetrel = vm.count("netrel") > 0;
   bool useArjun = vm.count("arjun") > 0;
   bool useApprox = vm.count("approx") > 0;
-  bool useProjectionBoost = vm.count("PB") > 0;
-  bool useProjectionEnumerate = vm.count("PE") > 0;
+  bool useProjectionBoost = vm.count("pact") > 0;
+  bool useProjectionEnumerate = vm.count("enum") > 0;
   std::uint64_t approxSeed = vm["seed"].as<std::uint64_t>();
   bool useUnsatQuant = vm.count("unsat-q") > 0;
   bool countUnsatAssignments = vm.count("unsat") > 0 || useUnsatQuant;
-  bool requestNativeXor = vm["xor"].as<bool>();
-  // --cvcxor: Gauss-Jordan parity solving inside cvc5's CadicalPropagator (a
-  // single propagator does theory + parity, and GJ propagation prunes the
-  // search like CMS/ApproxMC). This is now the DEFAULT backend for --PB; opt
-  // out with --bv-pact (old default: route XOR hashes through the BV SAT
-  // backend) or the other experimental paths --no-bv-pact / --xor.
-  bool useCvcXor = vm.count("cvcxor") > 0;
-  if (useProjectionBoost && !useCvcXor && vm.count("bv-pact") == 0
-      && vm.count("no-bv-pact") == 0 && !requestNativeXor)
+
+  // XOR (parity hash) backend for projection counting:
+  //   --xor cvc      -> Gauss-Jordan inside cvc5's CadicalPropagator (a single
+  //                     propagator does theory + parity, pruning the search
+  //                     like CMS/ApproxMC). The current default mode.
+  //   --xor cadical  -> hand each parity to CaDiCaL's native XOR engine.
+  //   --xor cms      -> route the XOR hashes to the bit-vector SAT solver
+  //                     (CryptoMiniSat); the BV-PACT substitution path.
+  //   --xor blast    -> Tseitin-blast the XOR hashes to CNF and solve them as
+  //                     plain clauses with CaDiCaL (no Gauss-Jordan).
+  //   (unset)        -> smart default: 'cvc' for LRA/theory inputs, auto-falls
+  //                     back to 'cms' for bit-vector / define-fun inputs where
+  //                     Gauss-Jordan stalls or cannot run.
+  std::string xorMode;
+  if (vm.count("xor"))
   {
-    // Smart default: cvcxor for LRA/theory inputs (where its GJ propagation is
-    // ~27x faster), BV-PACT for bit-vector or define-fun inputs (where cvcxor
-    // stalls or cannot run). Explicit --cvcxor / --bv-pact override this.
+    xorMode = vm["xor"].as<std::string>();
+    if (xorMode != "cvc" && xorMode != "cadical" && xorMode != "cms"
+        && xorMode != "blast")
+    {
+      std::cerr << "Error: --xor expects 'cvc', 'cadical', 'cms' or 'blast'"
+                << std::endl;
+      return 1;
+    }
+  }
+  const bool xorForceCvc = (xorMode == "cvc");
+  const bool xorForceCadical = (xorMode == "cadical");
+  const bool xorForceCms = (xorMode == "cms");
+  bool useCvcXor = false;
+  bool useXorCnf = (xorMode == "blast");
+  bool requestNativeXor = false;
+
+  // ----- Automatic engine dispatch (pre-parse classification) ---------------
+  // When the user does not force an engine, classify the input from its
+  // (set-logic ...) directive. Projection-variable types are only known after
+  // parsing, so pure-LRA is resolved into PB vs. volume later; everything that
+  // can run projection counting is configured here so the --PB backend (cvcxor
+  // / bv-pact) is set up exactly as if --PB had been passed explicitly.
+  const bool explicitEngine =
+      vm.count("pact") || vm.count("enum") || vm.count("bvcnf")
+      || vm.count("tocnf") || vm.count("d4") || vm.count("FB")
+      || vm.count("unsat") || vm.count("unsat-q");
+  const bool autoDispatch = !explicitEngine;
+  bool autoBvCnf = false;     // rule 1: BV/UFBV -> eager bit-blast + ApproxMC
+  bool autoDeferred = false;  // rule 2 (PB) or rule 3 (volume), resolved after parsing
+  std::string autoLogic;
+  if (autoDispatch)
+  {
+    autoLogic = extractLogicUpper(filename);
+    if (logicIsPureBv(autoLogic))
+    {
+      autoBvCnf = true;
+    }
+    else
+    {
+      // Rule 2 (projection counting) or rule 3 (LRA volume): the choice depends
+      // on the projection-variable sorts, which are only known after parsing.
+      // The PB backend (cvcxor / bv-pact) is configured below so that, if this
+      // resolves to projection counting, it behaves exactly like --PB.
+      autoDeferred = true;
+    }
+  }
+
+  // The XOR backend is configured for the deferred case too so that, if it
+  // resolves to projection counting, it behaves exactly like --pact. These
+  // settings are inert for the volume path.
+  const bool pbBackendNeeded = useProjectionBoost || autoDeferred;
+  if (xorForceCvc)
+  {
+    useCvcXor = true;
+  }
+  else if (xorForceCadical)
+  {
+    // Hand each parity to CaDiCaL's native XOR engine (no substitution path).
+    requestNativeXor = true;
+  }
+  else if (!xorForceCms && !useXorCnf && pbBackendNeeded)
+  {
+    // Smart default: 'cvc' (Gauss-Jordan, ~27x faster) for LRA/theory inputs,
+    // 'cms' (BV-PACT) for bit-vector or define-fun inputs where Gauss-Jordan
+    // stalls or cannot run. An explicit --xor mode overrides this.
     useCvcXor = preferCvcXorDefault(filename);
   }
-  // BV-PACT substitutes fresh 1-bit bit-vectors for the Boolean projection
-  // variables so the XOR hashes reach the BV SAT backend.
-  bool useBvPact =
-      useProjectionBoost && !useCvcXor && vm.count("no-bv-pact") == 0;
+  // 'cms' / BV-PACT substitutes fresh 1-bit bit-vectors for the Boolean
+  // projection variables so the XOR hashes reach the BV SAT backend.
+  bool useBvPact = pbBackendNeeded && !useCvcXor && !useXorCnf
+                   && !requestNativeXor;
   if (useCvcXor)
   {
     requestNativeXor = true;
@@ -715,8 +958,17 @@ int main(int argc, char *argv[]) {
       setenv("CVC5_XOR_GAUSS_PROP", "1", 1);
     }
   }
+  if (useXorCnf)
+  {
+    // 'blast': TTC_XOR_CNF makes rebuildCountSolver force CaDiCaL with native
+    // XOR disabled, so the parity is Tseitin-expanded to CNF and solved as
+    // plain clauses -- no Gauss-Jordan anywhere.
+    requestNativeXor = false;
+    useBvPact = false;
+    setenv("TTC_XOR_CNF", "1", 1);
+  }
   bool useToCNF = vm.count("tocnf") > 0;
-  bool useBvCnf = vm.count("bvcnf") > 0;
+  bool useBvCnf = vm.count("bvcnf") > 0 || autoBvCnf;
   bool writeFB = vm.count("FB") > 0;
   bool useMono = vm.count("mono") > 0 || vm.count("mono-true") > 0;
   bool monoTrue = vm.count("mono-true") > 0;
@@ -940,10 +1192,43 @@ int main(int argc, char *argv[]) {
   {
     parser.promoteBooleanAndBvToProjection();
   }
+
+  // Resolve the deferred automatic engine choice now that the projection
+  // variables (and their sorts) are known. --bvcnf (rule 1) was already
+  // committed pre-parse.
+  if (autoDispatch && autoDeferred)
+  {
+    const std::vector<cvc5::Term>& pv = parser.projectionVars();
+    if (!pv.empty() && projVarsAreBvOrBool(pv))
+    {
+      // Rule 2: BV/Bool projection variables -> projection counting (the
+      // pre-parse PB backend was already configured).
+      useProjectionBoost = true;
+      useApprox = true;
+    }
+    else
+    {
+      // Rule 3 candidate: pure LRA with no projection variables -> volume.
+      // Mirror the isLraInput detection used below; anything else (e.g. a
+      // bare QF_LIA, or non-BV/Bool projection variables) is unsupported.
+      const bool lra =
+          (!autoLogic.empty() && autoLogic.find("LRA") != std::string::npos)
+          || (parser.numRealVars() > 0 && parser.numIntVars() == 0
+              && parser.numBvVars() == 0);
+      const bool volumeOk = lra && pv.empty() && !parser.formula().isNull();
+      if (!volumeOk)
+      {
+        printUnsupportedEngine(autoLogic, parser.numProjVars());
+        return 1;
+      }
+      // else: leave useProjectionBoost false; the isLraInput path runs volume.
+    }
+  }
+
   if (parser.hasWeights() && !useProjectionEnumerate && !useProjectionBoost)
   {
-    std::cerr << "Error: declare-weight is currently supported only with --PE"
-              << " or --PB" << std::endl;
+    std::cerr << "Error: declare-weight is currently supported only with --enum"
+              << " or --pact" << std::endl;
     return 1;
   }
   if (parser.hasWeights() && countUnsatAssignments)
@@ -957,7 +1242,9 @@ int main(int argc, char *argv[]) {
   // ApproxMC over the bits of the bit-vector variables.
   if (useBvCnf)
   {
-    const std::string bvCnfPath = vm["bvcnf"].as<std::string>();
+    const std::string bvCnfPath = vm.count("bvcnf")
+                                      ? vm["bvcnf"].as<std::string>()
+                                      : makeAutoCnfPath(filename);
 
     // Sampling set: every declared bit-vector variable, including those that
     // do not occur in any assertion (counted as free bits), so the projected
@@ -1276,7 +1563,7 @@ int main(int argc, char *argv[]) {
         }
         catch (const std::exception& ex)
         {
-          std::cerr << "Error: weighted --PB failed: " << ex.what()
+          std::cerr << "Error: weighted --pact failed: " << ex.what()
                     << std::endl;
           return 1;
         }

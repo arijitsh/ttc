@@ -274,6 +274,23 @@ void Pact::rebuildCountSolver()
     }
   }
 
+  if (!d_useNativeXor && std::getenv("TTC_XOR_CNF"))
+  {
+    // --xorcnf baseline: hash with the Boolean parity *formula* (the fallback
+    // path, not assertXorClause) and force CaDiCaL with native XOR disabled, so
+    // cvc5's CNF stream Tseitin-expands each XOR into ordinary clauses. The
+    // parity is then solved as plain CNF by CaDiCaL -- no Gauss-Jordan at all --
+    // which is the natural baseline for the XOR-reasoning comparison.
+    try
+    {
+      cs.setOption("sat-solver", "cadical");
+      cs.setOption("sat-use-native-xor", "false");
+    }
+    catch (const cvc5::CVC5ApiException&)
+    {
+    }
+  }
+
   if (d_useNativeXor)
   {
     // Native XOR clauses (assertXorClause) are only supported when the core SAT
@@ -399,6 +416,10 @@ std::uint64_t Pact::count()
   double startTime = Log.elapsed();
   double lastProgress = -progress_interval;
   std::size_t currentRound = 0;
+  // Peak number of parity hashes added at any evaluation across the whole
+  // galloping search (reported as 'c max hashes:' for comparison with other
+  // counters' XOR depth).
+  std::size_t maxHashesUsed = 0;
 
   // Emits one row for every saturating-count evaluation (one per hash count
   // tried by the galloping search). `nextHash` is where the search will jump
@@ -406,6 +427,10 @@ std::uint64_t Pact::count()
   auto report = [&](std::size_t hashCount,
                     const std::optional<std::size_t>& sols,
                     std::int64_t nextHash) {
+    if (hashCount > maxHashesUsed)
+    {
+      maxHashesUsed = hashCount;
+    }
     if (Log.getVerbosity() == 0)
     {
       return;
@@ -442,6 +467,7 @@ std::uint64_t Pact::count()
   {
     Trace("pact") << "[pact] Base model count succeeded without hashing: "
         << *base << std::endl;
+    std::cout << "c max hashes: " << maxHashesUsed << std::endl;
     return static_cast<std::uint64_t>(*base);
   }
   Trace("pact")
@@ -498,6 +524,7 @@ std::uint64_t Pact::count()
   std::uint64_t result = median(estimates);
   Trace("pact") << "[pact] Median estimate across iterations: " << result
       << std::endl;
+  std::cout << "c max hashes: " << maxHashesUsed << std::endl;
   if (std::getenv("TTC_PACT_STATS") != nullptr)
   {
     try
