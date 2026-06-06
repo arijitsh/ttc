@@ -265,7 +265,9 @@ void assertCnf(cvc5::Solver& solver,
 WeightedPbResult runWeightedProjectionBoost(TTCParser& parser,
                                             std::uint64_t seed,
                                             bool useNativeXor,
-                                            bool useBvPact)
+                                            bool useBvPact,
+                                            double epsilon = 0.8,
+                                            double delta = 0.2)
 {
   for (const cvc5::Term& term : parser.projectionVars())
   {
@@ -330,7 +332,8 @@ WeightedPbResult runWeightedProjectionBoost(TTCParser& parser,
     projectionVars.push_back(cnfVars[var]);
   }
 
-  Pact counter(solver, projectionVars, seed, useNativeXor, useBvPact);
+  Pact counter(
+      solver, projectionVars, seed, useNativeXor, useBvPact, epsilon, delta);
   std::uint64_t unweightedCount = counter.count();
 
   WeightedPbResult result;
@@ -706,6 +709,14 @@ int main(int argc, char *argv[]) {
       ("seed,s",
        po::value<std::uint64_t>()->default_value(42),
        "Seed for randomized approximate counting")
+      ("epsilon,e",
+       po::value<double>()->default_value(0.8, "0.8"),
+       "Approximation tolerance: the count is within a (1+epsilon) "
+       "multiplicative factor of the true count (ApproxMC epsilon)")
+      ("delta,d",
+       po::value<double>()->default_value(0.2, "0.2"),
+       "Confidence: the (1+epsilon) guarantee holds with probability at least "
+       "1-delta (ApproxMC delta)")
       ("verbose,v", po::value<int>()->default_value(1),
        "Verbosity level (0-10)")
       ("verbosity-time,vt",
@@ -739,7 +750,14 @@ int main(int argc, char *argv[]) {
        "propagator (default mode); 'cadical' = CaDiCaL native XOR engine; "
        "'cms' = route to the bit-vector SAT solver (CryptoMiniSat); "
        "'blast' = Tseitin-blast to CNF for plain CaDiCaL. Unset: 'cvc' for "
-       "LRA/theory inputs, auto-fallback to 'cms' for bit-vector inputs.");
+       "LRA/theory inputs, auto-fallback to 'cms' for bit-vector inputs.")
+      ("xor-activation", po::value<std::string>(),
+       "How the native-XOR galloping search switches hashes on/off: 'rebuild' "
+       "(default) rebuilds the count solver per galloping level so it sees only "
+       "the active hashes; 'literal' folds an indicator variable into each "
+       "parity and toggles hashes by assumption on one solver. 'rebuild' is "
+       "measured faster here -- 'literal' accumulates every explored hash on "
+       "the solver, which outweighs the saved rebuild.");
 
   // Engine 3: pure QF_LRA with no projection variables -> LRA volume.
   po::options_description classLra(
@@ -855,6 +873,8 @@ int main(int argc, char *argv[]) {
   bool useProjectionBoost = vm.count("pact") > 0;
   bool useProjectionEnumerate = vm.count("enum") > 0;
   std::uint64_t approxSeed = vm["seed"].as<std::uint64_t>();
+  double approxEpsilon = vm["epsilon"].as<double>();
+  double approxDelta = vm["delta"].as<double>();
   bool useUnsatQuant = vm.count("unsat-q") > 0;
   bool countUnsatAssignments = vm.count("unsat") > 0 || useUnsatQuant;
 
@@ -882,6 +902,21 @@ int main(int argc, char *argv[]) {
       return 1;
     }
   }
+  // --xor-activation {literal,rebuild}: how the native-XOR galloping search
+  // toggles hashes. Default 'literal' (indicator-assumption, no per-level
+  // rebuild). Carried into Pact via TTC_XOR_ACTIVATION.
+  if (vm.count("xor-activation"))
+  {
+    std::string act = vm["xor-activation"].as<std::string>();
+    if (act != "literal" && act != "rebuild")
+    {
+      std::cerr << "Error: --xor-activation expects 'literal' or 'rebuild'"
+                << std::endl;
+      return 1;
+    }
+    setenv("TTC_XOR_ACTIVATION", act.c_str(), 1);
+  }
+
   const bool xorForceCvc = (xorMode == "cvc");
   const bool xorForceCadical = (xorMode == "cadical");
   const bool xorForceCms = (xorMode == "cms");
@@ -932,6 +967,18 @@ int main(int argc, char *argv[]) {
   {
     // Hand each parity to CaDiCaL's native XOR engine (no substitution path).
     requestNativeXor = true;
+    // The new ~/solvers/cadical ships an incremental Gauss-Jordan XOR engine
+    // (a watched-column port of CMS's EGaussian) but defaults it OFF
+    // (gauss=0) with CNF-blasting ON (xorblast=1). With those defaults every
+    // parity hash is Tseitin-expanded to plain CNF and solved with no Gaussian
+    // reasoning -- exponential on the dense XOR hashes, so counting hangs at the
+    // first hash level. Enable the GJ engine exactly as ApproxMC drives this
+    // same build (gauss=1, xorblast=0); CaDiCaL reads these per-option
+    // CADICAL_<NAME> env vars when each solver is constructed. (The --xor cvc
+    // path solves parities in cvc5's own propagator instead, so it leaves
+    // CaDiCaL's engine at its defaults.)
+    setenv("CADICAL_GAUSS", "1", 1);
+    setenv("CADICAL_XORBLAST", "0", 1);
   }
   else if (!xorForceCms && !useXorCnf && pbBackendNeeded)
   {
@@ -1555,7 +1602,9 @@ int main(int argc, char *argv[]) {
               runWeightedProjectionBoost(parser,
                                          approxSeed,
                                          g_useNativeXor,
-                                         useBvPact);
+                                         useBvPact,
+                                         approxEpsilon,
+                                         approxDelta);
           std::cout << "s wmc ";
           printWeightedCount(weighted.weightedCount);
           std::cout << std::endl;
@@ -1568,7 +1617,7 @@ int main(int argc, char *argv[]) {
           return 1;
         }
       }
-      Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact);
+      Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact, approxEpsilon, approxDelta);
       std::uint64_t res = counter.count();
       cpp_int unsatTotal;
       bool haveUnsat = false;
@@ -1648,12 +1697,13 @@ int main(int argc, char *argv[]) {
     // headings line up over their values.
     {
       std::ostringstream hdr;
-      hdr << "c " << std::setw(8) << "sec";
-      hdr << "  " << std::setw(6) << "round";
-      hdr << "  " << std::setw(6) << "hashes";
-      hdr << "  " << std::setw(10) << "saturating";
-      hdr << "  " << std::setw(9) << "nexthash";
-      hdr << "  " << std::setw(16) << "count";
+      hdr << "c " << std::setw(7) << "sec";
+      hdr << ' ' << std::setw(3) << "rnd";
+      hdr << ' ' << std::setw(4) << "hash";
+      hdr << ' ' << std::setw(8) << "sat";
+      hdr << ' ' << std::setw(9) << "reuse";
+      hdr << ' ' << std::setw(5) << "next";
+      hdr << ' ' << std::setw(13) << "count";
       std::cout << hdr.str() << std::endl;
     }
     double countStart = Log.elapsed();
@@ -1666,11 +1716,13 @@ int main(int argc, char *argv[]) {
         weighted = runWeightedProjectionBoost(parser,
                                              approxSeed,
                                              g_useNativeXor,
-                                             useBvPact);
+                                             useBvPact,
+                                             approxEpsilon,
+                                             approxDelta);
       }
       else
       {
-        Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact);
+        Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact, approxEpsilon, approxDelta);
         res = counter.count();
         weighted.smtCalls = counter.getSmtCallCount();
       }

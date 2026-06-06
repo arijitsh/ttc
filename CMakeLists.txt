@@ -80,10 +80,19 @@ if(NOT PICPOLYXX_LIB)
   message(WARNING "picpolyxx library not found; continuing without explicit linkage")
   set(PICPOLYXX_LIB "")
 endif()
-find_library(CADICAL_LIB cadical HINTS ${CVC5_DEPS_LIB_DIR})
+# CaDiCaL: link ONLY the hand-patched v3.0.0 build at ~/solvers/cadical, whose
+# gauss.cpp XOR engine has the residual-Gaussian-elimination GJ propagation.
+set(NEW_CADICAL_ROOT "$ENV{HOME}/solvers/cadical")
+find_library(CADICAL_LIB cadical
+             HINTS "${NEW_CADICAL_ROOT}/build"
+             NO_DEFAULT_PATH)
 if(NOT CADICAL_LIB)
-  message(WARNING "CaDiCaL library not found; continuing without explicit linkage")
-  set(CADICAL_LIB "")
+  message(FATAL_ERROR "sc2025 CaDiCaL not found at ${NEW_CADICAL_ROOT}/build/libcadical.a")
+endif()
+message(STATUS "CaDiCaL library: ${CADICAL_LIB}")
+set(CADICAL_SRC_INCLUDE_DIR "${NEW_CADICAL_ROOT}/src")
+if(EXISTS "${CADICAL_SRC_INCLUDE_DIR}/internal.hpp")
+  include_directories(${CADICAL_SRC_INCLUDE_DIR})
 endif()
 # CryptoMiniSat is only required when cvc5 was built statically with CMS support.
 find_library(CMS_LIB cryptominisat5 HINTS ${CVC5_DEPS_LIB_DIR})

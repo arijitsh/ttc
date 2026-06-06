@@ -34,13 +34,42 @@ class SaturatingCounter
   // assertion stack has been reset out from under the counter.
   void resetCache();
 
+  // Seed the model cache for the next count() with models already known to
+  // satisfy `constraints` (ApproxMC's reuse_models). count() will pre-count and
+  // pre-block them without an SMT call, then enumerate only the remaining
+  // (new) models. The caller is responsible for the validity of `models`.
+  void primeCache(const std::vector<HashConstraint>& constraints,
+                  std::vector<std::vector<cvc5::Term>> models)
+  {
+    d_cachedConstraints = constraints;
+    d_cachedModels = std::move(models);
+  }
+
+  // The projection assignments present after the most recent count(): the
+  // primed (reused) models followed by any newly enumerated ones.
+  const std::vector<std::vector<cvc5::Term>>& lastModels() const
+  {
+    return d_cachedModels;
+  }
+
   std::uint64_t getSmtCallCount() const { return d_smtCalls; }
 
   std::optional<std::size_t> count(
       const std::vector<HashConstraint>& additionalConstraints,
       std::size_t threshold);
 
+  // --xor-activation literal: the hash parities are already asserted on the
+  // solver (once, with their indicator variables). This enumerates models with
+  // the given activation literals assumed, so the active hashes are enforced
+  // and inactive ones stay vacuous -- no per-level rebuild and no cache reuse.
+  std::optional<std::size_t> countWithAssumptions(
+      const std::vector<cvc5::Term>& assumptions,
+      std::size_t threshold);
+
  private:
+  cvc5::Term buildBlockingClause(const std::vector<cvc5::Term>& modelValues,
+                                 bool projectionsAreBoolean) const;
+
   cvc5::Solver* d_solver;
   const std::vector<cvc5::Term>* d_projectionVars;
   std::vector<HashConstraint> d_cachedConstraints;

@@ -52,13 +52,48 @@ Pact::Pact(cvc5::Solver& solver,
            const std::vector<cvc5::Term>& projectionVars,
            std::uint64_t seed,
            bool useNativeXor,
-           bool bvPact)
+           bool bvPact,
+           double epsilon,
+           double delta)
     : d_solver(solver),
       d_rng(static_cast<std::mt19937::result_type>(seed)),
       d_counter(solver),
       d_boolHash(solver),
-      d_bvHash(solver)
+      d_bvHash(solver),
+      d_epsilon(epsilon),
+      d_delta(delta)
 {
+  if (d_epsilon <= 0.0)
+  {
+    d_epsilon = 0.8;
+  }
+  if (d_delta <= 0.0 || d_delta >= 1.0)
+  {
+    d_delta = 0.2;
+  }
+  // ApproxMC's reuse_models is on by default; TTC_NO_REUSE turns it off so the
+  // effect of the optimisation can be measured against the plain search.
+  if (std::getenv("TTC_NO_REUSE"))
+  {
+    d_reuseModels = false;
+  }
+  // --xor-activation {rebuild,literal}; main maps the flag to TTC_XOR_ACTIVATION.
+  // Default 'rebuild': measured faster here than 'literal'. Although 'literal'
+  // (one solver, hashes toggled by indicator assumptions) avoids the per-level
+  // rebuild, the galloping search overshoots and every explored hash stays on
+  // the solver -- on ttc's heavy count solver those accumulated, sampling-var-
+  // coupled GF(2) rows cost more than the cheap rebuild they replace. (ApproxMC
+  // tolerates it because its solver is a lean 45-var CNF, not a 183-var cvc5
+  // re-encoding.) 'literal' is kept as an opt-in.
+  if (const char* mode = std::getenv("TTC_XOR_ACTIVATION"))
+  {
+    d_xorActivationLiteral = (std::string(mode) == "literal");
+  }
+  else
+  {
+    d_xorActivationLiteral = false;
+  }
+
   std::string logic;
   try
   {
@@ -331,14 +366,36 @@ void Pact::rebuildCountSolver()
 
   d_counter.setSolver(cs);
   d_counter.resetCache();
+  // The fresh solver carries none of the pool's hashes yet (literal activation).
+  d_assertedHashes = 0;
+}
+
+double Pact::calcErrorBound(std::size_t t, double p) const
+{
+  // sum_{k=ceil(t/2)}^{t} C(t,k) p^k (1-p)^(t-k), computed by walking down from
+  // the k=t term so the binomial coefficients update multiplicatively (no
+  // factorials / overflow). Verbatim from ApproxMC's Counter::calc_error_bound.
+  double curr = std::pow(p, static_cast<double>(t));
+  double sum = curr;
+  const std::int64_t lo = static_cast<std::int64_t>(
+      std::ceil(static_cast<double>(t) / 2.0));
+  for (std::int64_t k = static_cast<std::int64_t>(t) - 1; k >= lo; --k)
+  {
+    curr *= static_cast<double>(k + 1) / static_cast<double>(t - k)
+            * (1.0 - p) / p;
+    sum += curr;
+  }
+  return sum;
 }
 
 Pact::Parameters Pact::getParameters() const
 {
-  const double epsilon = 0.8;
-  const double delta = 2.5;
+  // ApproxMC6 threshold (CAV23, Counter::set_up_probs_threshold_measurements,
+  // dense / non-sparse so thresh_factor = 1).
   std::size_t pivot = static_cast<std::size_t>(
-      std::ceil(2.0 * std::ceil(4.49 * std::pow(1.0 + 1.0 / epsilon, 2.0))));
+      1.0
+      + 9.84 * (1.0 + 1.0 / d_epsilon) * (1.0 + 1.0 / d_epsilon)
+            * (1.0 + d_epsilon / (1.0 + d_epsilon)));
   if (pivot == 0)
   {
     pivot = 1;
@@ -347,24 +404,77 @@ Pact::Parameters Pact::getParameters() const
   {
     pivot = static_cast<std::size_t>(std::atoll(e));
   }
-  std::size_t iterations = static_cast<std::size_t>(
-      std::ceil(25.0 * std::log(3.0 / delta)));
-  if (iterations == 0)
+
+  // Upper bounds on the per-measurement under-/over-estimation probabilities
+  // (ApproxMC6, Lemma 4 of the CAV23 rounding paper). The epsilon breakpoints
+  // pair with the rounding applied in roundCount().
+  double pL;
+  if (d_epsilon < std::sqrt(2.0) - 1.0)
   {
-    iterations = 1;
+    pL = 0.262;
+  }
+  else if (d_epsilon < 1.0)
+  {
+    pL = 0.157;
+  }
+  else if (d_epsilon < 3.0)
+  {
+    pL = 0.085;
+  }
+  else if (d_epsilon < 4.0 * std::sqrt(2.0) - 1.0)
+  {
+    pL = 0.055;
+  }
+  else
+  {
+    pL = 0.023;
+  }
+  const double pU = (d_epsilon < 3.0) ? 0.169 : 0.044;
+
+  // Smallest odd number of measurements whose combined error bound <= delta
+  // (median amplification, ApproxMC6 Algorithm 6).
+  std::size_t iterations = 1;
+  while (calcErrorBound(iterations, pL) + calcErrorBound(iterations, pU)
+         > d_delta)
+  {
+    iterations += 2;
+  }
+  if (const char* it = std::getenv("TTC_ITERATIONS"))
+  {
+    iterations = static_cast<std::size_t>(std::atoll(it));
+    if (iterations == 0)
+    {
+      iterations = 1;
+    }
   }
   return {pivot, iterations};
 }
 
-std::uint64_t Pact::median(std::vector<std::uint64_t>& values) const
+double Pact::roundCount(double cellCount) const
 {
-  if (values.empty())
+  // ApproxMC6 rounding (CAV23 Algorithm 5): round the cell count up to an
+  // epsilon-dependent multiple of the pivot. The pivot here is the un-rounded
+  // 9.84*(1+1/eps)^2 (NOT the +1, *thresh_factor threshold above).
+  const double pivot =
+      9.84 * (1.0 + 1.0 / d_epsilon) * (1.0 + 1.0 / d_epsilon);
+  if (d_epsilon < std::sqrt(2.0) - 1.0)
   {
-    return 0;
+    const double floor = std::sqrt(1.0 + 2.0 * d_epsilon) / 2.0 * pivot;
+    return std::max(cellCount, floor);
   }
-  std::size_t mid = values.size() / 2;
-  std::nth_element(values.begin(), values.begin() + mid, values.end());
-  return values[mid];
+  if (d_epsilon < 1.0)
+  {
+    return std::max(cellCount, pivot / std::sqrt(2.0));
+  }
+  if (d_epsilon < 3.0)
+  {
+    return std::max(cellCount, pivot);
+  }
+  if (d_epsilon < 4.0 * std::sqrt(2.0) - 1.0)
+  {
+    return pivot;
+  }
+  return std::sqrt(2.0) * pivot;
 }
 
 HashConstraint Pact::generateHashConstraint()
@@ -402,7 +512,20 @@ HashConstraint Pact::generateHashConstraint()
     fallback = tm.mkTerm(cvc5::Kind::AND, parts);
   }
 
-  return HashConstraint(fallback, std::move(clauses));
+  HashConstraint hash(fallback, std::move(clauses));
+
+  // In --xor-activation literal, give the hash a fresh indicator variable folded
+  // into its parity (see HashConstraint::setActivation). Only useful for the
+  // native-XOR path; the fallback Boolean encoding still rebuilds.
+  if (d_xorActivationLiteral && d_useNativeXor && hash.hasXorClauses())
+  {
+    cvc5::Term act =
+        tm.mkConst(d_solver.getBooleanSort(),
+                   "xact_" + std::to_string(d_activationCounter++));
+    hash.setActivation(act);
+  }
+
+  return hash;
 }
 
 std::uint64_t Pact::count()
@@ -426,7 +549,9 @@ std::uint64_t Pact::count()
   // next.
   auto report = [&](std::size_t hashCount,
                     const std::optional<std::size_t>& sols,
-                    std::int64_t nextHash) {
+                    std::int64_t nextHash,
+                    std::size_t reuseSat,
+                    std::size_t reuseChecked) {
     if (hashCount > maxHashesUsed)
     {
       maxHashesUsed = hashCount;
@@ -444,15 +569,28 @@ std::uint64_t Pact::count()
     }
     else
     {
-      countStream << ">= " << params.threshold;
+      countStream << ">=" << params.threshold;
+    }
+    // reuse_models tally: of `reuseChecked` stored solutions examined this
+    // evaluation, `reuseSat` still satisfied the active hashes and were reused
+    // without an SMT call. '-' when nothing was examined.
+    std::ostringstream reuseStream;
+    if (reuseChecked == 0)
+    {
+      reuseStream << '-';
+    }
+    else
+    {
+      reuseStream << reuseSat << '/' << reuseChecked;
     }
     std::ostringstream line;
-    line << std::fixed << std::setprecision(3);
-    line << "c " << std::setw(8) << elapsed;
-    line << "  " << std::setw(6) << currentRound;
-    line << "  " << std::setw(6) << hashCount;
-    line << "  " << std::setw(10) << countStream.str();
-    line << "  " << std::setw(9) << nextHash;
+    line << std::fixed << std::setprecision(2);
+    line << "c " << std::setw(7) << elapsed;
+    line << ' ' << std::setw(3) << currentRound;
+    line << ' ' << std::setw(4) << hashCount;
+    line << ' ' << std::setw(8) << countStream.str();
+    line << ' ' << std::setw(9) << reuseStream.str();
+    line << ' ' << std::setw(5) << nextHash;
     std::cout << line.str() << std::endl;
   };
 
@@ -462,7 +600,7 @@ std::uint64_t Pact::count()
   rebuildCountSolver();
   std::vector<HashConstraint> empty;
   std::optional<std::size_t> base = d_counter.count(empty, params.threshold);
-  report(0, base, 0);
+  report(0, base, 0, 0, 0);
   if (base.has_value())
   {
     Trace("pact") << "[pact] Base model count succeeded without hashing: "
@@ -473,8 +611,11 @@ std::uint64_t Pact::count()
   Trace("pact")
       << "[pact] Base count reached saturation; introducing random hashes"
       << std::endl;
+  // Level 0 (no hashes) is now known to saturate; oneMeasurement reuses this
+  // instead of re-enumerating the hash-free formula every measurement.
+  d_baseSaturated = true;
 
-  std::vector<std::uint64_t> estimates;
+  std::vector<double> estimates;
   estimates.reserve(params.iterations);
 
   // Carries the winning hash count between measurements (ApproxMC's
@@ -493,15 +634,24 @@ std::uint64_t Pact::count()
 
     // Each measurement draws a fresh pool of random parity hashes; within the
     // measurement the pool is reused so re-evaluating the same hash count is
-    // deterministic.
+    // deterministic. The saved-model store is tied to that pool, so it is
+    // cleared here (ApproxMC's hm.clear() between measurements).
     std::vector<HashConstraint> hashPool;
+    d_savedModels.clear();
     MeasurementResult m =
         oneMeasurement(iter, prevMeasure, hashPool, params.threshold, report);
 
-    std::uint64_t approx = static_cast<std::uint64_t>(m.cellCount);
-    approx <<= m.hashCount;
+    // ApproxMC6 rounding of the cell count, then scale by 2^hashCount. Rounding
+    // only applies once hashing was needed (with no hashes the cell count is the
+    // exact total and must not be inflated).
+    double cell = static_cast<double>(m.cellCount);
+    if (m.hashCount > 0)
+    {
+      cell = roundCount(cell);
+    }
+    double approx = std::ldexp(cell, static_cast<int>(m.hashCount));
     Trace("pact") << "[pact] Iteration " << (iter + 1) << " estimate: "
-        << approx << " (" << m.cellCount << " << " << m.hashCount << ")"
+        << approx << " (" << cell << " << " << m.hashCount << ")"
         << std::endl;
     estimates.push_back(approx);
 
@@ -509,19 +659,24 @@ std::uint64_t Pact::count()
     {
       double elapsed = Log.elapsed() - startTime;
       std::ostringstream line;
-      line << std::fixed << std::setprecision(3);
-      line << "c " << std::setw(8) << elapsed;
-      line << "  " << std::setw(6) << currentRound;
-      line << "  " << std::setw(6) << m.hashCount;
-      line << "  " << std::setw(10) << m.cellCount;
-      line << "  " << std::setw(9) << "winner";
-      line << "  " << std::setw(16) << approx;
+      line << std::fixed << std::setprecision(2);
+      line << "c " << std::setw(7) << elapsed;
+      line << ' ' << std::setw(3) << currentRound;
+      line << ' ' << std::setw(4) << m.hashCount;
+      line << ' ' << std::setw(8) << m.cellCount;
+      line << ' ' << std::setw(9) << "-";
+      line << ' ' << std::setw(5) << "win";
+      line << ' ' << std::setw(13)
+           << static_cast<std::uint64_t>(std::llround(approx));
       std::cout << line.str() << std::endl;
       lastProgress = elapsed;
     }
   }
 
-  std::uint64_t result = median(estimates);
+  std::sort(estimates.begin(), estimates.end());
+  double medianEstimate =
+      estimates.empty() ? 0.0 : estimates[estimates.size() / 2];
+  std::uint64_t result = static_cast<std::uint64_t>(std::llround(medianEstimate));
   Trace("pact") << "[pact] Median estimate across iterations: " << result
       << std::endl;
   std::cout << "c max hashes: " << maxHashesUsed << std::endl;
@@ -597,19 +752,110 @@ Pact::MeasurementResult Pact::oneMeasurement(
       hashCnt = 0;
     }
     const std::int64_t curHashCnt = hashCnt;
-    std::vector<HashConstraint> active = activeHashes(hashCnt);
-    Trace("pact") << "[pact] Evaluating hash count " << hashCnt << std::endl;
-    // Native XOR clauses are added to CaDiCaL's Gaussian engine, which has no
-    // per-scope retraction (an activation-guarded XOR cannot be deactivated --
-    // forcing the activation only flips the parity). Reusing the solver across
-    // galloping levels would therefore accumulate every level's hashes and
-    // over-constrain the formula. Rebuild a fresh counting solver per level so
-    // each count sees only its own hashes.
-    if (d_useNativeXor && !std::getenv("TTC_NO_PERLEVEL_REBUILD"))
+    std::optional<std::size_t> attempt;
+    // reuse_models tally for this evaluation, threaded into report().
+    std::size_t curReuseSat = 0;
+    std::size_t curReuseChecked = 0;
+    if (curHashCnt == 0 && d_baseSaturated)
     {
-      rebuildCountSolver();
+      // Level 0 is the hash-free formula, already known to saturate the pivot
+      // (see d_baseSaturated). Skip the rebuild + full re-enumeration: on large
+      // formulas with a small count the search returns to level 0 every
+      // measurement, and that base enumeration is the dominant cost.
+      Trace("pact") << "[pact] Reusing saturated base count at level 0"
+          << std::endl;
     }
-    std::optional<std::size_t> attempt = d_counter.count(active, threshold);
+    else if (d_xorActivationLiteral && d_useNativeXor)
+    {
+      // Literal activation: the whole hash pool lives on one solver. Generate
+      // hashes up to hashCnt, assert any not yet present (once each, with their
+      // indicator folded into the parity), then count with the first hashCnt
+      // indicators assumed false -- so exactly those hashes are enforced and the
+      // rest stay vacuous. No per-level rebuild; the search moving down just
+      // assumes fewer indicators.
+      activeHashes(hashCnt);  // grow hashPool to >= hashCnt
+      cvc5::Solver& cs = d_countSolver ? *d_countSolver : d_solver;
+      Trace("pact") << "[pact] Evaluating hash count " << hashCnt
+          << " (literal activation)" << std::endl;
+      for (; d_assertedHashes < static_cast<std::size_t>(hashCnt);
+           ++d_assertedHashes)
+      {
+        hashPool[d_assertedHashes].assertToSolver(cs, d_useNativeXor);
+      }
+      auto& tm = ttc::getTermBuilder(cs);
+      std::vector<cvc5::Term> assumptions;
+      assumptions.reserve(static_cast<std::size_t>(hashCnt));
+      for (std::int64_t i = 0; i < hashCnt; ++i)
+      {
+        const cvc5::Term& act = hashPool[i].activation();
+        if (!act.isNull())
+        {
+          assumptions.push_back(tm.mkTerm(cvc5::Kind::NOT, {act}));
+        }
+      }
+      attempt = d_counter.countWithAssumptions(assumptions, threshold);
+    }
+    else
+    {
+      std::vector<HashConstraint> active = activeHashes(hashCnt);
+      Trace("pact") << "[pact] Evaluating hash count " << hashCnt << std::endl;
+      // Native XOR clauses are added to CaDiCaL's Gaussian engine, which has no
+      // per-scope retraction (an activation-guarded XOR cannot be deactivated --
+      // forcing the activation only flips the parity). Reusing the solver across
+      // galloping levels would therefore accumulate every level's hashes and
+      // over-constrain the formula. Rebuild a fresh counting solver per level so
+      // each count sees only its own hashes.
+      if (d_useNativeXor && !std::getenv("TTC_NO_PERLEVEL_REBUILD"))
+      {
+        rebuildCountSolver();
+      }
+
+      // ApproxMC's reuse_models: pre-seed the count with the stored solutions
+      // that still satisfy these `hashCnt` parities, so the SMT solver only has
+      // to discover the ones we have not seen yet. A model saved with at least
+      // `hashCnt` hashes active automatically satisfies this prefix; one saved
+      // with fewer is checked against the parities (cheap term evaluation, no
+      // SMT call). The fresh solver after a rebuild has no banning clauses, so
+      // priming here is always sound. Reuse is skipped at level 0 (no hashes to
+      // satisfy, and the base count already saturated).
+      std::size_t primedCount = 0;
+      if (d_reuseModels && hashCnt > 0)
+      {
+        std::vector<std::vector<cvc5::Term>> reusable;
+        reusable.reserve(d_savedModels.size());
+        for (const SavedModel& sm : d_savedModels)
+        {
+          ++curReuseChecked;
+          if (sm.hashCount >= static_cast<std::size_t>(hashCnt)
+              || modelSatisfiesHashes(sm.values, active))
+          {
+            reusable.push_back(sm.values);
+            if (reusable.size() >= threshold)
+            {
+              break;
+            }
+          }
+        }
+        curReuseSat = reusable.size();
+        primedCount = curReuseSat;
+        d_counter.primeCache(active, std::move(reusable));
+      }
+
+      attempt = d_counter.count(active, threshold);
+
+      // Record the newly enumerated solutions (those past the primed prefix) so
+      // a later, lower hash count can reuse them in turn.
+      if (d_reuseModels && hashCnt > 0)
+      {
+        const std::vector<std::vector<cvc5::Term>>& found =
+            d_counter.lastModels();
+        for (std::size_t i = primedCount; i < found.size(); ++i)
+        {
+          d_savedModels.push_back(
+              {found[i], static_cast<std::size_t>(hashCnt)});
+        }
+      }
+    }
     Trace("pact") << "[pact]   level " << hashCnt << " -> "
         << (attempt.has_value() ? std::to_string(*attempt)
                                 : std::string(">=threshold"))
@@ -628,7 +874,7 @@ Pact::MeasurementResult Pact::oneMeasurement(
       if (hashCnt == 0 || (prev != thresholdSols.end() && prev->second))
       {
         prevMeasure = hashCnt;
-        report(static_cast<std::size_t>(hashCnt), attempt, hashCnt);
+        report(static_cast<std::size_t>(hashCnt), attempt, hashCnt, curReuseSat, curReuseChecked);
         Trace("pact") << "[pact] Winner at " << hashCnt << " with " << numSols
             << " models" << std::endl;
         return {static_cast<std::size_t>(hashCnt),
@@ -658,7 +904,7 @@ Pact::MeasurementResult Pact::oneMeasurement(
         }
         nextHash = (upperFib + lowerFib) / 2;
       }
-      report(static_cast<std::size_t>(hashCnt), attempt, nextHash);
+      report(static_cast<std::size_t>(hashCnt), attempt, nextHash, curReuseSat, curReuseChecked);
       hashPrev = curHashCnt;
       hashCnt = nextHash;
     }
@@ -671,7 +917,7 @@ Pact::MeasurementResult Pact::oneMeasurement(
       if (above != thresholdSols.end() && !above->second)
       {
         prevMeasure = hashCnt + 1;
-        report(static_cast<std::size_t>(hashCnt), std::nullopt, hashCnt + 1);
+        report(static_cast<std::size_t>(hashCnt), std::nullopt, hashCnt + 1, curReuseSat, curReuseChecked);
         Trace("pact") << "[pact] Winner at " << (hashCnt + 1) << " with "
             << solsForHash[hashCnt + 1] << " models" << std::endl;
         return {static_cast<std::size_t>(hashCnt + 1),
@@ -703,7 +949,7 @@ Pact::MeasurementResult Pact::oneMeasurement(
           ++nextHash;
         }
       }
-      report(static_cast<std::size_t>(hashCnt), std::nullopt, nextHash);
+      report(static_cast<std::size_t>(hashCnt), std::nullopt, nextHash, curReuseSat, curReuseChecked);
       hashPrev = curHashCnt;
       hashCnt = nextHash;
     }
@@ -715,5 +961,39 @@ Pact::MeasurementResult Pact::oneMeasurement(
   auto it = solsForHash.find(upperFib);
   std::int64_t cell = (it != solsForHash.end()) ? it->second : 1;
   return {static_cast<std::size_t>(upperFib), static_cast<std::size_t>(cell)};
+}
+
+bool Pact::modelSatisfiesHashes(
+    const std::vector<cvc5::Term>& model,
+    const std::vector<HashConstraint>& hashes)
+{
+  // Evaluate each parity under the saved projection assignment without touching
+  // the SAT solver. Every term in a hash's XOR clauses references only
+  // projection variables (a Boolean projection var, or a (= (extract b b) #b1)
+  // bit literal of a projection bit-vector), so substituting the model values
+  // and simplifying folds it to a Boolean constant. The hash holds iff the XOR
+  // of those constants equals the clause's right-hand side.
+  cvc5::Solver& s = d_countSolver ? *d_countSolver : d_solver;
+  for (const HashConstraint& hash : hashes)
+  {
+    for (const XorClause& clause : hash.xorClauses())
+    {
+      bool parity = false;
+      for (const cvc5::Term& term : clause.terms)
+      {
+        cvc5::Term value =
+            s.simplify(term.substitute(d_projectionVars, model));
+        if (value.isBooleanValue() && value.getBooleanValue())
+        {
+          parity = !parity;
+        }
+      }
+      if (parity != clause.rhs)
+      {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 

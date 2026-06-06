@@ -23,7 +23,9 @@ class Pact
        const std::vector<cvc5::Term>& projectionVars,
        std::uint64_t seed = 42,
        bool useNativeXor = false,
-       bool bvPact = false);
+       bool bvPact = false,
+       double epsilon = 0.8,
+       double delta = 0.2);
 
   std::uint64_t count();
 
@@ -47,14 +49,51 @@ class Pact
 
   // Called for each saturating-count evaluation inside a measurement so the
   // caller can emit progress. Arguments: number of hashes evaluated, the count
-  // result (nullopt when the pivot was saturated), and the next number of
-  // hashes the galloping search will jump to.
-  using ReportFn = std::function<void(
-      std::size_t, const std::optional<std::size_t>&, std::int64_t)>;
+  // result (nullopt when the pivot was saturated), the next number of hashes
+  // the galloping search will jump to, and the reuse_models tally for this
+  // evaluation (reuseSat stored solutions still satisfied the active hashes out
+  // of reuseChecked examined, so they were reused without an SMT call).
+  using ReportFn = std::function<void(std::size_t,
+                                      const std::optional<std::size_t>&,
+                                      std::int64_t,
+                                      std::size_t,
+                                      std::size_t)>;
 
   Parameters getParameters() const;
-  std::uint64_t median(std::vector<std::uint64_t>& values) const;
+
+  // Tail of the binomial used by ApproxMC to bound the error probability of a
+  // single measurement: sum_{k=ceil(t/2)}^{t} C(t,k) p^k (1-p)^(t-k). Mirrors
+  // Counter::calc_error_bound in approxmc. Used to pick the (odd) number of
+  // measurements so the combined under/over-estimation probability <= delta.
+  double calcErrorBound(std::size_t t, double p) const;
+
+  // ApproxMC6 rounding (CAV23 "Rounding Meets Approximate Model Counting",
+  // Algorithm 5): each measurement's cell count is rounded up to an
+  // epsilon-dependent multiple of the pivot before the median is taken. This is
+  // what makes the p_L/p_U probabilities -- and hence getParameters()'s
+  // iteration count -- give the (epsilon, delta) guarantee.
+  double roundCount(double cellCount) const;
+
   HashConstraint generateHashConstraint();
+
+  // A satisfying projection assignment found during the current measurement,
+  // tagged with the number of hashes that were active when it was found.
+  // ApproxMC's SavedModel / glob_model: a model found with `hashCount` hashes
+  // active also satisfies any prefix of those hashes, so it can be reused (as an
+  // already-counted, pre-blocked solution) at every lower hash level without a
+  // fresh SMT call -- and at higher levels too whenever it still satisfies the
+  // extra parities (checked cheaply by modelSatisfiesHashes).
+  struct SavedModel
+  {
+    std::vector<cvc5::Term> values;  // values in d_projectionVars order
+    std::size_t hashCount;
+  };
+
+  // True iff `model` (projection-variable values) satisfies every parity in
+  // `hashes`. Pure term evaluation (substitute + simplify), no SMT solving --
+  // the cheap check that lets ApproxMC reuse stored solutions.
+  bool modelSatisfiesHashes(const std::vector<cvc5::Term>& model,
+                            const std::vector<HashConstraint>& hashes);
 
   // One galloping (exponential-then-binary) search over the number of hashes,
   // mirroring ApproxMC's one_measurement_count. prevMeasure carries the winning
@@ -74,6 +113,19 @@ class Pact
   SaturatingCounter d_counter;
   BoolHash d_boolHash;
   BvHash d_bvHash;
+
+  // Approximation guarantee. epsilon is the multiplicative tolerance and delta
+  // the failure probability; getParameters() derives the pivot/threshold and the
+  // number of measurements from them exactly as ApproxMC does.
+  double d_epsilon = 0.8;
+  double d_delta = 0.2;
+
+  // ApproxMC's reuse_models optimisation: keep the satisfying assignments found
+  // so far in the current measurement and reuse the still-valid ones at the next
+  // hash count instead of re-deriving them with the SMT solver. On by default;
+  // disable with TTC_NO_REUSE for A/B comparison.
+  bool d_reuseModels = true;
+  std::vector<SavedModel> d_savedModels;
   // Upper bound on the number of useful hashes (total projection bits); the
   // galloping search's hiIndex sentinel.
   std::size_t d_maxHashes = 1;
@@ -82,6 +134,23 @@ class Pact
   // (CaDiCaL Gauss-Jordan) instead of CNF. Requires the core SAT solver to be
   // CaDiCaL, which rebuildCountSolver enforces on the counting solver.
   bool d_useNativeXor = false;
+
+  // --xor-activation literal: hold the whole hash pool on a single solver and
+  // toggle hashes with indicator-variable assumptions instead of rebuilding the
+  // count solver per galloping level (the rebuild mode). Only meaningful with
+  // native XOR (CaDiCaL Gauss-Jordan); ignored otherwise. d_assertedHashes
+  // tracks how many pool hashes are already asserted on the current solver.
+  bool d_xorActivationLiteral = false;
+  std::size_t d_assertedHashes = 0;
+  std::size_t d_activationCounter = 0;
+
+  // True once the base (no-hash) count has been shown to saturate the pivot.
+  // Level 0 of every measurement re-counts that identical hash-free formula, so
+  // each measurement (after the first) would otherwise pay the full base
+  // enumeration again -- expensive on large formulas with a small model count
+  // (e.g. netrel), where the search hovers at 0/1 hashes. Knowing the result is
+  // invariant lets oneMeasurement short-circuit level 0.
+  bool d_baseSaturated = false;
 
   // The base formula (after any BV-PACT substitution), captured once so we can
   // rebuild a fresh counting solver between measurements.

@@ -36,6 +36,7 @@ void HashConstraint::assertToSolver(cvc5::Solver& solver, bool useNativeXor) con
 
   if (canGoNative)
   {
+    const bool haveActivation = !d_activation.isNull();
     for (const XorClause& clause : d_xorClauses)
     {
       if (Trace.isEnabled("xor"))
@@ -45,8 +46,20 @@ void HashConstraint::assertToSolver(cvc5::Solver& solver, bool useNativeXor) con
       }
       // Hand the parity directly to the SAT solver (CaDiCaL) as a native XOR
       // clause so it is solved by Gauss-Jordan elimination rather than a
-      // Tseitin CNF expansion.
-      solver.assertXorClause(clause.terms, clause.rhs);
+      // Tseitin CNF expansion. In --xor-activation literal we fold the hash's
+      // indicator variable into every parity row: with it assigned false the
+      // row enforces the real parity, and left free the row is vacuous, so the
+      // hash can be toggled by an assumption without rebuilding the solver.
+      if (haveActivation)
+      {
+        std::vector<cvc5::Term> terms = clause.terms;
+        terms.push_back(d_activation);
+        solver.assertXorClause(terms, clause.rhs);
+      }
+      else
+      {
+        solver.assertXorClause(clause.terms, clause.rhs);
+      }
     }
     return;
   }

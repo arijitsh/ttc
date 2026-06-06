@@ -343,3 +343,117 @@ std::optional<std::size_t> SaturatingCounter::count(
   return result;
 }
 
+cvc5::Term SaturatingCounter::buildBlockingClause(
+    const std::vector<cvc5::Term>& modelValues, bool projectionsAreBoolean) const
+{
+  auto& tm = ttc::getTermBuilder(*d_solver);
+  bool useBooleanBlocking = projectionsAreBoolean;
+  if (useBooleanBlocking)
+  {
+    for (const cvc5::Term& value : modelValues)
+    {
+      if (!value.isBooleanValue())
+      {
+        useBooleanBlocking = false;
+        break;
+      }
+    }
+  }
+  if (useBooleanBlocking)
+  {
+    std::vector<cvc5::Term> clause;
+    clause.reserve(modelValues.size());
+    for (std::size_t i = 0; i < modelValues.size(); ++i)
+    {
+      const cvc5::Term& var = (*d_projectionVars)[i];
+      clause.push_back(modelValues[i].getBooleanValue()
+                           ? tm.mkTerm(cvc5::Kind::NOT, {var})
+                           : var);
+    }
+    if (clause.size() == 1)
+    {
+      return clause.front();
+    }
+    return tm.mkTerm(cvc5::Kind::OR, clause);
+  }
+  std::vector<cvc5::Term> equalities;
+  equalities.reserve(modelValues.size());
+  for (std::size_t i = 0; i < modelValues.size(); ++i)
+  {
+    equalities.push_back(
+        tm.mkTerm(cvc5::Kind::EQUAL, {(*d_projectionVars)[i], modelValues[i]}));
+  }
+  cvc5::Term blocking = equalities.size() == 1
+                            ? equalities.front()
+                            : tm.mkTerm(cvc5::Kind::AND, equalities);
+  return tm.mkTerm(cvc5::Kind::NOT, {blocking});
+}
+
+std::optional<std::size_t> SaturatingCounter::countWithAssumptions(
+    const std::vector<cvc5::Term>& assumptions, std::size_t threshold)
+{
+  if (!d_projectionVars)
+  {
+    throw std::logic_error("Projection variables not initialised for counter");
+  }
+  if (threshold == 0)
+  {
+    return std::size_t{0};
+  }
+
+  // The hash parities are already on the solver; the active ones are selected by
+  // 'assumptions' (each an asserted-false indicator). A fresh measurement leaves
+  // no cache to reuse here, so this path keeps no model cache.
+  auto sat = [&]() {
+    ++d_smtCalls;
+    return assumptions.empty() ? d_solver->checkSat()
+                               : d_solver->checkSatAssuming(assumptions);
+  };
+
+  if (d_projectionVars->empty())
+  {
+    cvc5::Result res = sat();
+    if (res.isSat()) return std::size_t{1};
+    if (res.isUnsat()) return std::size_t{0};
+    return std::nullopt;
+  }
+
+  const bool projectionsAreBoolean = std::all_of(
+      d_projectionVars->cbegin(), d_projectionVars->cend(),
+      [](const cvc5::Term& term) { return term.getSort().isBoolean(); });
+
+  d_solver->push();
+  std::optional<std::size_t> result;
+  std::size_t modelCount = 0;
+  while (true)
+  {
+    cvc5::Result res = sat();
+    if (res.isUnsat())
+    {
+      result = modelCount;
+      break;
+    }
+    if (!res.isSat())
+    {
+      result = std::nullopt;
+      break;
+    }
+    ++modelCount;
+    if (modelCount >= threshold)
+    {
+      result = std::nullopt;
+      break;
+    }
+    std::vector<cvc5::Term> modelValues;
+    modelValues.reserve(d_projectionVars->size());
+    for (const cvc5::Term& var : *d_projectionVars)
+    {
+      modelValues.push_back(d_solver->getValue(var));
+    }
+    d_solver->assertFormula(
+        buildBlockingClause(modelValues, projectionsAreBoolean));
+  }
+  d_solver->pop();
+  return result;
+}
+
