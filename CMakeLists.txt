@@ -32,6 +32,11 @@ if(BUILD_STATIC)
     message(STATUS "Building a static binary")
     # Linux-specific flag for static linking; adjust for your environment.
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+    # Make every find_library() below resolve to the static archive (.a) rather
+    # than the shared object, so nothing sneaks a .so into the -static link.
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+    # Boost components (program_options) must also come from static archives.
+    set(Boost_USE_STATIC_LIBS ON)
 endif()
 
 # Enable feature macro when DDNNF/D4 support is requested
@@ -121,6 +126,61 @@ if(NOT AMD_LIB)
   set(AMD_LIB "")
 endif()
 
+# SkolemFC: uninterpreted-function (Skolem-function) counting engine. Links the
+# locally built libskolemfc and its CryptoMiniSat / ApproxMC / UniGen / Arjun
+# dependencies. The dynamic build uses build_test/ (shared .so); a fully static
+# ttc (BUILD_STATIC) uses build_static/ which holds the whole stack as .a
+# archives (build it with: cd ~/solvers/skolemfc && ./configure.sh --static
+# --build-dir build_static && cd build_static && make -j).
+set(SKOLEMFC_ROOT "$ENV{HOME}/solvers/skolemfc")
+if(BUILD_STATIC)
+  set(SKOLEMFC_BUILD "${SKOLEMFC_ROOT}/build_static")
+else()
+  set(SKOLEMFC_BUILD "${SKOLEMFC_ROOT}/build_test")
+endif()
+find_library(SKOLEMFC_LIB skolemfc HINTS "${SKOLEMFC_BUILD}/src" NO_DEFAULT_PATH)
+set(SKOLEMFC_DEPS_LIB_DIR "${SKOLEMFC_BUILD}/deps_install/lib")
+set(SKOLEMFC_DEPS_INCLUDE_DIR "${SKOLEMFC_BUILD}/deps_install/include")
+if(SKOLEMFC_LIB AND EXISTS "${SKOLEMFC_ROOT}/src/skolemfc.h")
+  message(STATUS "Found SkolemFC library: ${SKOLEMFC_LIB}")
+  find_library(SKOLEMFC_CMS_LIB cryptominisat5 HINTS ${SKOLEMFC_DEPS_LIB_DIR} NO_DEFAULT_PATH)
+  find_library(SKOLEMFC_APPROXMC_LIB approxmc HINTS ${SKOLEMFC_DEPS_LIB_DIR} NO_DEFAULT_PATH)
+  find_library(SKOLEMFC_UNIGEN_LIB unigen HINTS ${SKOLEMFC_DEPS_LIB_DIR} NO_DEFAULT_PATH)
+  find_library(SKOLEMFC_ARJUN_LIB arjun HINTS ${SKOLEMFC_DEPS_LIB_DIR} NO_DEFAULT_PATH)
+  if(BUILD_STATIC)
+    # Static cryptominisat pulls in louvain-community, sbva, cadical and cadiback
+    # symbols; the shared build hid these inside libcryptominisat5.so, but a
+    # -static link must name every archive explicitly.
+    find_library(SKOLEMFC_LOUVAIN_LIB louvain_communities HINTS ${SKOLEMFC_DEPS_LIB_DIR} NO_DEFAULT_PATH)
+    find_library(SKOLEMFC_SBVA_LIB sbva HINTS ${SKOLEMFC_DEPS_LIB_DIR} NO_DEFAULT_PATH)
+    set(SKOLEMFC_CADICAL_LIB "${SKOLEMFC_ROOT}/deps/cadical/build/libcadical.a")
+    set(SKOLEMFC_CADIBACK_LIB "${SKOLEMFC_ROOT}/deps/cadiback/libcadiback.a")
+    # CryptoMiniSat collision: both cvc5 and SkolemFC bundle their own
+    # libcryptominisat5.a, so a single -static link sees "multiple definition"
+    # on the shared CCNR/CMSat objects. Resolve by linking ONE shared copy --
+    # the user's canonical ~/solvers/cryptominisat (5.13) -- and dropping both
+    # bundled archives. cvc5 needs only the 10 stable CMSat::SATSolver facade
+    # methods, and SkolemFC's approxmc/arjun/unigen archives resolve all of
+    # their CMSat references against 5.13, so one copy satisfies both.
+    set(SHARED_CMS_LIB "$ENV{HOME}/solvers/cryptominisat/build/lib/libcryptominisat5.a")
+    if(NOT EXISTS "${SHARED_CMS_LIB}")
+      message(FATAL_ERROR "Shared CryptoMiniSat static lib not found at ${SHARED_CMS_LIB}; "
+                          "build it with: cd ~/solvers/cryptominisat && cmake -B build -DSTATICCOMPILE=ON && cmake --build build")
+    endif()
+    set(CMS_LIB "")                       # drop cvc5's bundled copy
+    set(SKOLEMFC_CMS_LIB "${SHARED_CMS_LIB}")  # drop SkolemFC's bundled copy
+  endif()
+  set(HAVE_SKOLEMFC ON)
+  add_compile_definitions(TTC_ENABLE_SKOLEMFC)
+  include_directories(${PROJECT_SOURCE_DIR}/src/skolemfc)
+  include_directories(${SKOLEMFC_ROOT}/src)
+  include_directories(${SKOLEMFC_DEPS_INCLUDE_DIR})
+else()
+  message(WARNING "SkolemFC library not found at ${SKOLEMFC_BUILD}/src; "
+                  "--skolemfc engine disabled")
+  set(HAVE_SKOLEMFC OFF)
+endif()
+
 # Add our project source directories
 include_directories(${PROJECT_SOURCE_DIR}/src)
 include_directories(${PROJECT_SOURCE_DIR}/src/ddnnf)
@@ -137,6 +197,23 @@ find_path(LPSOLVE_INCLUDE_DIR lp_lib.h PATH_SUFFIXES lpsolve)
 if(LPSOLVE_LIB AND LPSOLVE_INCLUDE_DIR)
     message(STATUS "Found lpsolve library: ${LPSOLVE_LIB}")
     include_directories(${LPSOLVE_INCLUDE_DIR})
+    if(BUILD_STATIC)
+        # liblpsolve55.a and libcdd.a both export the C symbol `set_int` (two
+        # unrelated functions). The shared build tolerated it (separate .so);
+        # a -static link reports "multiple definition". Nothing outside lpsolve
+        # references lpsolve's set_int, so rewrite that symbol in a patched copy
+        # of the archive, leaving cddlib's set_int as the sole definition.
+        set(LPSOLVE_PATCHED "${CMAKE_BINARY_DIR}/liblpsolve55_patched.a")
+        add_custom_command(
+            OUTPUT "${LPSOLVE_PATCHED}"
+            COMMAND ${CMAKE_OBJCOPY} --redefine-sym set_int=lpsolve_set_int
+                    "${LPSOLVE_LIB}" "${LPSOLVE_PATCHED}"
+            DEPENDS "${LPSOLVE_LIB}"
+            VERBATIM
+            COMMENT "Patching liblpsolve55.a: rename set_int -> lpsolve_set_int (avoids cddlib clash)")
+        add_custom_target(lpsolve_patched DEPENDS "${LPSOLVE_PATCHED}")
+        set(LPSOLVE_LIB "${LPSOLVE_PATCHED}")
+    endif()
 else()
     if(NOT LPSOLVE_LIB)
         message(WARNING "lpsolve library not found; disabling lpsolve integration")
@@ -169,6 +246,7 @@ set(SOURCES
     src/weighted/tounweighted.cpp
     src/volume/allsat_volume.cpp
     src/volume/lra_volume.cpp
+    src/cadical_search_assign_shim.cpp
     src/allsat-circuits/src/AllSatAlgo/AllSatAlgoBase.cpp
     src/allsat-circuits/src/AllSatAlgo/Blocking/AllSatAlgoBlockingBase.cpp
     src/allsat-circuits/src/AllSatAlgo/Blocking/TseitinEnc/AllSatAlgoTseitinEnc.cpp
@@ -178,6 +256,10 @@ set(SOURCES
     src/allsat-circuits/src/CirSimulation/CirSim.cpp
     src/allsat-circuits/src/Globals/ipasir_stub.cpp
 )
+
+if(HAVE_SKOLEMFC)
+    list(APPEND SOURCES src/skolemfc/skolemfc_engine.cpp)
+endif()
 
 if(ENABLE_DDNNF)
     include_directories(${PROJECT_SOURCE_DIR}/src/ddnnf/flowcutter/src)
@@ -269,6 +351,19 @@ endif()
 
 add_executable(ttc ${SOURCES})
 
+# The static cryptominisat/louvain stack calls OpenMP runtime routines
+# (omp_get_wtime, etc.); a -static link needs libgomp named explicitly.
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(ttc OpenMP::OpenMP_CXX)
+endif()
+
+# The static lpsolve archive is patched (set_int renamed) by a custom command;
+# make ttc wait for it.
+if(BUILD_STATIC AND TARGET lpsolve_patched)
+    add_dependencies(ttc lpsolve_patched)
+endif()
+
 # Link against the cvc5 libraries, Boost, optional STP and optional D4 support
 target_link_libraries(ttc
     ${CVC5PARSER_LIB}
@@ -289,6 +384,46 @@ target_link_libraries(ttc
 find_library(GMP_LIB gmp REQUIRED)
 find_library(GMPXX_LIB gmpxx REQUIRED)
 target_link_libraries(ttc ${GMP_LIB} ${GMPXX_LIB})
+
+if(HAVE_SKOLEMFC)
+    target_link_libraries(ttc
+        ${SKOLEMFC_LIB}
+        ${SKOLEMFC_APPROXMC_LIB}
+        ${SKOLEMFC_UNIGEN_LIB}
+        ${SKOLEMFC_ARJUN_LIB}
+        ${SKOLEMFC_CMS_LIB})
+    if(BUILD_STATIC)
+        # Static link: name every transitive archive (cryptominisat -> cadical,
+        # cadiback, sbva, louvain-community) explicitly, in dependency order.
+        # gmpxx/gmp are repeated here (after libskolemfc) so the GMP C++ stream
+        # operators it references resolve, and libsuitesparseconfig satisfies
+        # colamd's SuiteSparse_config_* symbols in a -static link.
+        find_library(SUITESPARSECONFIG_LIB suitesparseconfig)
+        target_link_libraries(ttc
+            ${SKOLEMFC_CADIBACK_LIB}
+            ${SKOLEMFC_SBVA_LIB}
+            ${SKOLEMFC_CADICAL_LIB}
+            ${SKOLEMFC_LOUVAIN_LIB}
+            ${SUITESPARSECONFIG_LIB}
+            ${GMPXX_LIB}
+            ${GMP_LIB}
+            dl)
+    else()
+        # Resolve libskolemfc and its CryptoMiniSat/ApproxMC/UniGen deps at runtime
+        # without polluting LD_LIBRARY_PATH.
+        set_target_properties(ttc PROPERTIES
+            BUILD_RPATH "${SKOLEMFC_BUILD}/src;${SKOLEMFC_DEPS_LIB_DIR}"
+            INSTALL_RPATH "${SKOLEMFC_BUILD}/src;${SKOLEMFC_DEPS_LIB_DIR}")
+    endif()
+    # cvc5 is statically linked and bundles an OLDER CryptoMiniSat. Without this,
+    # those CMSat symbols are exported in ttc's dynamic symbol table and the
+    # dynamic linker interposes them into SkolemFC's libapproxmc /
+    # libcryptominisat5.so.5.13 (a different, incompatible ABI), crashing inside
+    # ApproxMC. Hiding all static-archive symbols from the executable's dynamic
+    # symbol table lets the SkolemFC shared libraries resolve CryptoMiniSat
+    # among themselves.
+    target_link_options(ttc PRIVATE "LINKER:--exclude-libs,ALL")
+endif()
 
 if(ENABLE_DDNNF)
     add_dependencies(ttc d4lib)

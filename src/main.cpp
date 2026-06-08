@@ -8,6 +8,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <functional>
 #include <optional>
 #include <utility>
 #include <cctype>
@@ -27,6 +28,9 @@
 #include "profiler.hpp"
 #include "tocnf/tocnf.hpp"
 #include "eager/bvcnf.hpp"
+#if defined(TTC_ENABLE_SKOLEMFC)
+#include "skolemfc/skolemfc_engine.hpp"
+#endif
 #include "weighted/tounweighted.hpp"
 #if defined(TTC_ENABLE_DDNNF)
 #include "var_order.hpp"
@@ -764,7 +768,20 @@ int main(int argc, char *argv[]) {
       "Engine 3 -- LRA volume computation (auto: QF_LRA, no projection vars; "
       "fully automatic, no tunable options)");
 
-  // Engine 4 (d-DNNF / exact CNF counting) and its tuning knobs are inactive by
+  // Engine 4: uninterpreted-function counting -> SkolemFC. Counts the number of
+  // interpretations of an uninterpreted function that satisfy the formula by
+  // bit-blasting and treating the function inputs as universally quantified and
+  // the function output (plus internal bits) as existentially quantified.
+  po::options_description classSkolem(
+      "Engine 4 -- uninterpreted-function counting (SkolemFC)");
+  classSkolem.add_options()
+      ("skolemfc",
+       "Count the interpretations (Skolem functions) of an uninterpreted "
+       "function that satisfy the formula (forces this engine)")
+      ("func", po::value<std::string>(),
+       "Name of the uninterpreted function to count (default: mainfunc)");
+
+  // Advanced d-DNNF / exact CNF counting knobs are inactive by
   // default and hidden from --help. They are still accepted on the command line
   // so existing invocations keep working.
   po::options_description advanced("Advanced / exact counting options");
@@ -817,7 +834,7 @@ int main(int argc, char *argv[]) {
   // (engine 4 / exact CNF) options and the positional input-file are accepted
   // by the parser but hidden from --help.
   po::options_description visible("Allowed options");
-  visible.add(general).add(classBv).add(classPb).add(classLra);
+  visible.add(general).add(classBv).add(classPb).add(classLra).add(classSkolem);
   po::options_description all;
   all.add(visible).add(advanced).add(hidden);
 
@@ -872,6 +889,9 @@ int main(int argc, char *argv[]) {
   bool useApprox = vm.count("approx") > 0;
   bool useProjectionBoost = vm.count("pact") > 0;
   bool useProjectionEnumerate = vm.count("enum") > 0;
+  bool useSkolemFc = vm.count("skolemfc") > 0;
+  std::string skolemFuncName =
+      vm.count("func") ? vm["func"].as<std::string>() : std::string("mainfunc");
   std::uint64_t approxSeed = vm["seed"].as<std::uint64_t>();
   double approxEpsilon = vm["epsilon"].as<double>();
   double approxDelta = vm["delta"].as<double>();
@@ -933,7 +953,7 @@ int main(int argc, char *argv[]) {
   const bool explicitEngine =
       vm.count("pact") || vm.count("enum") || vm.count("bvcnf")
       || vm.count("tocnf") || vm.count("d4") || vm.count("FB")
-      || vm.count("unsat") || vm.count("unsat-q");
+      || vm.count("unsat") || vm.count("unsat-q") || vm.count("skolemfc");
   const bool autoDispatch = !explicitEngine;
   bool autoBvCnf = false;     // rule 1: BV/UFBV -> eager bit-blast + ApproxMC
   bool autoDeferred = false;  // rule 2 (PB) or rule 3 (volume), resolved after parsing
@@ -1238,6 +1258,161 @@ int main(int argc, char *argv[]) {
   if (!parser.hasExplicitProjectionVars() && parser.numProjVars() == 0)
   {
     parser.promoteBooleanAndBvToProjection();
+  }
+
+  // Engine 4: uninterpreted-function counting with SkolemFC. Treat the bits of
+  // the function's inputs as universally quantified and the function output
+  // (with all internal bit-blast variables) as existentially quantified; the
+  // Skolem-function count is the number of input->output functions that satisfy
+  // the formula.
+  if (useSkolemFc)
+  {
+#if !defined(TTC_ENABLE_SKOLEMFC)
+    std::cerr << "Error: --skolemfc requested but ttc was built without "
+                 "SkolemFC support"
+              << std::endl;
+    return 1;
+#else
+    // Locate the uninterpreted function symbol to count.
+    cvc5::Term funcTerm;
+    for (const cvc5::Term& t : parser.declaredVariables())
+    {
+      if (t.getSort().isFunction() && t.hasSymbol()
+          && t.getSymbol() == skolemFuncName)
+      {
+        funcTerm = t;
+        break;
+      }
+    }
+    if (funcTerm.isNull())
+    {
+      std::cerr << "Error: --skolemfc could not find an uninterpreted function "
+                << "named '" << skolemFuncName
+                << "' (declare it with declare-fun, or pass --func <name>)"
+                << std::endl;
+      return 1;
+    }
+
+    // Collect the applications of that function in the assertions.
+    std::vector<cvc5::Term> applications;
+    std::unordered_set<cvc5::Term> seenApps;
+    std::unordered_set<cvc5::Term> visited;
+    std::function<void(const cvc5::Term&)> collectApps =
+        [&](const cvc5::Term& t) {
+          if (!visited.insert(t).second) return;
+          if (t.getKind() == cvc5::Kind::APPLY_UF && t.getNumChildren() > 0
+              && t[0] == funcTerm)
+          {
+            if (seenApps.insert(t).second) applications.push_back(t);
+          }
+          for (size_t i = 0, n = t.getNumChildren(); i < n; ++i)
+          {
+            collectApps(t[i]);
+          }
+        };
+    for (const cvc5::Term& a : parser.assertions())
+    {
+      collectApps(a);
+    }
+
+    if (applications.empty())
+    {
+      std::cerr << "Error: --skolemfc found no application of '"
+                << skolemFuncName << "' in the assertions" << std::endl;
+      return 1;
+    }
+    if (applications.size() > 1)
+    {
+      std::cerr << "Error: --skolemfc currently supports a single application "
+                << "of the counted function; '" << skolemFuncName << "' is "
+                << "applied " << applications.size() << " times" << std::endl;
+      return 1;
+    }
+
+    cvc5::Term app = applications.front();
+    if (!app.getSort().isBitVector())
+    {
+      std::cerr << "Error: --skolemfc requires a bit-vector valued function; '"
+                << skolemFuncName << "' returns " << app.getSort().toString()
+                << std::endl;
+      return 1;
+    }
+
+    // The function inputs (forall) are the argument terms; require bit-vectors
+    // so the bit accounting matches the bit-blaster's sampling set.
+    std::vector<cvc5::Term> inputVars;
+    for (size_t i = 1, n = app.getNumChildren(); i < n; ++i)
+    {
+      if (!app[i].getSort().isBitVector())
+      {
+        std::cerr << "Error: --skolemfc requires bit-vector function inputs; "
+                  << "argument " << i << " of '" << skolemFuncName << "' is "
+                  << app[i].getSort().toString() << std::endl;
+        return 1;
+      }
+      inputVars.push_back(app[i]);
+    }
+
+    // Replace the application by a fresh output variable (exists) and build the
+    // relational formula F(inputs, output).
+    auto& tm = ttc::getTermBuilder(parser.solver());
+    cvc5::Term outputVar = tm.mkConst(app.getSort(), "__ttc_skolem_out");
+    std::vector<cvc5::Term> substituted;
+    substituted.reserve(parser.assertions().size());
+    for (const cvc5::Term& a : parser.assertions())
+    {
+      substituted.push_back(a.substitute({app}, {outputVar}));
+    }
+    cvc5::Term formula;
+    if (substituted.empty())
+    {
+      formula = tm.mkBoolean(true);
+    }
+    else if (substituted.size() == 1)
+    {
+      formula = substituted[0];
+    }
+    else
+    {
+      formula = tm.mkTerm(cvc5::Kind::AND, substituted);
+    }
+
+    std::cout << "c [ttc->skolemfc] counting interpretations of function '"
+              << skolemFuncName << "' (" << inputVars.size()
+              << " input arg(s), output width "
+              << app.getSort().getBitVectorSize() << ")" << std::endl;
+
+    ttc::skolem::SkolemFcResult sk = ttc::skolem::countSkolemFunctions(
+        parser.solver(), formula, inputVars, outputVar, approxSeed,
+        approxEpsilon, approxDelta, verbosity);
+    if (!sk.ok)
+    {
+      std::cerr << "Error: --skolemfc failed: " << sk.error << std::endl;
+      return 1;
+    }
+
+    std::cout << "c [ttc->skolemfc] CNF: " << sk.numVars << " vars, "
+              << sk.numClauses << " clauses; forall(input) bits: "
+              << sk.numForall << ", exists bits: " << sk.numExists << std::endl;
+    if (!sk.satisfiable)
+    {
+      std::cout << "c [ttc->skolemfc] relation is unsatisfiable: no function "
+                << "interpretation satisfies the formula" << std::endl;
+      std::cout << "s fc 0" << std::endl;
+    }
+    else if (sk.deterministic)
+    {
+      std::cout << "c [ttc->skolemfc] function is deterministic: exactly one "
+                << "interpretation (Skolem function)" << std::endl;
+      std::cout << "s fc 2 ** 0" << std::endl;
+    }
+    else
+    {
+      std::cout << "s fc 2 ** " << std::setprecision(15) << sk.log2Count
+                << std::endl;
+    }
+    return 0;
+#endif
   }
 
   // Resolve the deferred automatic engine choice now that the projection
