@@ -296,7 +296,7 @@ void Pact::rebuildCountSolver()
   static constexpr const char* kOptions[] = {
       "print-success",  "incremental",        "produce-models",
       "bv-sat-solver",  "bv-to-bool",         "sat-use-native-xor",
-      "sat-solver",
+      "sat-solver",     "portfolio-jobs",
   };
   for (const char* name : kOptions)
   {
@@ -552,9 +552,58 @@ HashConstraint Pact::generateHashConstraint()
   return hash;
 }
 
+Pact::ProbeResult Pact::probeHashCount(std::size_t hashCount)
+{
+  Parameters params = getParameters();
+  const std::size_t threshold = params.appmc7 ? 1 : params.threshold;
+  d_counter.resetStatistics();
+  d_savedModels.clear();
+  rebuildCountSolver();
+
+  std::vector<HashConstraint> hashPool;
+  hashPool.reserve(hashCount);
+  while (hashPool.size() < hashCount)
+  {
+    hashPool.push_back(generateHashConstraint());
+  }
+
+  std::optional<std::size_t> attempt = d_counter.count(hashPool, threshold);
+  if (d_progressCallback)
+  {
+    d_progressCallback({hashCount, attempt, "probe", 0, 0, threshold});
+  }
+  ProbeResult result;
+  result.hashCount = hashCount;
+  result.saturated = !attempt.has_value();
+  result.cellCount = attempt.value_or(threshold);
+  d_lastWinningHash = hashCount;
+  d_lastWinningCellCount = result.cellCount;
+  return result;
+}
+
+double Pact::estimateFromMeasurement(std::size_t hashCount,
+                                     std::size_t cellCount) const
+{
+  Parameters params = getParameters();
+  double cell = static_cast<double>(cellCount);
+  if (params.appmc7 && hashCount > 0)
+  {
+    cell *= std::sqrt(2.0 * params.alpha / params.beta);
+  }
+  else if (hashCount > 0)
+  {
+    cell = roundCount(cell);
+  }
+  return std::ldexp(cell, static_cast<int>(hashCount));
+}
+
 std::uint64_t Pact::count()
 {
   Parameters params = getParameters();
+  if (d_iterationOverride.has_value())
+  {
+    params.iterations = std::max<std::size_t>(1, *d_iterationOverride);
+  }
   d_counter.resetStatistics();
   Trace("pact") << "[pact] Starting approximate count with pivot "
                  << params.threshold << " and " << params.iterations
@@ -580,7 +629,21 @@ std::uint64_t Pact::count()
     {
       maxHashesUsed = hashCount;
     }
+    if (d_progressCallback)
+    {
+      d_progressCallback(
+          {hashCount,
+           sols,
+           std::to_string(nextHash),
+           reuseSat,
+           reuseChecked,
+           params.appmc7 ? 1 : params.threshold});
+    }
     if (Log.getVerbosity() == 0)
+    {
+      return;
+    }
+    if (d_quiet)
     {
       return;
     }
@@ -618,7 +681,11 @@ std::uint64_t Pact::count()
     std::cout << line.str() << std::endl;
   };
 
-  if (!params.appmc7)
+  if (!params.appmc7 && d_assumeBaseSaturated)
+  {
+    d_baseSaturated = true;
+  }
+  else if (!params.appmc7)
   {
     // Base count with no hashing. If the formula has fewer than `threshold`
     // models in total the count is exact and we are done -- this mirrors
@@ -632,7 +699,12 @@ std::uint64_t Pact::count()
     {
       Trace("pact") << "[pact] Base model count succeeded without hashing: "
           << *base << std::endl;
-      std::cout << "c max hashes: " << maxHashesUsed << std::endl;
+      d_lastWinningHash = 0;
+      d_lastWinningCellCount = *base;
+      if (!d_quiet)
+      {
+        std::cout << "c max hashes: " << maxHashesUsed << std::endl;
+      }
       return static_cast<std::uint64_t>(*base);
     }
     Trace("pact")
@@ -652,7 +724,7 @@ std::uint64_t Pact::count()
 
   // Carries the winning hash count between measurements (ApproxMC's
   // prev_measure) so later rounds start their galloping search near the answer.
-  std::int64_t prevMeasure = 0;
+  std::int64_t prevMeasure = d_initialPrevMeasure;
 
   for (std::size_t iter = 0; iter < params.iterations; ++iter)
   {
@@ -679,22 +751,15 @@ std::uint64_t Pact::count()
     // ApproxMC6 rounds the cell count; ApproxMC7 applies its alpha/beta
     // adjustment. Both happen before scaling by 2^hashCount. With no hashes the
     // cell count is exact and must not be inflated.
-    double cell = static_cast<double>(m.cellCount);
-    if (params.appmc7 && m.hashCount > 0)
-    {
-      cell *= std::sqrt(2.0 * params.alpha / params.beta);
-    }
-    else if (m.hashCount > 0)
-    {
-      cell = roundCount(cell);
-    }
-    double approx = std::ldexp(cell, static_cast<int>(m.hashCount));
+    double approx = estimateFromMeasurement(m.hashCount, m.cellCount);
+    d_lastWinningHash = m.hashCount;
+    d_lastWinningCellCount = m.cellCount;
     Trace("pact") << "[pact] Iteration " << (iter + 1) << " estimate: "
-        << approx << " (" << cell << " << " << m.hashCount << ")"
+        << approx << " (" << m.cellCount << " @ " << m.hashCount << ")"
         << std::endl;
     estimates.push_back(approx);
 
-    if (Log.getVerbosity() != 0)
+    if (Log.getVerbosity() != 0 && !d_quiet)
     {
       double elapsed = Log.elapsed() - startTime;
       std::ostringstream line;
@@ -718,7 +783,10 @@ std::uint64_t Pact::count()
   std::uint64_t result = static_cast<std::uint64_t>(std::llround(medianEstimate));
   Trace("pact") << "[pact] Median estimate across iterations: " << result
       << std::endl;
-  std::cout << "c max hashes: " << maxHashesUsed << std::endl;
+  if (!d_quiet)
+  {
+    std::cout << "c max hashes: " << maxHashesUsed << std::endl;
+  }
   if (std::getenv("TTC_PACT_STATS") != nullptr)
   {
     try

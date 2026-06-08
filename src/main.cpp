@@ -2,8 +2,10 @@
 #include <boost/program_options.hpp>
 #include <cmath>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -225,6 +227,23 @@ void configureWeightedPbSolver(cvc5::Solver& solver,
   catch (const cvc5::CVC5ApiException&) {}
 }
 
+void configureCvc5ParallelJobs(cvc5::Solver& solver, int jobs)
+{
+  if (jobs <= 1)
+  {
+    return;
+  }
+  try
+  {
+    solver.setOption("portfolio-jobs", std::to_string(jobs));
+  }
+  catch (const cvc5::CVC5ApiException& ex)
+  {
+    Log(1) << "Warning: unable to set cvc5 portfolio-jobs="
+           << jobs << ": " << ex.getMessage() << std::endl;
+  }
+}
+
 void assertCnf(cvc5::Solver& solver,
                const std::vector<cvc5::Term>& variables,
                const std::vector<std::vector<int>>& clauses)
@@ -354,6 +373,494 @@ WeightedPbResult runWeightedProjectionBoost(TTCParser& parser,
       std::ldexp(static_cast<long double>(unweightedCount) *
                      unweighted.multiplier,
                  -unweighted.divisorPower);
+  return result;
+}
+
+struct ParallelPactWorkerResult
+{
+  std::uint64_t count = 0;
+  std::uint64_t smtCalls = 0;
+  std::size_t winningHash = 0;
+  std::size_t cellCount = 0;
+  double estimate = 0.0;
+};
+
+struct ParallelPactProbeResult
+{
+  std::size_t hashCount = 0;
+  bool saturated = false;
+  std::size_t cellCount = 0;
+  std::uint64_t smtCalls = 0;
+  double estimate = 0.0;
+  std::size_t threshold = 0;
+};
+
+using ParallelPactProgressPrinter =
+    std::function<void(std::size_t,
+                       const Pact::ProgressEvent&,
+                       const std::optional<std::uint64_t>&)>;
+
+ParallelPactProbeResult runPactProbeWorker(const std::string& smtFormula,
+                                           std::uint64_t seed,
+                                           bool useNativeXor,
+                                           bool useBvPact,
+                                           double epsilon,
+                                           double delta,
+                                           std::size_t hashCount,
+                                           bool doArjun,
+                                           std::size_t round,
+                                           ParallelPactProgressPrinter progress)
+{
+  TTCParser parser;
+  cvc5::Solver& solver = parser.solver();
+  try { solver.setOption("bv-sat-solver", "cryptominisat"); }
+  catch (const cvc5::CVC5ApiException&) {}
+  if (useBvPact)
+  {
+    try { solver.setOption("bv-to-bool", "false"); }
+    catch (const cvc5::CVC5ApiException&) {}
+  }
+  if (g_hasCadicalXorSupport)
+  {
+    try { applyNativeXor(solver, useNativeXor); }
+    catch (const cvc5::CVC5ApiException&) {}
+  }
+  if (useBvPact && g_hasCadicalXorSupport)
+  {
+    try { applyNativeXor(solver, true); }
+    catch (const cvc5::CVC5ApiException&) {}
+  }
+
+  parser.parseFormula(smtFormula);
+  if (!parser.hasExplicitProjectionVars() && parser.numProjVars() == 0)
+  {
+    parser.promoteBooleanAndBvToProjection();
+  }
+  if (doArjun)
+  {
+    parser.minimizeProjectionSet();
+  }
+
+  Pact counter(parser.solver(),
+               parser.projectionVars(),
+               seed,
+               useNativeXor,
+               useBvPact,
+               epsilon,
+               delta);
+  counter.setQuiet(true);
+  if (progress)
+  {
+    counter.setProgressCallback(
+        [round, progress](const Pact::ProgressEvent& event) {
+          progress(round, event, std::nullopt);
+        });
+  }
+  Pact::ProbeResult probe = counter.probeHashCount(hashCount);
+
+  ParallelPactProbeResult result;
+  result.hashCount = probe.hashCount;
+  result.saturated = probe.saturated;
+  result.cellCount = probe.cellCount;
+  result.smtCalls = counter.getSmtCallCount();
+  result.estimate = counter.estimateFromMeasurement(probe.hashCount,
+                                                    probe.cellCount);
+  result.threshold = probe.saturated ? probe.cellCount : 0;
+  return result;
+}
+
+ParallelPactWorkerResult runPactWorker(const std::string& smtFormula,
+                                       std::uint64_t seed,
+                                       bool useNativeXor,
+                                       bool useBvPact,
+                                       double epsilon,
+                                       double delta,
+                                       std::size_t initialHash,
+                                       int cvc5Jobs,
+                                       bool doArjun,
+                                       bool baseSaturatedKnown,
+                                       std::size_t round,
+                                       ParallelPactProgressPrinter progress)
+{
+  TTCParser parser;
+  cvc5::Solver& solver = parser.solver();
+  try { solver.setOption("bv-sat-solver", "cryptominisat"); }
+  catch (const cvc5::CVC5ApiException&) {}
+  if (useBvPact)
+  {
+    try { solver.setOption("bv-to-bool", "false"); }
+    catch (const cvc5::CVC5ApiException&) {}
+  }
+  configureCvc5ParallelJobs(solver, cvc5Jobs);
+  if (g_hasCadicalXorSupport)
+  {
+    try { applyNativeXor(solver, useNativeXor); }
+    catch (const cvc5::CVC5ApiException&) {}
+  }
+  if (useBvPact && g_hasCadicalXorSupport)
+  {
+    try { applyNativeXor(solver, true); }
+    catch (const cvc5::CVC5ApiException&) {}
+  }
+
+  parser.parseFormula(smtFormula);
+  if (!parser.hasExplicitProjectionVars() && parser.numProjVars() == 0)
+  {
+    parser.promoteBooleanAndBvToProjection();
+  }
+  if (doArjun)
+  {
+    parser.minimizeProjectionSet();
+  }
+
+  Pact counter(parser.solver(),
+               parser.projectionVars(),
+               seed,
+               useNativeXor,
+               useBvPact,
+               epsilon,
+               delta);
+  counter.setQuiet(true);
+  counter.setIterationOverride(std::size_t{1});
+  counter.setInitialHashCount(initialHash);
+  counter.setBaseSaturatedKnown(baseSaturatedKnown);
+  if (progress)
+  {
+    counter.setProgressCallback(
+        [round, progress](const Pact::ProgressEvent& event) {
+          progress(round, event, std::nullopt);
+        });
+  }
+  ParallelPactWorkerResult result;
+  result.count = counter.count();
+  result.smtCalls = counter.getSmtCallCount();
+  result.winningHash = counter.lastWinningHash();
+  result.cellCount = counter.lastWinningCellCount();
+  result.estimate =
+      counter.estimateFromMeasurement(result.winningHash, result.cellCount);
+  return result;
+}
+
+ParallelPactWorkerResult runParallelPact(const std::string& smtFormula,
+                                         std::uint64_t seed,
+                                         bool useNativeXor,
+                                         bool useBvPact,
+                                         double epsilon,
+                                         double delta,
+                                         std::size_t iterations,
+                                         int jobs,
+                                         int cvc5Jobs,
+                                         bool doArjun)
+{
+  const int workerCount = std::max(1, jobs);
+  const double progressStart = Log.elapsed();
+  std::mutex progressMutex;
+  ParallelPactProgressPrinter progress =
+      [&](std::size_t round,
+          const Pact::ProgressEvent& event,
+          const std::optional<std::uint64_t>& count) {
+        if (Log.getVerbosity() == 0)
+        {
+          return;
+        }
+        std::lock_guard<std::mutex> lock(progressMutex);
+        std::ostringstream countStream;
+        if (event.cellCount.has_value())
+        {
+          countStream << *event.cellCount;
+        }
+        else
+        {
+          countStream << ">=" << event.threshold;
+        }
+        std::ostringstream reuseStream;
+        if (event.reuseChecked == 0)
+        {
+          reuseStream << '-';
+        }
+        else
+        {
+          reuseStream << event.reuseSat << '/' << event.reuseChecked;
+        }
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(2);
+        line << "c " << std::setw(7) << (Log.elapsed() - progressStart);
+        line << ' ' << std::setw(3) << round;
+        line << ' ' << std::setw(4) << event.hashCount;
+        line << ' ' << std::setw(8) << countStream.str();
+        line << ' ' << std::setw(9) << reuseStream.str();
+        line << ' ' << std::setw(5) << event.next;
+        if (count.has_value())
+        {
+          line << ' ' << std::setw(13) << *count;
+        }
+        std::cout << line.str() << std::endl;
+      };
+
+  auto emitWin = [&](std::size_t round,
+                     std::size_t hashCount,
+                     std::size_t cellCount,
+                     double estimate) {
+    progress(round,
+             {hashCount, cellCount, "win", 0, 0, 0},
+             static_cast<std::uint64_t>(std::llround(estimate)));
+  };
+
+  auto launch = [&](std::uint64_t workerSeed,
+                    std::size_t initialHash,
+                    std::size_t round) {
+    return std::async(std::launch::async,
+                      runPactWorker,
+                      std::cref(smtFormula),
+                      workerSeed,
+                      useNativeXor,
+                      useBvPact,
+                      epsilon,
+                      delta,
+                      initialHash,
+                      cvc5Jobs,
+                      doArjun,
+                      true,
+                      round,
+                      progress);
+  };
+  auto launchProbe = [&](std::uint64_t workerSeed,
+                         std::size_t hashCount,
+                         std::size_t round) {
+    return std::async(std::launch::async,
+                      runPactProbeWorker,
+                      std::cref(smtFormula),
+                      workerSeed,
+                      useNativeXor,
+                      useBvPact,
+                      epsilon,
+                      delta,
+                      hashCount,
+                      doArjun,
+                      round,
+                      progress);
+  };
+
+  ParallelPactProbeResult baseProbe =
+      runPactProbeWorker(smtFormula,
+                         seed + 0x94d049bb133111ebULL,
+                         useNativeXor,
+                         useBvPact,
+                         epsilon,
+                         delta,
+                         0,
+                         doArjun,
+                         0,
+                         progress);
+  std::uint64_t smtCalls = baseProbe.smtCalls;
+  if (!baseProbe.saturated)
+  {
+    ParallelPactWorkerResult exact;
+    exact.count = baseProbe.cellCount;
+    exact.smtCalls = smtCalls;
+    exact.winningHash = 0;
+    return exact;
+  }
+
+  const std::size_t pilotStarts[] = {1, 2, 4, 8, 16};
+  constexpr std::size_t pilotCount =
+      sizeof(pilotStarts) / sizeof(pilotStarts[0]);
+  std::vector<std::future<ParallelPactProbeResult>> pilotFutures;
+  pilotFutures.reserve(pilotCount);
+  for (std::size_t i = 0; i < pilotCount; ++i)
+  {
+    pilotFutures.push_back(launchProbe(seed, pilotStarts[i], 0));
+  }
+
+  std::optional<std::size_t> smallestBelow;
+  std::optional<ParallelPactProbeResult> smallestBelowProbe;
+  std::size_t largestSaturated = 0;
+  auto recordProbe = [&](const ParallelPactProbeResult& pilot) {
+    smtCalls += pilot.smtCalls;
+    if (pilot.saturated)
+    {
+      largestSaturated = std::max(largestSaturated, pilot.hashCount);
+    }
+    else if (!smallestBelow.has_value()
+             || pilot.hashCount < *smallestBelow)
+    {
+      smallestBelow = pilot.hashCount;
+      smallestBelowProbe = pilot;
+    }
+  };
+  auto splitBracket = [&](std::size_t low, std::size_t high) {
+    std::vector<std::size_t> points;
+    if (high <= low + 1)
+    {
+      return points;
+    }
+
+    const std::size_t gap = high - low;
+    const std::size_t slots =
+        std::min<std::size_t>(static_cast<std::size_t>(workerCount), gap - 1);
+    points.reserve(slots);
+    for (std::size_t i = 1; i <= slots; ++i)
+    {
+      const std::size_t candidate = low + (i * gap) / (slots + 1);
+      if (candidate <= low || candidate >= high)
+      {
+        continue;
+      }
+      if (std::find(points.begin(), points.end(), candidate) == points.end())
+      {
+        points.push_back(candidate);
+      }
+    }
+    if (points.empty())
+    {
+      points.push_back(low + gap / 2);
+    }
+    return points;
+  };
+  for (auto& fut : pilotFutures)
+  {
+    recordProbe(fut.get());
+  }
+
+  std::size_t nextProbe = largestSaturated == 0 ? std::size_t{1}
+                                                : largestSaturated * 2;
+  while (!smallestBelow.has_value())
+  {
+    recordProbe(runPactProbeWorker(smtFormula,
+                                   seed,
+                                   useNativeXor,
+                                   useBvPact,
+                                   epsilon,
+                                   delta,
+                                   nextProbe,
+                                   doArjun,
+                                   0,
+                                   progress));
+    nextProbe *= 2;
+  }
+  while (*smallestBelow > largestSaturated + 1)
+  {
+    std::vector<std::size_t> probes =
+        splitBracket(largestSaturated, *smallestBelow);
+    std::vector<std::future<ParallelPactProbeResult>> refineFutures;
+    refineFutures.reserve(probes.size());
+    for (std::size_t hashCount : probes)
+    {
+      refineFutures.push_back(launchProbe(seed, hashCount, 0));
+    }
+    for (auto& fut : refineFutures)
+    {
+      recordProbe(fut.get());
+    }
+  }
+  const std::size_t initialHash =
+      smallestBelow.value_or(largestSaturated == 0 ? std::size_t{1}
+                                                   : largestSaturated);
+
+  std::vector<double> estimates;
+  estimates.reserve(iterations);
+  if (smallestBelowProbe.has_value()
+      && largestSaturated + 1 == smallestBelowProbe->hashCount)
+  {
+    estimates.push_back(smallestBelowProbe->estimate);
+    emitWin(1,
+            smallestBelowProbe->hashCount,
+            smallestBelowProbe->cellCount,
+            smallestBelowProbe->estimate);
+  }
+  const std::size_t concurrentIterations =
+      std::max<std::size_t>(1, static_cast<std::size_t>(workerCount) / 3);
+
+  struct Triad
+  {
+    std::size_t iter = 0;
+    std::future<ParallelPactProbeResult> lower;
+    std::future<ParallelPactProbeResult> middle;
+    std::future<ParallelPactProbeResult> upper;
+  };
+
+  std::size_t launched = estimates.size();
+  while (launched < iterations)
+  {
+    std::vector<Triad> batch;
+    while (launched < iterations && batch.size() < concurrentIterations)
+    {
+      const std::uint64_t iterSeed = seed + launched;
+      const std::size_t round = launched + 1;
+      const std::size_t lowerHash =
+          initialHash == 0 ? std::size_t{0} : initialHash - 1;
+      batch.push_back({launched,
+                       launchProbe(iterSeed, lowerHash, round),
+                       launchProbe(iterSeed, initialHash, round),
+                       launchProbe(iterSeed, initialHash + 1, round)});
+      ++launched;
+    }
+
+    for (Triad& triad : batch)
+    {
+      ParallelPactProbeResult lower = triad.lower.get();
+      ParallelPactProbeResult middle = triad.middle.get();
+      ParallelPactProbeResult upper = triad.upper.get();
+      smtCalls += lower.smtCalls + middle.smtCalls + upper.smtCalls;
+
+      std::optional<ParallelPactProbeResult> winner;
+      std::size_t fallbackHash = initialHash;
+      if (lower.saturated && !middle.saturated)
+      {
+        winner = middle;
+      }
+      else if (middle.saturated && !upper.saturated)
+      {
+        winner = upper;
+      }
+      else if (!lower.saturated)
+      {
+        fallbackHash = lower.hashCount;
+      }
+      else
+      {
+        fallbackHash = upper.hashCount;
+      }
+
+      const std::size_t round = triad.iter + 1;
+      if (winner.has_value())
+      {
+        estimates.push_back(winner->estimate);
+        emitWin(round, winner->hashCount, winner->cellCount, winner->estimate);
+      }
+      else
+      {
+        ParallelPactWorkerResult fallback =
+            runPactWorker(smtFormula,
+                          seed + triad.iter,
+                          useNativeXor,
+                          useBvPact,
+                          epsilon,
+                          delta,
+                          fallbackHash,
+                          cvc5Jobs,
+                          doArjun,
+                          true,
+                          round,
+                          progress);
+        smtCalls += fallback.smtCalls;
+        estimates.push_back(fallback.estimate);
+        emitWin(round,
+                fallback.winningHash,
+                fallback.cellCount,
+                fallback.estimate);
+      }
+    }
+  }
+
+  std::sort(estimates.begin(), estimates.end());
+  ParallelPactWorkerResult result;
+  result.count = estimates.empty()
+                     ? 0
+                     : static_cast<std::uint64_t>(
+                           std::llround(estimates[estimates.size() / 2]));
+  result.smtCalls = smtCalls;
+  result.winningHash = initialHash;
   return result;
 }
 
@@ -721,6 +1228,13 @@ int main(int argc, char *argv[]) {
        po::value<double>()->default_value(0.2, "0.2"),
        "Confidence: the (1+epsilon) guarantee holds with probability at least "
        "1-delta (ApproxMC delta)")
+      ("jobs,j",
+       po::value<int>()->default_value(1),
+       "Number of worker processes/threads to use for --parallel pact or cvc5")
+      ("parallel",
+       po::value<std::string>(),
+       "Parallelization mode: 'cvc5' enables cvc5 portfolio jobs; 'pact' runs "
+       "independent PACT ApproxMCCore iterations in parallel")
       ("verbose,v", po::value<int>()->default_value(1),
        "Verbosity level (0-10)")
       ("verbosity-time,vt",
@@ -895,6 +1409,33 @@ int main(int argc, char *argv[]) {
   std::uint64_t approxSeed = vm["seed"].as<std::uint64_t>();
   double approxEpsilon = vm["epsilon"].as<double>();
   double approxDelta = vm["delta"].as<double>();
+  int parallelJobs = vm["jobs"].as<int>();
+  if (parallelJobs < 1)
+  {
+    std::cerr << "Error: -j/--jobs must be at least 1" << std::endl;
+    return 1;
+  }
+  std::string parallelMode;
+  if (vm.count("parallel"))
+  {
+    parallelMode = vm["parallel"].as<std::string>();
+    if (parallelMode != "cvc5" && parallelMode != "pact")
+    {
+      std::cerr << "Error: --parallel expects 'cvc5' or 'pact'"
+                << std::endl;
+      return 1;
+    }
+  }
+  const bool parallelCvc5 = (parallelMode == "cvc5");
+  const bool parallelPact = (parallelMode == "pact");
+  const bool parallelPactActive = parallelPact && parallelJobs > 1;
+  const int cvc5ParallelJobs = parallelCvc5 ? parallelJobs : 1;
+  if (parallelCvc5)
+  {
+    std::string jobsText = std::to_string(parallelJobs);
+    setenv("CADICAL_THREADS", jobsText.c_str(), 1);
+    setenv("CADICAL_NTHREADS", jobsText.c_str(), 1);
+  }
   bool useUnsatQuant = vm.count("unsat-q") > 0;
   bool countUnsatAssignments = vm.count("unsat") > 0 || useUnsatQuant;
 
@@ -994,11 +1535,12 @@ int main(int argc, char *argv[]) {
     // reasoning -- exponential on the dense XOR hashes, so counting hangs at the
     // first hash level. Enable the GJ engine exactly as ApproxMC drives this
     // same build (gauss=1, xorblast=0); CaDiCaL reads these per-option
-    // CADICAL_<NAME> env vars when each solver is constructed. (The --xor cvc
-    // path solves parities in cvc5's own propagator instead, so it leaves
-    // CaDiCaL's engine at its defaults.)
+    // CADICAL_<NAME> env vars when each solver is constructed.
     setenv("CADICAL_GAUSS", "1", 1);
     setenv("CADICAL_XORBLAST", "0", 1);
+    setenv("CADICAL_SHRINK", "0", 0);
+    setenv("CADICAL_REDUCE", "0", 0);
+    setenv("CADICAL_INPROCESSING", "0", 0);
   }
   else if (!xorForceCms && !useXorCnf && pbBackendNeeded)
   {
@@ -1016,6 +1558,13 @@ int main(int argc, char *argv[]) {
     requestNativeXor = true;
     useBvPact = false;
     setenv("CVC5_XOR_GAUSS", "1", 1);
+    // The patched CaDiCaL native-XOR build can crash in clause shrinking /
+    // reduction on dense PACT hashes (case60 reproduces it). Keep the XOR
+    // engine enabled but disable those inprocessing paths by default; callers
+    // can still override any of these before launching ttc.
+    setenv("CADICAL_SHRINK", "0", 0);
+    setenv("CADICAL_REDUCE", "0", 0);
+    setenv("CADICAL_INPROCESSING", "0", 0);
     // Enable Gauss-Jordan *propagation* (not just conflict detection) by
     // default: it prunes the search like CMS/ApproxMC and is the whole point
     // (~27x on case89). Set CVC5_XOR_GAUSS_NOPROP=1 to fall back to
@@ -1175,6 +1724,7 @@ int main(int argc, char *argv[]) {
     Log(1) << "Warning: unable to select CryptoMiniSat backend: " << ex.getMessage()
            << std::endl;
   }
+  configureCvc5ParallelJobs(mainSolver, cvc5ParallelJobs);
   if (useBvPact)
   {
     // Keep the fresh 1-bit projection bit-vectors as genuine bit-vectors so the
@@ -1792,8 +2342,34 @@ int main(int argc, char *argv[]) {
           return 1;
         }
       }
-      Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact, approxEpsilon, approxDelta);
-      std::uint64_t res = counter.count();
+      std::uint64_t res;
+      if (parallelPactActive && useProjectionBoost && !parser.hasWeights())
+      {
+        Pact planner(parser.solver(),
+                     parser.projectionVars(),
+                     approxSeed,
+                     g_useNativeXor,
+                     useBvPact,
+                     approxEpsilon,
+                     approxDelta);
+        ParallelPactWorkerResult parallel =
+            runParallelPact(smtFormula,
+                            approxSeed,
+                            g_useNativeXor,
+                            useBvPact,
+                            approxEpsilon,
+                            approxDelta,
+                            planner.plannedIterations(),
+                            parallelJobs,
+                            1,
+                            doArjun);
+        res = parallel.count;
+      }
+      else
+      {
+        Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact, approxEpsilon, approxDelta);
+        res = counter.count();
+      }
       cpp_int unsatTotal;
       bool haveUnsat = false;
       if (countUnsatAssignments) {
@@ -1846,6 +2422,9 @@ int main(int argc, char *argv[]) {
     std::cout << "c contract: " << (noContract ? "no" : "yes") << std::endl;
     std::cout << "c arjun: " << (doArjun ? "yes" : "no") << std::endl;
     std::cout << "c xor: " << (g_useNativeXor ? "yes" : "no") << std::endl;
+    std::cout << "c parallel: "
+              << (parallelMode.empty() ? "none" : parallelMode)
+              << " (-j " << parallelJobs << ")" << std::endl;
     std::cout << "c unsat assignments: "
               << (countUnsatAssignments
                       ? (useUnsatQuant ? "yes (quantified)"
@@ -1897,9 +2476,37 @@ int main(int argc, char *argv[]) {
       }
       else
       {
-        Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact, approxEpsilon, approxDelta);
-        res = counter.count();
-        weighted.smtCalls = counter.getSmtCallCount();
+        if (parallelPactActive && useProjectionBoost)
+        {
+          Pact planner(parser.solver(),
+                       parser.projectionVars(),
+                       approxSeed,
+                       g_useNativeXor,
+                       useBvPact,
+                       approxEpsilon,
+                       approxDelta);
+          ParallelPactWorkerResult parallel =
+              runParallelPact(smtFormula,
+                              approxSeed,
+                              g_useNativeXor,
+                              useBvPact,
+                              approxEpsilon,
+                              approxDelta,
+                              planner.plannedIterations(),
+                              parallelJobs,
+                              1,
+                              doArjun);
+          res = parallel.count;
+          weighted.smtCalls = parallel.smtCalls;
+          std::cout << "c parallel pact pilot hash: "
+                    << parallel.winningHash << std::endl;
+        }
+        else
+        {
+          Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact, approxEpsilon, approxDelta);
+          res = counter.count();
+          weighted.smtCalls = counter.getSmtCallCount();
+        }
       }
     }
     catch (const std::exception& ex)

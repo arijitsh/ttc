@@ -7,6 +7,8 @@
 #include <functional>
 #include <optional>
 #include <random>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "pact/bool_hash.hpp"
@@ -29,7 +31,50 @@ class Pact
 
   std::uint64_t count();
 
+  struct ProbeResult
+  {
+    std::size_t hashCount = 0;
+    bool saturated = false;
+    std::size_t cellCount = 0;
+  };
+
+  struct ProgressEvent
+  {
+    std::size_t hashCount = 0;
+    std::optional<std::size_t> cellCount;
+    std::string next;
+    std::size_t reuseSat = 0;
+    std::size_t reuseChecked = 0;
+    std::size_t threshold = 0;
+  };
+
+  ProbeResult probeHashCount(std::size_t hashCount);
+  double estimateFromMeasurement(std::size_t hashCount,
+                                 std::size_t cellCount) const;
+
   std::uint64_t getSmtCallCount() const { return d_counter.getSmtCallCount(); }
+  std::size_t plannedIterations() const { return getParameters().iterations; }
+  std::size_t lastWinningHash() const { return d_lastWinningHash; }
+  std::size_t lastWinningCellCount() const { return d_lastWinningCellCount; }
+
+  void setIterationOverride(std::optional<std::size_t> iterations)
+  {
+    d_iterationOverride = iterations;
+  }
+
+  void setInitialHashCount(std::size_t hashCount)
+  {
+    d_initialPrevMeasure = static_cast<std::int64_t>(hashCount);
+  }
+
+  void setBaseSaturatedKnown(bool saturated) { d_assumeBaseSaturated = saturated; }
+
+  void setProgressCallback(std::function<void(const ProgressEvent&)> callback)
+  {
+    d_progressCallback = std::move(callback);
+  }
+
+  void setQuiet(bool quiet) { d_quiet = quiet; }
 
  private:
   struct Parameters
@@ -130,6 +175,13 @@ class Pact
   // number of measurements from them exactly as ApproxMC does.
   double d_epsilon = 0.8;
   double d_delta = 0.2;
+  std::optional<std::size_t> d_iterationOverride;
+  std::int64_t d_initialPrevMeasure = 0;
+  std::size_t d_lastWinningHash = 0;
+  std::size_t d_lastWinningCellCount = 0;
+  bool d_assumeBaseSaturated = false;
+  bool d_quiet = false;
+  std::function<void(const ProgressEvent&)> d_progressCallback;
 
   // ApproxMC's reuse_models optimisation: keep the satisfying assignments found
   // so far in the current measurement and reuse the still-valid ones at the next
