@@ -390,15 +390,33 @@ double Pact::calcErrorBound(std::size_t t, double p) const
 
 Pact::Parameters Pact::getParameters() const
 {
+  constexpr double appmc7EpsCutoff = 5.0;
+  const bool useAppmc7 = d_epsilon >= appmc7EpsCutoff;
+  double alpha = -1.0;
+  double beta = -1.0;
+
   // ApproxMC6 threshold (CAV23, Counter::set_up_probs_threshold_measurements,
   // dense / non-sparse so thresh_factor = 1).
   std::size_t pivot = static_cast<std::size_t>(
       1.0
       + 9.84 * (1.0 + 1.0 / d_epsilon) * (1.0 + 1.0 / d_epsilon)
             * (1.0 + d_epsilon / (1.0 + d_epsilon)));
+  if (useAppmc7)
+  {
+    // ApproxMC7 Algorithm 4, line 6: for large epsilon the threshold is zero
+    // and each measurement searches for the last non-empty cell.
+    pivot = 0;
+    beta = (1.0
+            + std::sqrt(1.0 + 2.0 * (1.0 + d_epsilon) * (1.0 + d_epsilon)))
+           / 2.0;
+    alpha = beta - 1.0;
+  }
   if (pivot == 0)
   {
-    pivot = 1;
+    if (!useAppmc7)
+    {
+      pivot = 1;
+    }
   }
   if (const char* e = std::getenv("TTC_PIVOT"))
   {
@@ -429,7 +447,13 @@ Pact::Parameters Pact::getParameters() const
   {
     pL = 0.023;
   }
-  const double pU = (d_epsilon < 3.0) ? 0.169 : 0.044;
+  double pU = (d_epsilon < 3.0) ? 0.169 : 0.044;
+  if (useAppmc7)
+  {
+    // ApproxMC7 Lemma 5.
+    pL = 1.0 / (1.0 + alpha);
+    pU = 1.0 / beta;
+  }
 
   // Smallest odd number of measurements whose combined error bound <= delta
   // (median amplification, ApproxMC6 Algorithm 6).
@@ -447,7 +471,7 @@ Pact::Parameters Pact::getParameters() const
       iterations = 1;
     }
   }
-  return {pivot, iterations};
+  return {pivot, iterations, useAppmc7, alpha, beta};
 }
 
 double Pact::roundCount(double cellCount) const
@@ -520,7 +544,7 @@ HashConstraint Pact::generateHashConstraint()
   if (d_xorActivationLiteral && d_useNativeXor && hash.hasXorClauses())
   {
     cvc5::Term act =
-        tm.mkConst(d_solver.getBooleanSort(),
+        tm.mkConst(tm.getBooleanSort(),
                    "xact_" + std::to_string(d_activationCounter++));
     hash.setActivation(act);
   }
@@ -569,7 +593,7 @@ std::uint64_t Pact::count()
     }
     else
     {
-      countStream << ">=" << params.threshold;
+      countStream << ">=" << (params.appmc7 ? 1 : params.threshold);
     }
     // reuse_models tally: of `reuseChecked` stored solutions examined this
     // evaluation, `reuseSat` still satisfied the active hashes and were reused
@@ -594,26 +618,34 @@ std::uint64_t Pact::count()
     std::cout << line.str() << std::endl;
   };
 
-  // Base count with no hashing. If the formula has fewer than `threshold`
-  // models in total the count is exact and we are done -- this mirrors ApproxMC
-  // "counting without XORs".
-  rebuildCountSolver();
-  std::vector<HashConstraint> empty;
-  std::optional<std::size_t> base = d_counter.count(empty, params.threshold);
-  report(0, base, 0, 0, 0);
-  if (base.has_value())
+  if (!params.appmc7)
   {
-    Trace("pact") << "[pact] Base model count succeeded without hashing: "
-        << *base << std::endl;
-    std::cout << "c max hashes: " << maxHashesUsed << std::endl;
-    return static_cast<std::uint64_t>(*base);
+    // Base count with no hashing. If the formula has fewer than `threshold`
+    // models in total the count is exact and we are done -- this mirrors
+    // ApproxMC "counting without XORs". ApproxMC7's threshold is zero and its
+    // level-0 check is part of appmc7_one_measurement_count instead.
+    rebuildCountSolver();
+    std::vector<HashConstraint> empty;
+    std::optional<std::size_t> base = d_counter.count(empty, params.threshold);
+    report(0, base, 0, 0, 0);
+    if (base.has_value())
+    {
+      Trace("pact") << "[pact] Base model count succeeded without hashing: "
+          << *base << std::endl;
+      std::cout << "c max hashes: " << maxHashesUsed << std::endl;
+      return static_cast<std::uint64_t>(*base);
+    }
+    Trace("pact")
+        << "[pact] Base count reached saturation; introducing random hashes"
+        << std::endl;
+    // Level 0 (no hashes) is now known to saturate; oneMeasurement reuses this
+    // instead of re-enumerating the hash-free formula every measurement.
+    d_baseSaturated = true;
   }
-  Trace("pact")
-      << "[pact] Base count reached saturation; introducing random hashes"
-      << std::endl;
-  // Level 0 (no hashes) is now known to saturate; oneMeasurement reuses this
-  // instead of re-enumerating the hash-free formula every measurement.
-  d_baseSaturated = true;
+  else
+  {
+    d_baseSaturated = false;
+  }
 
   std::vector<double> estimates;
   estimates.reserve(params.iterations);
@@ -639,13 +671,20 @@ std::uint64_t Pact::count()
     std::vector<HashConstraint> hashPool;
     d_savedModels.clear();
     MeasurementResult m =
-        oneMeasurement(iter, prevMeasure, hashPool, params.threshold, report);
+        params.appmc7
+            ? oneMeasurementAppmc7(iter, prevMeasure, hashPool, report)
+            : oneMeasurement(
+                  iter, prevMeasure, hashPool, params.threshold, report);
 
-    // ApproxMC6 rounding of the cell count, then scale by 2^hashCount. Rounding
-    // only applies once hashing was needed (with no hashes the cell count is the
-    // exact total and must not be inflated).
+    // ApproxMC6 rounds the cell count; ApproxMC7 applies its alpha/beta
+    // adjustment. Both happen before scaling by 2^hashCount. With no hashes the
+    // cell count is exact and must not be inflated.
     double cell = static_cast<double>(m.cellCount);
-    if (m.hashCount > 0)
+    if (params.appmc7 && m.hashCount > 0)
+    {
+      cell *= std::sqrt(2.0 * params.alpha / params.beta);
+    }
+    else if (m.hashCount > 0)
     {
       cell = roundCount(cell);
     }
@@ -963,6 +1002,231 @@ Pact::MeasurementResult Pact::oneMeasurement(
   return {static_cast<std::size_t>(upperFib), static_cast<std::size_t>(cell)};
 }
 
+Pact::MeasurementResult Pact::oneMeasurementAppmc7(
+    std::size_t iter,
+    std::int64_t& prevMeasure,
+    std::vector<HashConstraint>& hashPool,
+    const ReportFn& report)
+{
+  // ApproxMC7 searches for adjacent levels h and h+1 where h is non-empty and
+  // h+1 is empty. A bounded count with threshold 1 returns nullopt on SAT
+  // (non-empty) and exact 0 on UNSAT (empty).
+  constexpr std::size_t existenceThreshold = 1;
+  const std::int64_t totalMaxHashes = static_cast<std::int64_t>(d_maxHashes);
+  std::int64_t lowerFib = 0;
+  std::int64_t upperFib = totalMaxHashes + 1;
+  std::int64_t hashCnt = prevMeasure;
+  std::int64_t hashPrev = hashCnt;
+
+  std::unordered_map<std::int64_t, bool> thresholdSols;
+  std::unordered_map<std::int64_t, std::int64_t> solsForHash;
+  thresholdSols[lowerFib] = true;
+  solsForHash[lowerFib] = 1;
+  thresholdSols[upperFib] = false;
+  solsForHash[upperFib] = 0;
+
+  auto activeHashes = [&](std::int64_t level) {
+    while (static_cast<std::int64_t>(hashPool.size()) < level)
+    {
+      hashPool.push_back(generateHashConstraint());
+    }
+    return std::vector<HashConstraint>(hashPool.begin(),
+                                       hashPool.begin() + level);
+  };
+
+  while (true)
+  {
+    if (hashCnt < 0)
+    {
+      hashCnt = 0;
+    }
+    if (hashCnt > totalMaxHashes)
+    {
+      hashCnt = totalMaxHashes;
+    }
+
+    const std::int64_t curHashCnt = hashCnt;
+    std::optional<std::size_t> attempt;
+    std::size_t curReuseSat = 0;
+    std::size_t curReuseChecked = 0;
+
+    if (d_xorActivationLiteral && d_useNativeXor)
+    {
+      activeHashes(hashCnt);
+      cvc5::Solver& cs = d_countSolver ? *d_countSolver : d_solver;
+      Trace("pact") << "[pact] Evaluating hash count " << hashCnt
+          << " (ApproxMC7, literal activation)" << std::endl;
+      for (; d_assertedHashes < static_cast<std::size_t>(hashCnt);
+           ++d_assertedHashes)
+      {
+        hashPool[d_assertedHashes].assertToSolver(cs, d_useNativeXor);
+      }
+      auto& tm = ttc::getTermBuilder(cs);
+      std::vector<cvc5::Term> assumptions;
+      assumptions.reserve(static_cast<std::size_t>(hashCnt));
+      for (std::int64_t i = 0; i < hashCnt; ++i)
+      {
+        const cvc5::Term& act = hashPool[i].activation();
+        if (!act.isNull())
+        {
+          assumptions.push_back(tm.mkTerm(cvc5::Kind::NOT, {act}));
+        }
+      }
+      attempt =
+          d_counter.countWithAssumptions(assumptions, existenceThreshold);
+    }
+    else
+    {
+      std::vector<HashConstraint> active = activeHashes(hashCnt);
+      Trace("pact") << "[pact] Evaluating hash count " << hashCnt
+          << " (ApproxMC7)" << std::endl;
+      if (d_useNativeXor && !std::getenv("TTC_NO_PERLEVEL_REBUILD"))
+      {
+        rebuildCountSolver();
+      }
+
+      std::size_t primedCount = 0;
+      if (d_reuseModels && hashCnt > 0)
+      {
+        std::vector<std::vector<cvc5::Term>> reusable;
+        reusable.reserve(d_savedModels.size());
+        for (const SavedModel& sm : d_savedModels)
+        {
+          ++curReuseChecked;
+          if (sm.hashCount >= static_cast<std::size_t>(hashCnt)
+              || modelSatisfiesHashes(sm.values, active))
+          {
+            reusable.push_back(sm.values);
+            break;
+          }
+        }
+        curReuseSat = reusable.size();
+        primedCount = curReuseSat;
+        d_counter.primeCache(active, std::move(reusable));
+      }
+
+      attempt = d_counter.count(active, existenceThreshold);
+
+      if (d_reuseModels && hashCnt > 0)
+      {
+        const std::vector<std::vector<cvc5::Term>>& found =
+            d_counter.lastModels();
+        for (std::size_t i = primedCount; i < found.size(); ++i)
+        {
+          d_savedModels.push_back(
+              {found[i], static_cast<std::size_t>(hashCnt)});
+        }
+      }
+    }
+
+    const bool empty = attempt.has_value() && *attempt == 0;
+    Trace("pact") << "[pact]   level " << hashCnt << " -> "
+        << (empty ? std::string("0") : std::string("non-empty"))
+        << std::endl;
+
+    if (empty)
+    {
+      if (hashCnt == 0)
+      {
+        prevMeasure = 0;
+        report(0, std::size_t{0}, 0, curReuseSat, curReuseChecked);
+        Trace("pact") << "[pact] ApproxMC7 found UNSAT at level 0"
+            << std::endl;
+        return {0, 0};
+      }
+      auto prev = thresholdSols.find(hashCnt - 1);
+      if (prev != thresholdSols.end() && prev->second)
+      {
+        prevMeasure = hashCnt - 1;
+        report(static_cast<std::size_t>(hashCnt),
+               std::size_t{0},
+               hashCnt - 1,
+               curReuseSat,
+               curReuseChecked);
+        Trace("pact") << "[pact] ApproxMC7 winner at " << (hashCnt - 1)
+            << std::endl;
+        return {static_cast<std::size_t>(hashCnt - 1), 1};
+      }
+
+      thresholdSols[hashCnt] = false;
+      solsForHash[hashCnt] = 0;
+
+      std::int64_t nextHash;
+      if (iter > 0 && std::llabs(hashCnt - prevMeasure) <= 2)
+      {
+        upperFib = hashCnt;
+        nextHash = hashCnt - 1;
+      }
+      else
+      {
+        if (hashPrev > hashCnt)
+        {
+          hashPrev = 0;
+        }
+        upperFib = hashCnt;
+        if (hashPrev > lowerFib)
+        {
+          lowerFib = hashPrev;
+        }
+        nextHash = (upperFib + lowerFib) / 2;
+      }
+      report(static_cast<std::size_t>(hashCnt),
+             std::size_t{0},
+             nextHash,
+             curReuseSat,
+             curReuseChecked);
+      hashPrev = curHashCnt;
+      hashCnt = nextHash;
+    }
+    else
+    {
+      auto above = thresholdSols.find(hashCnt + 1);
+      if (above != thresholdSols.end() && !above->second)
+      {
+        prevMeasure = hashCnt;
+        report(static_cast<std::size_t>(hashCnt),
+               std::nullopt,
+               hashCnt,
+               curReuseSat,
+               curReuseChecked);
+        Trace("pact") << "[pact] ApproxMC7 winner at " << hashCnt
+            << std::endl;
+        return {static_cast<std::size_t>(hashCnt), 1};
+      }
+
+      thresholdSols[hashCnt] = true;
+      solsForHash[hashCnt] = 1;
+
+      std::int64_t nextHash;
+      if (iter > 0 && std::llabs(hashCnt - prevMeasure) < 2)
+      {
+        lowerFib = hashCnt;
+        nextHash = hashCnt + 1;
+      }
+      else if (lowerFib + (hashCnt - lowerFib) * 2 >= upperFib - 1)
+      {
+        lowerFib = hashCnt;
+        nextHash = (lowerFib + upperFib) / 2;
+      }
+      else
+      {
+        nextHash = lowerFib + (hashCnt - lowerFib) * 2;
+        if (nextHash == hashCnt)
+        {
+          ++nextHash;
+        }
+      }
+      report(static_cast<std::size_t>(hashCnt),
+             std::nullopt,
+             nextHash,
+             curReuseSat,
+             curReuseChecked);
+      hashPrev = curHashCnt;
+      hashCnt = nextHash;
+    }
+  }
+}
+
 bool Pact::modelSatisfiesHashes(
     const std::vector<cvc5::Term>& model,
     const std::vector<HashConstraint>& hashes)
@@ -996,4 +1260,3 @@ bool Pact::modelSatisfiesHashes(
   }
   return true;
 }
-

@@ -351,6 +351,25 @@ endif()
 
 add_executable(ttc ${SOURCES})
 
+if(NOT BUILD_STATIC AND UNIX AND NOT APPLE)
+    execute_process(
+        COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libstdc++.so.6
+        OUTPUT_VARIABLE TTC_LIBSTDCXX
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(TTC_LIBSTDCXX AND IS_ABSOLUTE "${TTC_LIBSTDCXX}")
+        get_filename_component(TTC_LIBSTDCXX_DIR "${TTC_LIBSTDCXX}" DIRECTORY)
+        get_filename_component(TTC_LIBSTDCXX_DIR "${TTC_LIBSTDCXX_DIR}" REALPATH)
+        message(STATUS "C++ runtime RPATH: ${TTC_LIBSTDCXX_DIR}")
+        set_target_properties(ttc PROPERTIES
+            BUILD_RPATH "${TTC_LIBSTDCXX_DIR}"
+            INSTALL_RPATH "${TTC_LIBSTDCXX_DIR}")
+        # Use DT_RPATH instead of DT_RUNPATH so an older libstdc++ injected by
+        # LD_LIBRARY_PATH (for example Anaconda) cannot override the compiler
+        # runtime needed by this executable and its solver libraries.
+        target_link_options(ttc PRIVATE "LINKER:--disable-new-dtags")
+    endif()
+endif()
+
 # The static cryptominisat/louvain stack calls OpenMP runtime routines
 # (omp_get_wtime, etc.); a -static link needs libgomp named explicitly.
 find_package(OpenMP)
@@ -411,8 +430,9 @@ if(HAVE_SKOLEMFC)
     else()
         # Resolve libskolemfc and its CryptoMiniSat/ApproxMC/UniGen deps at runtime
         # without polluting LD_LIBRARY_PATH.
-        set_target_properties(ttc PROPERTIES
-            BUILD_RPATH "${SKOLEMFC_BUILD}/src;${SKOLEMFC_DEPS_LIB_DIR}"
+        set_property(TARGET ttc APPEND PROPERTY
+            BUILD_RPATH "${SKOLEMFC_BUILD}/src;${SKOLEMFC_DEPS_LIB_DIR}")
+        set_property(TARGET ttc APPEND PROPERTY
             INSTALL_RPATH "${SKOLEMFC_BUILD}/src;${SKOLEMFC_DEPS_LIB_DIR}")
     endif()
     # cvc5 is statically linked and bundles an OLDER CryptoMiniSat. Without this,

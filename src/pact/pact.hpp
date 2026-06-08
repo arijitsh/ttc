@@ -36,6 +36,9 @@ class Pact
   {
     std::size_t threshold;
     std::size_t iterations;
+    bool appmc7;
+    double alpha;
+    double beta;
   };
 
   // Outcome of a single galloping measurement: the model count found within the
@@ -104,6 +107,14 @@ class Pact
                                    std::size_t threshold,
                                    const ReportFn& report);
 
+  // ApproxMC7 large-epsilon measurement (AAAI25 Algorithm 4): instead of
+  // counting up to a pivot, each level only tests whether the hashed cell is
+  // non-empty, and the final cell count is adjusted by alpha/beta.
+  MeasurementResult oneMeasurementAppmc7(std::size_t iter,
+                                         std::int64_t& prevMeasure,
+                                         std::vector<HashConstraint>& hashPool,
+                                         const ReportFn& report);
+
   cvc5::Solver& d_solver;
   std::vector<cvc5::Term> d_projectionVars;
   std::vector<cvc5::Term> d_booleanVars;
@@ -165,4 +176,3 @@ class Pact
   std::optional<cvc5::Solver> d_countSolver;
   void rebuildCountSolver();
 };
-
