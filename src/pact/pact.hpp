@@ -193,10 +193,25 @@ class Pact
   // galloping search's hiIndex sentinel.
   std::size_t d_maxHashes = 1;
 
+  // Number of cells one hash splits the model space into. 2 for the default XOR
+  // parity hashing, but the word-level bit-vector hash families (--hash
+  // prime/lemire) split into the prime modulus / 2^slice cells per hash, so a
+  // measurement at h hashes estimates cellCount * d_hashMultiplier^h instead of
+  // cellCount * 2^h. Stays 2 unless a word-level family is active over a purely
+  // bit-vector projection.
+  double d_hashMultiplier = 2.0;
+
   // Whether parity hashes are handed to the SAT solver as native XOR clauses
   // (CaDiCaL Gauss-Jordan) instead of CNF. Requires the core SAT solver to be
   // CaDiCaL, which rebuildCountSolver enforces on the counting solver.
   bool d_useNativeXor = false;
+
+  // --hash prime-gj: the prime hash is enforced by cvc5's Z_p Gauss-Jordan
+  // propagator (assertModpClause), which requires the count solver to be
+  // CaDiCaL and, like native XOR, a per-galloping-level solver rebuild (the
+  // mod-p rows live in the propagator and are not retracted on pop, so reusing
+  // the solver would accumulate every level's rows). Set from TTC_HASH_MODE.
+  bool d_useModpGj = false;
 
   // --xor-activation literal: hold the whole hash pool on a single solver and
   // toggle hashes with indicator-variable assumptions instead of rebuilding the

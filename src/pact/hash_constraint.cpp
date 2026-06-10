@@ -1,8 +1,11 @@
 #include "pact/hash_constraint.hpp"
+#include <cstdint>
+#include <cstdlib>
 
 #include <sstream>
 #include <utility>
 
+#include "features.hpp"
 #include "logger.hpp"
 
 HashConstraint::HashConstraint(cvc5::Term fallback, std::vector<XorClause> clauses)
@@ -22,6 +25,43 @@ bool HashConstraint::hasXorClauses() const
 
 void HashConstraint::assertToSolver(cvc5::Solver& solver, bool useNativeXor) const
 {
+  // --hash prime-gj: a mod-p row is enforced by cvc5's Z_p Gauss-Jordan
+  // propagator, not bit-blasted. Hand the literals + weights + modulus straight
+  // to assertModpClause; do NOT assert the (arithmetic) fallback term, so the
+  // expensive multiply/urem is never built into CNF.
+  for (const XorClause& clause : d_xorClauses)
+  {
+    if (clause.modulus != 0)
+    {
+      solver.assertModpClause(
+          clause.terms, clause.weights, clause.rhsValue, clause.modulus);
+      // The mod-p row lives in the CDCL(T) propagator, but the projection-bit
+      // atoms (= (extract k k) #b1) otherwise appear in no asserted clause, so
+      // the bit-vector theory never bit-blasts/links them to x's real bits and
+      // the propagator reasons over free, disconnected copies. Force the theory
+      // to bit-blast and link EACH bit-atom individually by asserting, per bit,
+      // (= g_k lit_k) with a fresh unconstrained guard g_k. This bit-blasts and
+      // ties lit_k to x's real bit (so the propagator's per-bit values match the
+      // model) while adding no restriction on x -- and, unlike the arithmetic
+      // fallback, blasts only the individual bits, never the multiply/mod. A
+      // single parity link is insufficient: it would tie only the XOR of the
+      // bits, letting individual atoms deviate and the mod-p sum drift.
+      if (!std::getenv("TTC_MODP_NO_LINK"))
+      {
+        auto& tm = ttc::getTermBuilder(solver);
+        static std::uint64_t s_guardCounter = 0;
+        for (const cvc5::Term& lit : clause.terms)
+        {
+          cvc5::Term guard =
+              tm.mkConst(tm.getBooleanSort(),
+                         "__ttc_modp_link_" + std::to_string(s_guardCounter++));
+          solver.assertFormula(tm.mkTerm(cvc5::Kind::EQUAL, {guard, lit}));
+        }
+      }
+      return;
+    }
+  }
+
   bool canGoNative = useNativeXor && !d_xorClauses.empty();
   for (const XorClause& clause : d_xorClauses)
   {

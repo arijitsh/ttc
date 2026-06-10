@@ -12,6 +12,16 @@ struct XorClause
   std::vector<cvc5::Term> terms;
   bool rhs = false;
   cvc5::Term fallback;
+
+  // --hash prime-gj: when modulus != 0 this clause is not a GF(2) parity but a
+  // linear constraint over Z_p:  sum_i weights[i] * terms[i] == rhsValue (mod
+  // modulus). It is handed to cvc5's mod-p Gauss-Jordan propagator via
+  // assertModpClause instead of being bit-blasted; `fallback` still holds the
+  // equivalent bit-vector arithmetic term, used only for the cheap model-reuse
+  // check (never asserted to the solver, so never blasted).
+  std::vector<uint64_t> weights;
+  uint64_t modulus = 0;
+  uint64_t rhsValue = 0;
 };
 
 // Encapsulates one randomly generated hash constraint. Each hash constraint may

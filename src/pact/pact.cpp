@@ -77,6 +77,10 @@ Pact::Pact(cvc5::Solver& solver,
   {
     d_reuseModels = false;
   }
+  if (const char* hm = std::getenv("TTC_HASH_MODE"))
+  {
+    d_useModpGj = (std::string(hm) == "prime-gj");
+  }
   // --xor-activation {rebuild,literal}; main maps the flag to TTC_XOR_ACTIVATION.
   // Default 'rebuild': measured faster here than 'literal'. Although 'literal'
   // (one solver, hashes toggled by indicator assumptions) avoids the per-level
@@ -244,6 +248,28 @@ Pact::Pact(cvc5::Solver& solver,
     d_maxHashes = 1;
   }
 
+  // Word-level bit-vector hash families (--hash prime/lemire) split the space
+  // into more than two cells per hash. They only make sense over a purely
+  // bit-vector projection (main rejects mixing them with Boolean projection
+  // variables); when active, fewer hashes are needed and each measurement scales
+  // by the family's per-hash multiplier rather than 2. Otherwise the default XOR
+  // multiplier of 2 is kept.
+  if (!d_bitvectorVars.empty() && d_booleanVars.empty())
+  {
+    d_hashMultiplier = d_bvHash.perHashMultiplier();
+  }
+  if (d_hashMultiplier > 2.0)
+  {
+    const double bitsPerHash = std::log2(d_hashMultiplier);
+    if (bitsPerHash > 0.0)
+    {
+      std::size_t refined = static_cast<std::size_t>(
+                                std::ceil(d_maxHashes / bitsPerHash))
+                            + 1;
+      d_maxHashes = std::max<std::size_t>(refined, 1);
+    }
+  }
+
   d_baseAssertions = d_solver.getAssertions();
 }
 
@@ -345,6 +371,40 @@ void Pact::rebuildCountSolver()
     }
     catch (const cvc5::CVC5ApiException&)
     {
+    }
+  }
+
+  // --hash prime-gj: the mod-p Gauss-Jordan rows live in the CaDiCaL CDCL(T)
+  // propagator. The projection bits are tied to x via the per-bit linkage
+  // clauses asserted in HashConstraint::assertToSolver; here we force the count
+  // solver to CaDiCaL (for the propagator) and disable simplification so those
+  // linkage clauses survive.
+  if (const char* hm = std::getenv("TTC_HASH_MODE"))
+  {
+    if (std::string(hm) == "prime-gj")
+    {
+      // The per-bit linkage (= g_k lit_k) asserted alongside each mod-p row has
+      // unconstrained guards; cvc5's nonclausal simplification would substitute
+      // them away and drop the clauses, un-linking the bits from x. Disable
+      // simplification so the linkage survives.
+      try
+      {
+        cs.setOption("simplification", "none");
+      }
+      catch (const cvc5::CVC5ApiException&)
+      {
+      }
+      // The mod-p Gauss-Jordan engine lives in the CaDiCaL CDCL(T) propagator,
+      // so the count solver must be CaDiCaL (no native XOR -- prime-gj adds no
+      // XOR clauses, and native-XOR-on-BV is unstable).
+      try
+      {
+        cs.setOption("sat-solver", "cadical");
+        cs.setOption("sat-use-native-xor", "false");
+      }
+      catch (const cvc5::CVC5ApiException&)
+      {
+      }
     }
   }
   try
@@ -590,11 +650,21 @@ double Pact::estimateFromMeasurement(std::size_t hashCount,
   {
     cell *= std::sqrt(2.0 * params.alpha / params.beta);
   }
-  else if (hashCount > 0)
+  else if (hashCount > 0 && d_hashMultiplier == 2.0)
   {
+    // ApproxMC6 rounding is calibrated for factor-2 hashing, where the winning
+    // cell count always lands within [pivot/2, pivot] so the rounding floor is a
+    // sound correction. The word-level families (--hash prime/lemire) divide the
+    // space by their (much larger) multiplier per hash, so the winning cell
+    // count can be as small as pivot/multiplier; applying the factor-2 floor
+    // there grossly overestimates. For them use the raw cell count, i.e. the
+    // classic SMTApproxMC estimator cellCount * multiplier^hashCount.
     cell = roundCount(cell);
   }
-  return std::ldexp(cell, static_cast<int>(hashCount));
+  // cell * d_hashMultiplier^hashCount. For the default XOR family
+  // (d_hashMultiplier == 2) this is exactly std::ldexp(cell, hashCount); the
+  // word-level families use their larger per-hash multiplier instead.
+  return cell * std::pow(d_hashMultiplier, static_cast<double>(hashCount));
 }
 
 std::uint64_t Pact::count()
@@ -912,7 +982,8 @@ Pact::MeasurementResult Pact::oneMeasurement(
       // galloping levels would therefore accumulate every level's hashes and
       // over-constrain the formula. Rebuild a fresh counting solver per level so
       // each count sees only its own hashes.
-      if (d_useNativeXor && !std::getenv("TTC_NO_PERLEVEL_REBUILD"))
+      if ((d_useNativeXor || d_useModpGj)
+          && !std::getenv("TTC_NO_PERLEVEL_REBUILD"))
       {
         rebuildCountSolver();
       }
@@ -1148,7 +1219,8 @@ Pact::MeasurementResult Pact::oneMeasurementAppmc7(
       std::vector<HashConstraint> active = activeHashes(hashCnt);
       Trace("pact") << "[pact] Evaluating hash count " << hashCnt
           << " (ApproxMC7)" << std::endl;
-      if (d_useNativeXor && !std::getenv("TTC_NO_PERLEVEL_REBUILD"))
+      if ((d_useNativeXor || d_useModpGj)
+          && !std::getenv("TTC_NO_PERLEVEL_REBUILD"))
       {
         rebuildCountSolver();
       }
@@ -1308,6 +1380,31 @@ bool Pact::modelSatisfiesHashes(
   cvc5::Solver& s = d_countSolver ? *d_countSolver : d_solver;
   for (const HashConstraint& hash : hashes)
   {
+    // Word-level (Prime/Lemire) hashes carry no parity literals -- their clause
+    // has empty `terms` and the whole constraint lives in the fallback equality.
+    // Evaluate that term under the saved assignment instead of XORing literals.
+    bool arithmetic = false;
+    for (const XorClause& clause : hash.xorClauses())
+    {
+      // Word-level Prime/Lemire have empty parity terms; PrimeGj has parity-like
+      // bit literals but is really a mod-p row (modulus != 0). Both are checked
+      // by evaluating the (arithmetic) fallback term, not by XORing literals.
+      if (clause.terms.empty() || clause.modulus != 0)
+      {
+        arithmetic = true;
+        break;
+      }
+    }
+    if (arithmetic)
+    {
+      cvc5::Term value =
+          s.simplify(hash.fallback().substitute(d_projectionVars, model));
+      if (!(value.isBooleanValue() && value.getBooleanValue()))
+      {
+        return false;
+      }
+      continue;
+    }
     for (const XorClause& clause : hash.xorClauses())
     {
       bool parity = false;

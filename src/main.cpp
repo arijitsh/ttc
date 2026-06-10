@@ -1269,6 +1269,13 @@ int main(int argc, char *argv[]) {
        "'cms' = route to the bit-vector SAT solver (CryptoMiniSat); "
        "'blast' = Tseitin-blast to CNF for plain CaDiCaL. Unset: 'cvc' for "
        "LRA/theory inputs, auto-fallback to 'cms' for bit-vector inputs.")
+      ("hash", po::value<std::string>(),
+       "Hash family for bit-vector projection counting: 'xor' (default) = "
+       "ApproxMC-style parity over projection bits; 'prime' = word-level "
+       "a*x mod p == c hash; 'lemire' = multiply-shift hash; 'prime-gj' = the "
+       "prime hash enforced by cvc5's Z_p Gauss-Jordan propagator (no "
+       "bit-blast of the multiply/mod). All but 'xor' require a purely "
+       "bit-vector projection.")
       ("xor-activation", po::value<std::string>(),
        "How the native-XOR galloping search switches hashes on/off: 'rebuild' "
        "(default) rebuilds the count solver per galloping level so it sees only "
@@ -1463,6 +1470,31 @@ int main(int argc, char *argv[]) {
       return 1;
     }
   }
+  // --hash {xor,prime,lemire}: the hash family used over bit-vector projection
+  // variables. 'xor' (default) is the existing ApproxMC parity hashing; 'prime'
+  // and 'lemire' are word-level bit-vector hashes ported from cvc5's
+  // SmtApproxMc and require a purely bit-vector projection (checked once the
+  // projection variables are known, below). Carried into Pact via TTC_HASH_MODE.
+  std::string hashMode = "xor";
+  if (vm.count("hash"))
+  {
+    hashMode = vm["hash"].as<std::string>();
+    if (hashMode != "xor" && hashMode != "prime" && hashMode != "lemire"
+        && hashMode != "prime-gj")
+    {
+      std::cerr
+          << "Error: --hash expects 'xor', 'prime', 'lemire' or 'prime-gj'"
+          << std::endl;
+      return 1;
+    }
+  }
+  // 'prime-gj' enforces the prime hash with cvc5's Z_p Gauss-Jordan propagator.
+  // That propagator is the CDCL(T) external propagator, active whenever the
+  // count solver is CaDiCaL -- but prime-gj must NOT use native XOR (it adds no
+  // XOR clauses, and native-XOR-on-BV is unstable) nor the BV-PACT substitution.
+  // The count solver is forced to CaDiCaL in Pact::rebuildCountSolver when the
+  // mode is prime-gj; here we just make sure neither XOR nor BV-PACT is engaged.
+  const bool useModpGj = (hashMode == "prime-gj");
   // --xor-activation {literal,rebuild}: how the native-XOR galloping search
   // toggles hashes. Default 'literal' (indicator-assumption, no per-level
   // rebuild). Carried into Pact via TTC_XOR_ACTIVATION.
@@ -1553,6 +1585,14 @@ int main(int argc, char *argv[]) {
   // projection variables so the XOR hashes reach the BV SAT backend.
   bool useBvPact = pbBackendNeeded && !useCvcXor && !useXorCnf
                    && !requestNativeXor;
+  // prime-gj counts on the bit-vector projection directly (no BV-PACT Boolean
+  // substitution) and uses the mod-p propagator, not native XOR. Pact forces
+  // the count solver to CaDiCaL for this mode.
+  if (useModpGj)
+  {
+    useBvPact = false;
+    requestNativeXor = false;
+  }
   if (useCvcXor)
   {
     requestNativeXor = true;
@@ -1994,6 +2034,38 @@ int main(int argc, char *argv[]) {
         return 1;
       }
       // else: leave useProjectionBoost false; the isLraInput path runs volume.
+    }
+  }
+
+  // The word-level hash families operate on bit-vector projection variables
+  // only; reject them if any projection variable is non-bit-vector (e.g. a
+  // Boolean). Then hand the mode to Pact's BvHash through TTC_HASH_MODE.
+  if (hashMode != "xor")
+  {
+    const std::vector<cvc5::Term>& pv = parser.projectionVars();
+    bool allBv = !pv.empty();
+    for (const cvc5::Term& t : pv)
+    {
+      if (!t.getSort().isBitVector())
+      {
+        allBv = false;
+        break;
+      }
+    }
+    if (!allBv)
+    {
+      std::cerr << "Error: --hash " << hashMode
+                << " requires a purely bit-vector projection" << std::endl;
+      return 1;
+    }
+    setenv("TTC_HASH_MODE", hashMode.c_str(), 1);
+    // prime-gj: enable Z_p Gauss-Jordan *propagation* in the propagator (the
+    // conflict check always runs once mod-p rows exist; this adds search
+    // pruning, the point of the propagator). CVC5_MODP_GAUSS_NOPROP=1 falls back
+    // to conflict-only for A/B comparison.
+    if (useModpGj && !getenv("CVC5_MODP_GAUSS_NOPROP"))
+    {
+      setenv("CVC5_MODP_GAUSS_PROP", "1", 1);
     }
   }
 
