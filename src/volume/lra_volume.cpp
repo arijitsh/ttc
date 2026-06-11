@@ -14,6 +14,13 @@
 
 #include <random>
 
+// GMP arbitrary-precision floats for the sampling / union bookkeeping. The
+// default (--gmp) path stores points and evaluates membership tests in mpf at a
+// precision derived from get_precision_from_cubes(); --fullgmp additionally runs
+// the billiard walk itself in this type (see gmp_billiard_walk.hpp).
+#include <boost/multiprecision/gmp.hpp>
+#include <boost/multiprecision/eigen.hpp>
+
 #include "cartesian_geom/cartesian_kernel.h"
 #include "convex_bodies/hpolytope.h"
 #include "generators/boost_random_number_generator.hpp"
@@ -24,6 +31,7 @@
 #include "sampling/random_point_generators.hpp"
 #include "volume/sampling_policies.hpp"
 #include "volume/volume_cooling_gaussians.hpp"
+#include "volume/gmp_billiard_walk.hpp"
 
 // cddlib (double precision) for polytope canonicalization, mirroring the
 // Python prototype's use of pycddlib (src/polytope_operations.py::canonicalize).
@@ -40,6 +48,10 @@ namespace
 {
 
 using TermIndexMap = std::unordered_map<cvc5::Term, std::size_t>;
+
+// MpFloat (GMP float for the sampling / union bookkeeping) is defined in
+// gmp_billiard_walk.hpp; its runtime precision is set globally via
+// MpFloat::default_precision(digits) before sampling starts.
 
 constexpr double kZeroTolerance = 1e-9;
 
@@ -526,30 +538,42 @@ bool canonicalizePolytope(Eigen::MatrixXd& A, Eigen::VectorXd& b)
 
 // Stores the running set of sample points "X" used by the union-volume
 // (Karp-Luby style) estimator.  Mirrors the behaviour of the reference Python
-// implementation in src/cube_processor_nondis.py.
+// implementation in src/cube_processor_nondis.py.  Templated on the coordinate
+// type: `double` for the --nogmp path, `MpFloat` for the GMP paths (the
+// membership test A x <= b is then evaluated in GMP, avoiding the double
+// cancellation that can misclassify points near a facet).
+template <typename Coord>
 class SampleStore
 {
  public:
+  using Vec = Eigen::Matrix<Coord, Eigen::Dynamic, 1>;
+  using Mat = Eigen::Matrix<Coord, Eigen::Dynamic, Eigen::Dynamic>;
+
   explicit SampleStore(double tolerance) : d_tolerance(tolerance) {}
 
-  void addSample(const Eigen::VectorXd& sample)
+  void addSample(const Vec& sample)
   {
     d_samples.push_back(sample);
   }
 
   // Removes every stored point that lies inside the polytope {x : A x <= b}.
-  // Equivalent to the Python:  X = [s for s in X if not poly.is_in(s)].
-  std::size_t removeInside(const Eigen::MatrixXd& A, const Eigen::VectorXd& b)
+  // Equivalent to the Python:  X = [s for s in X if not poly.is_in(s)].  The
+  // half-space matrices are double (built once); they are cast to the
+  // coordinate type so the dot products run at the stored precision.
+  std::size_t removeInside(const Eigen::MatrixXd& Ad, const Eigen::VectorXd& bd)
   {
-    if (A.rows() == 0)
+    if (Ad.rows() == 0)
     {
       return 0;
     }
+    Mat A = Ad.template cast<Coord>();
+    Vec b = bd.template cast<Coord>();
+    Coord tol(d_tolerance);
     auto oldSize = d_samples.size();
     auto it = std::remove_if(d_samples.begin(), d_samples.end(),
-                             [&](const Eigen::VectorXd& sample) {
-                               Eigen::VectorXd diff = A * sample - b;
-                               return (diff.array() <= d_tolerance).all();
+                             [&](const Vec& sample) {
+                               Vec diff = A * sample - b;
+                               return (diff.array() <= tol).all();
                              });
     d_samples.erase(it, d_samples.end());
     return oldSize - d_samples.size();
@@ -563,7 +587,7 @@ class SampleStore
     std::uniform_real_distribution<double> unit(0.0, 1.0);
     auto oldSize = d_samples.size();
     auto it = std::remove_if(d_samples.begin(), d_samples.end(),
-                             [&](const Eigen::VectorXd&) {
+                             [&](const Vec&) {
                                return unit(rng) < 0.5;
                              });
     d_samples.erase(it, d_samples.end());
@@ -577,8 +601,116 @@ class SampleStore
 
  private:
   double d_tolerance;
-  std::vector<Eigen::VectorXd> d_samples;
+  std::vector<Vec> d_samples;
 };
+
+// Precision (decimal digits) for GMP sampling, mirroring the Python prototype's
+// get_precision_from_cubes (src/cube_processor_nondis.py):
+//   precision = ceil(8 * dim * sqrt(log(facet)))
+// where `facet` is the polytope's facet count and `dim` the real dimension.
+// (The Python caller passes a hard-coded dim=2; we use the true dimension, which
+// is the mathematically intended value.)  Clamped to >= 1.
+int precisionFromCubes(std::size_t dimension, long facetCount)
+{
+  double facet = std::max<double>(facetCount, 2.0);
+  double prec = std::ceil(8.0 * static_cast<double>(dimension)
+                          * std::sqrt(std::log(facet)));
+  if (!std::isfinite(prec) || prec < 1.0)
+  {
+    return 1;
+  }
+  return static_cast<int>(prec);
+}
+
+// A polytope kept after phase 1, with its (double) half-space matrices and the
+// volesti volume estimate.
+struct PolytopeVolume
+{
+  Eigen::MatrixXd A;
+  Eigen::VectorXd b;
+  double volume = 0.0;
+};
+
+// Phase 2: streaming union-volume (Karp-Luby style) estimation, templated on the
+// coordinate type used to store the surviving sample set `X`.  `p` is the
+// running sampling probability; the union volume is estimated as |X| / p.
+// `generate(A, b, n, samplingTime)` draws `n` fresh points inside {x : A x <= b}
+// (the only step that differs between the double and GMP walk backends).
+template <typename Coord, typename GenFn>
+void runUnionAlgorithm(const std::vector<PolytopeVolume>& kept, double thresh,
+                       unsigned seed, GenFn&& generate,
+                       VolumeComputationResult& result,
+                       const std::function<void(const VolumeComputationRow&)>& onRow)
+{
+  std::mt19937 auxRng(seed);  // drives Poisson draws and down-sampling
+  SampleStore<Coord> store(1e-6);
+
+  double p = 1.0;
+  std::size_t rowIndex = 0;
+  std::size_t totalGenerated = 0;
+  std::size_t totalDeleted = 0;
+  double totalSamplingTime = 0.0;
+
+  for (const auto& entry : kept)
+  {
+    const double volume = entry.volume;
+
+    // Drop stored points that lie inside the current polytope.
+    std::size_t deleted = store.removeInside(entry.A, entry.b);
+
+    // Shrink the sampling probability so that p*volume stays within thresh.
+    while (p * volume > thresh)
+    {
+      store.downsampleHalf(auxRng);
+      p /= 2.0;
+    }
+
+    // Draw the number of fresh samples; keep |X| + N within the threshold.
+    std::poisson_distribution<long long> poisson(p * volume);
+    long long n = poisson(auxRng);
+    while (static_cast<double>(n) + static_cast<double>(store.size()) > thresh)
+    {
+      store.downsampleHalf(auxRng);
+      p /= 2.0;
+      poisson = std::poisson_distribution<long long>(p * volume);
+      n = poisson(auxRng);
+    }
+
+    std::size_t sampleCount = 0;
+    double samplingTime = 0.0;
+    if (n > 0)
+    {
+      auto samples = generate(entry.A, entry.b, n, samplingTime);
+      for (auto& sample : samples)
+      {
+        store.addSample(sample);
+      }
+      sampleCount = samples.size();
+    }
+
+    totalGenerated += sampleCount;
+    totalDeleted += deleted;
+    totalSamplingTime += samplingTime;
+    VolumeComputationRow row;
+    row.index = ++rowIndex;
+    row.volume = volume;
+    row.samplesDeleted = deleted;
+    row.totalSamples = store.size();
+    row.samplesGenerated = sampleCount;
+    result.rows.push_back(row);
+    if (onRow)
+    {
+      onRow(row);
+    }
+  }
+
+  result.finalSampleCount = store.size();
+  result.volumeEstimate =
+      (p > 0.0) ? static_cast<double>(store.size()) / p : 0.0;
+  result.totalSamplesGenerated = totalGenerated;
+  result.totalSamplesDeleted = totalDeleted;
+  result.samplingTime = totalSamplingTime;
+}
 
 std::vector<cvc5::Term> deduplicateRealVariables(
     const std::vector<cvc5::Term>& variables)
@@ -605,6 +737,7 @@ std::vector<cvc5::Term> deduplicateRealVariables(
 VolumeComputationResult computeLraVolume(
     const std::vector<Polytope>& polytopes,
     const std::vector<cvc5::Term>& realVariables,
+    const VolumeOptions& options,
     const std::function<void(const VolumeComputationRow&)>& onRow)
 {
   VolumeComputationResult result;
@@ -644,25 +777,27 @@ VolumeComputationResult computeLraVolume(
       6.0 * (std::log(6.0 / kDelta) + std::log(std::max(1.0, numCubes))));
 
   // The volesti `volume` tool uses walk length 10 + dim/10; the `sample` tool
-  // uses a fixed walk length of 10.
-  const unsigned volumeWalkLength = static_cast<unsigned>(10 + dimension / 10);
-  const unsigned sampleWalkLength = 10;
+  // uses a fixed walk length of 10. Both are overridable via --walklen-vol /
+  // --walklen-samp (a negative option value keeps the volesti default).
+  const unsigned volumeWalkLength =
+      options.volumeWalkLength >= 0
+          ? static_cast<unsigned>(options.volumeWalkLength)
+          : static_cast<unsigned>(10 + dimension / 10);
+  const unsigned sampleWalkLength =
+      options.sampleWalkLength >= 0
+          ? static_cast<unsigned>(options.sampleWalkLength)
+          : 10;
 
   Log(2) << "Starting union algorithm, threshold: " << thresh << std::endl;
 
   // Phase 1: build the half-space matrices and compute every volume up front,
   // dropping polytopes whose (full-dimensional) volume is zero.
-  struct PolytopeVolume
-  {
-    Eigen::MatrixXd A;
-    Eigen::VectorXd b;
-    double volume = 0.0;
-  };
   std::vector<PolytopeVolume> kept;
   kept.reserve(polytopes.size());
 
   std::size_t numZeroVolume = 0;
   double totalVolumeTime = 0.0;
+  long maxRawFacets = 0;  // for the GMP sampling precision (get_precision_from_cubes)
   for (const auto& poly : polytopes)
   {
     PolytopeMatrices matrices = buildPolytopeMatrices(poly, index, dimension);
@@ -673,8 +808,10 @@ VolumeComputationResult computeLraVolume(
     }
     // Canonicalize (remove redundant constraints, detect equalities) with
     // cddlib, exactly as the Python prototype does before volume/sampling.
+    // --no-cdd-simp skips this and feeds volesti the raw half-spaces.
     long rawFacets = matrices.A.rows();
-    if (!canonicalizePolytope(matrices.A, matrices.b))
+    maxRawFacets = std::max(maxRawFacets, rawFacets);
+    if (options.cddSimplify && !canonicalizePolytope(matrices.A, matrices.b))
     {
       ++numZeroVolume;
       continue;
@@ -707,89 +844,93 @@ VolumeComputationResult computeLraVolume(
            << polytopes.size() << " where volume is zero" << std::endl;
   }
 
-  // Phase 2: streaming union-volume (Karp-Luby style) estimation.  `p` is the
-  // running sampling probability and `store` holds the surviving samples `X`;
-  // the union volume is estimated as |X| / p.
-  std::mt19937 auxRng(kSeed);  // drives Poisson draws and down-sampling
-  SampleRNG sampleRng(static_cast<int>(dimension));
-  SampleStore store(1e-6);
-
-  double p = 1.0;
-  std::size_t rowIndex = 0;
-  std::size_t totalGenerated = 0;
-  std::size_t totalDeleted = 0;
-  double totalSamplingTime = 0.0;
-
-  for (const auto& entry : kept)
+  // Phase 2: streaming union-volume (Karp-Luby style) estimation.  The sample
+  // bookkeeping uses double (--nogmp) or GMP (default / --fullgmp); the GMP
+  // precision follows get_precision_from_cubes (overridable via --precision).
+  int precision = options.precision > 0
+                      ? options.precision
+                      : precisionFromCubes(dimension, maxRawFacets);
+  result.samplingPrecision = precision;
+  if (options.gmpMode != GmpMode::None)
   {
-    const double volume = entry.volume;
+    MpFloat::default_precision(static_cast<unsigned>(precision));
+  }
 
-    // Drop stored points that lie inside the current polytope.
-    std::size_t deleted = store.removeInside(entry.A, entry.b);
+  SampleRNG sampleRng(static_cast<int>(dimension));
 
-    // Shrink the sampling probability so that p*volume stays within thresh.
-    while (p * volume > thresh)
+  // Generator: run volesti's billiard walk in double inside {x : A x <= b} and
+  // return the raw double points.  Shared by --nogmp and the default GMP path
+  // (which only differ in how the points are *stored*).
+  auto generateDouble =
+      [&](const Eigen::MatrixXd& A, const Eigen::VectorXd& b, long long n,
+          double& samplingTime) -> std::vector<Eigen::VectorXd> {
+    HPolytope hpoly(static_cast<unsigned>(dimension), A, b);
+    Point start = hpoly.ComputeInnerBall().first;
+    PushBackWalkPolicy policy;
+    std::list<Point> samples;
+    sampleRng.set_seed(kSeed);
+    double samplingStart = Log.elapsed();
+    RandomPointGenerator<SampleWalk>::apply(hpoly, start,
+                                            static_cast<unsigned>(n),
+                                            sampleWalkLength, samples, policy,
+                                            sampleRng);
+    samplingTime = Log.elapsed() - samplingStart;
+    std::vector<Eigen::VectorXd> out;
+    out.reserve(samples.size());
+    for (const Point& sample : samples)
     {
-      store.downsampleHalf(auxRng);
-      p /= 2.0;
+      out.push_back(sample.getCoefficients());
     }
+    return out;
+  };
 
-    // Draw the number of fresh samples; keep |X| + N within the threshold.
-    std::poisson_distribution<long long> poisson(p * volume);
-    long long n = poisson(auxRng);
-    while (static_cast<double>(n) + static_cast<double>(store.size()) > thresh)
+  switch (options.gmpMode)
+  {
+    case GmpMode::None:
+      runUnionAlgorithm<double>(kept, thresh, kSeed, generateDouble, result,
+                                onRow);
+      break;
+    case GmpMode::PointRepr:
     {
-      store.downsampleHalf(auxRng);
-      p /= 2.0;
-      poisson = std::poisson_distribution<long long>(p * volume);
-      n = poisson(auxRng);
+      // Double walk, but store / test the points in GMP at `precision` digits.
+      auto generate =
+          [&](const Eigen::MatrixXd& A, const Eigen::VectorXd& b, long long n,
+              double& samplingTime) {
+            auto dpts = generateDouble(A, b, n, samplingTime);
+            std::vector<Eigen::Matrix<MpFloat, Eigen::Dynamic, 1>> out;
+            out.reserve(dpts.size());
+            for (const auto& v : dpts)
+            {
+              out.push_back(v.cast<MpFloat>());
+            }
+            return out;
+          };
+      runUnionAlgorithm<MpFloat>(kept, thresh, kSeed, generate, result, onRow);
+      break;
     }
-
-    std::size_t sampleCount = 0;
-    double samplingTime = 0.0;
-    if (n > 0)
+    case GmpMode::Full:
     {
-      HPolytope hpoly(static_cast<unsigned>(dimension), entry.A, entry.b);
-      Point start = hpoly.ComputeInnerBall().first;
-      PushBackWalkPolicy policy;
-      std::list<Point> samples;
-      sampleRng.set_seed(kSeed);
-      double samplingStart = Log.elapsed();
-      RandomPointGenerator<SampleWalk>::apply(hpoly, start,
-                                              static_cast<unsigned>(n),
-                                              sampleWalkLength, samples, policy,
-                                              sampleRng);
-      samplingTime = Log.elapsed() - samplingStart;
-      for (const Point& sample : samples)
-      {
-        store.addSample(sample.getCoefficients());
-      }
-      sampleCount = samples.size();
-    }
-
-    totalGenerated += sampleCount;
-    totalDeleted += deleted;
-    totalSamplingTime += samplingTime;
-    VolumeComputationRow row;
-    row.index = ++rowIndex;
-    row.volume = volume;
-    row.samplesDeleted = deleted;
-    row.totalSamples = store.size();
-    row.samplesGenerated = sampleCount;
-    result.rows.push_back(row);
-    if (onRow)
-    {
-      onRow(row);
+      // Run the billiard walk itself in GMP.  The Chebyshev centre and inner
+      // radius (used to size the walk step) come from the double inner ball.
+      auto generate =
+          [&](const Eigen::MatrixXd& A, const Eigen::VectorXd& b, long long n,
+              double& samplingTime) {
+            HPolytope hpoly(static_cast<unsigned>(dimension), A, b);
+            auto ball = hpoly.ComputeInnerBall();
+            Eigen::VectorXd center = ball.first.getCoefficients();
+            double radius = ball.second;
+            double samplingStart = Log.elapsed();
+            auto pts = sampleGmpBilliard(A, b, center, radius, n,
+                                         sampleWalkLength, kSeed);
+            samplingTime = Log.elapsed() - samplingStart;
+            return pts;
+          };
+      runUnionAlgorithm<MpFloat>(kept, thresh, kSeed, generate, result, onRow);
+      break;
     }
   }
 
-  result.finalSampleCount = store.size();
-  result.volumeEstimate =
-      (p > 0.0) ? static_cast<double>(store.size()) / p : 0.0;
-  result.totalSamplesGenerated = totalGenerated;
-  result.totalSamplesDeleted = totalDeleted;
   result.volumeComputationTime = totalVolumeTime;
-  result.samplingTime = totalSamplingTime;
   return result;
 }
 

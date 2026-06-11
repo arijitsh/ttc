@@ -386,21 +386,33 @@ void Pact::rebuildCountSolver()
       // The per-bit linkage (= g_k lit_k) asserted alongside each mod-p row has
       // unconstrained guards; cvc5's nonclausal simplification would substitute
       // them away and drop the clauses, un-linking the bits from x. Disable
-      // simplification so the linkage survives.
+      // simplification so the linkage survives. (TTC_MODP_SIMP overrides, for
+      // perf A/B -- correctness needs 'none' with the current linkage.)
       try
       {
-        cs.setOption("simplification", "none");
+        const char* simp = std::getenv("TTC_MODP_SIMP");
+        cs.setOption("simplification", simp ? simp : "none");
       }
       catch (const cvc5::CVC5ApiException&)
       {
       }
       // The mod-p Gauss-Jordan engine lives in the CaDiCaL CDCL(T) propagator,
       // so the count solver must be CaDiCaL (no native XOR -- prime-gj adds no
-      // XOR clauses, and native-XOR-on-BV is unstable).
+      // XOR clauses, and native-XOR-on-BV is unstable). Bit-blast the bit-vector
+      // theory to a CaDiCaL sub-solver too: with the default cryptominisat
+      // sub-solver, cross-solver model extraction (getValue -> CMS::value) reads
+      // a variable past CMS's model and segfaults (e.g. 6.smt2); cadical (and
+      // minisat) do not. TTC_MODP_BVSAT / TTC_MODP_BV override for experiments.
       try
       {
         cs.setOption("sat-solver", "cadical");
         cs.setOption("sat-use-native-xor", "false");
+        const char* bvsat = std::getenv("TTC_MODP_BVSAT");
+        cs.setOption("bv-sat-solver", bvsat ? bvsat : "cadical");
+        if (const char* bv = std::getenv("TTC_MODP_BV"))
+        {
+          cs.setOption("bv-solver", bv);
+        }
       }
       catch (const cvc5::CVC5ApiException&)
       {

@@ -1286,8 +1286,27 @@ int main(int argc, char *argv[]) {
 
   // Engine 3: pure QF_LRA with no projection variables -> LRA volume.
   po::options_description classLra(
-      "Engine 3 -- LRA volume computation (auto: QF_LRA, no projection vars; "
-      "fully automatic, no tunable options)");
+      "Engine 3 -- LRA volume computation (auto: QF_LRA, no projection vars)");
+  classLra.add_options()
+      ("walklen-vol", po::value<int>(),
+       "Random-walk length for the volesti volume estimator "
+       "(volume_cooling_gaussians); default 10 + dim/10")
+      ("walklen-samp", po::value<int>(),
+       "Random-walk length for volesti point sampling (billiard walk); "
+       "default 10")
+      ("no-cdd-simp",
+       "Skip cddlib polytope canonicalization (redundant-constraint removal / "
+       "implicit-equality detection) before volume and sampling")
+      ("nogmp",
+       "Disable GMP: store sample points and run the union membership tests in "
+       "double (the original behaviour). Default: store/test in GMP at a "
+       "precision derived from the polytopes (get_precision_from_cubes)")
+      ("fullgmp",
+       "Run the billiard walk itself in GMP at the sampling precision (not just "
+       "the point bookkeeping). Slower; mutually exclusive with --nogmp")
+      ("precision", po::value<int>(),
+       "Override the GMP sampling precision (decimal digits). Default: auto, "
+       "ceil(8*dim*sqrt(log(facets)))");
 
   // Engine 4: uninterpreted-function counting -> SkolemFC. Counts the number of
   // interpretations of an uninterpreted function that satisfy the formula by
@@ -2190,11 +2209,76 @@ int main(int argc, char *argv[]) {
       const auto& polytopes = parser.polytopes();
       auto realVars = parser.realVariables();
 
+      ttc::VolumeOptions volumeOptions;
+      if (vm.count("walklen-vol"))
+      {
+        int wl = vm["walklen-vol"].as<int>();
+        if (wl < 1)
+        {
+          std::cerr << "Error: --walklen-vol must be at least 1" << std::endl;
+          return 1;
+        }
+        volumeOptions.volumeWalkLength = wl;
+      }
+      if (vm.count("walklen-samp"))
+      {
+        int wl = vm["walklen-samp"].as<int>();
+        if (wl < 1)
+        {
+          std::cerr << "Error: --walklen-samp must be at least 1" << std::endl;
+          return 1;
+        }
+        volumeOptions.sampleWalkLength = wl;
+      }
+      volumeOptions.cddSimplify = vm.count("no-cdd-simp") == 0;
+      if (vm.count("nogmp") && vm.count("fullgmp"))
+      {
+        std::cerr << "Error: --nogmp and --fullgmp are mutually exclusive"
+                  << std::endl;
+        return 1;
+      }
+      if (vm.count("nogmp"))
+        volumeOptions.gmpMode = ttc::GmpMode::None;
+      else if (vm.count("fullgmp"))
+        volumeOptions.gmpMode = ttc::GmpMode::Full;
+      else
+        volumeOptions.gmpMode = ttc::GmpMode::PointRepr;
+      if (vm.count("precision"))
+      {
+        int prec = vm["precision"].as<int>();
+        if (prec < 1)
+        {
+          std::cerr << "Error: --precision must be at least 1" << std::endl;
+          return 1;
+        }
+        volumeOptions.precision = prec;
+      }
+
       print_section("options");
       std::cout << "c counting: volume" << std::endl;
       std::cout << "c detected pure LRA: yes" << std::endl;
       std::cout << "c real variables: " << realVars.size() << std::endl;
       std::cout << "c polytopes: " << polytopes.size() << std::endl;
+      std::cout << "c sampling arithmetic: "
+                << (volumeOptions.gmpMode == ttc::GmpMode::None ? "double"
+                    : volumeOptions.gmpMode == ttc::GmpMode::Full
+                        ? "gmp (full walk)"
+                        : "gmp (point repr)")
+                << std::endl;
+      std::cout << "c volume walk length: ";
+      if (volumeOptions.volumeWalkLength >= 0)
+        std::cout << volumeOptions.volumeWalkLength;
+      else
+        std::cout << "auto (10 + dim/10)";
+      std::cout << std::endl;
+      std::cout << "c sample walk length: ";
+      if (volumeOptions.sampleWalkLength >= 0)
+        std::cout << volumeOptions.sampleWalkLength;
+      else
+        std::cout << "10";
+      std::cout << std::endl;
+      std::cout << "c cdd simplification: "
+                << (volumeOptions.cddSimplify ? "yes" : "no") << std::endl;
       std::cout << "c" << std::endl;
 
       print_section("volume computation");
@@ -2209,7 +2293,7 @@ int main(int argc, char *argv[]) {
 
       double volumeStart = Log.elapsed();
       auto volumeResult =
-          ttc::computeLraVolume(polytopes, realVars, rowPrinter);
+          ttc::computeLraVolume(polytopes, realVars, volumeOptions, rowPrinter);
       double volumeEnd = Log.elapsed();
       Profile.addSearch(volumeEnd - volumeStart);
       Profile.addPolytopeVolume(volumeResult.volumeComputationTime);
@@ -2218,6 +2302,11 @@ int main(int argc, char *argv[]) {
                              volumeResult.totalSamplesDeleted);
       std::cout.unsetf(std::ios::floatfield);
       std::cout.precision(6);
+      if (volumeOptions.gmpMode != ttc::GmpMode::None)
+      {
+        std::cout << "c gmp sampling precision (digits): "
+                  << volumeResult.samplingPrecision << std::endl;
+      }
       std::cout << "c" << std::endl;
 
       print_section("result");

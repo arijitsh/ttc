@@ -266,6 +266,47 @@ std::optional<std::size_t> SaturatingCounter::count(
         break;
       }
 
+      std::vector<cvc5::Term> modelValues;
+      modelValues.reserve(d_projectionVars->size());
+      for (const cvc5::Term& var : *d_projectionVars)
+      {
+        modelValues.push_back(d_solver->getValue(var));
+      }
+
+      // Theory-level (real-x) verification of the mod-p hashes (--hash prime-gj
+      // with TTC_MODP_VERIFY): the propagator reasons over the (= extract #b1)
+      // atoms, which can lag x's real bits; a model the SAT side accepted may
+      // have hash(x) != c on the actual x. Evaluate each mod-p hash's arithmetic
+      // term on the real assignment (getValue, no solving) and reject violators
+      // -- block the projection assignment and do not count it. This is the
+      // word-level conflict check that the atom-level SAT propagator cannot do
+      // soundly.
+      if (std::getenv("TTC_MODP_VERIFY"))
+      {
+        bool spurious = false;
+        for (const HashConstraint& hc : additionalConstraints)
+        {
+          bool isModp = false;
+          for (const XorClause& xc : hc.xorClauses())
+          {
+            if (xc.modulus != 0) { isModp = true; break; }
+          }
+          if (!isModp || hc.fallback().isNull()) continue;
+          cvc5::Term v = d_solver->getValue(hc.fallback());
+          if (v.isBooleanValue() && !v.getBooleanValue())
+          {
+            spurious = true;
+            break;
+          }
+        }
+        if (spurious)
+        {
+          // Block this projection assignment without counting it.
+          d_solver->assertFormula(buildBlocking(modelValues, modelCount + 1));
+          continue;
+        }
+      }
+
       ++modelCount;
       Trace("saturating") << "Recorded model " << modelCount << std::endl;
       if (modelCount >= threshold)
@@ -274,13 +315,6 @@ std::optional<std::size_t> SaturatingCounter::count(
             << "; stopping enumeration" << std::endl;
         result = std::nullopt;
         break;
-      }
-
-      std::vector<cvc5::Term> modelValues;
-      modelValues.reserve(d_projectionVars->size());
-      for (const cvc5::Term& var : *d_projectionVars)
-      {
-        modelValues.push_back(d_solver->getValue(var));
       }
       if (std::getenv("TTC_DUP_DEBUG"))
       {
