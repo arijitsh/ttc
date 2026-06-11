@@ -1161,27 +1161,6 @@ bool projVarsAreBvOrBool(const std::vector<cvc5::Term>& projVars)
   return true;
 }
 
-// Build a writable path for the intermediate model-preserving CNF that the
-// bit-vector ApproxMC path produces under automatic dispatch (the user did not
-// supply one via --bvcnf <file>).
-std::string makeAutoCnfPath(const std::string& filename)
-{
-  const char* tmp = std::getenv("TMPDIR");
-  std::string dir = (tmp != nullptr && *tmp != '\0') ? tmp : "/tmp";
-  std::string base = filename;
-  std::size_t slash = base.find_last_of("/\\");
-  if (slash != std::string::npos)
-  {
-    base = base.substr(slash + 1);
-  }
-  if (base.empty())
-  {
-    base = "ttc";
-  }
-  return dir + "/" + base + "." + std::to_string(static_cast<long>(::getpid())) +
-         ".bvcnf";
-}
-
 // Report that the input matches none of the auto-dispatch engine classes and
 // explain how the engine is chosen.
 void printUnsupportedEngine(const std::string& logicUpper,
@@ -1248,10 +1227,16 @@ int main(int argc, char *argv[]) {
   po::options_description classBv(
       "Engine 1 -- bit-vector counting (auto: logic BV / UFBV)");
   classBv.add_options()
-      ("bvcnf", po::value<std::string>(),
-       "Eagerly bit-blast a QF_BV formula to a model-preserving CNF, write it "
-       "to the given file, and run ApproxMC to count its bit-vector models "
-       "(forces this engine; auto-selected for BV/UFBV logics)");
+      ("bvcnf", po::value<std::string>()->implicit_value(""),
+       "Force engine 1: eagerly bit-blast a QF_BV formula to a "
+       "model-preserving CNF in memory and count its bit-vector models with "
+       "Arjun+ApproxMC in-process (no intermediate file). Auto-selected for "
+       "BV/UFBV logics. If a path is given the bit-blasted CNF is also written "
+       "to that file (equivalent to --cnf <file>)")
+      ("cnf", po::value<std::string>()->implicit_value(""),
+       "Also write the eager bit-blasted, model-preserving CNF used by engine 1 "
+       "to a DIMACS file (defaults to <input>.cnf when no path is given); the "
+       "count is still produced in-process");
 
   // Engine 2: other theories with BV/Bool projection variables -> --pact.
   po::options_description classPb(
@@ -1544,6 +1529,7 @@ int main(int argc, char *argv[]) {
   // / bv-pact) is set up exactly as if --PB had been passed explicitly.
   const bool explicitEngine =
       vm.count("pact") || vm.count("enum") || vm.count("bvcnf")
+      || vm.count("cnf")
       || vm.count("tocnf") || vm.count("d4") || vm.count("FB")
       || vm.count("unsat") || vm.count("unsat-q") || vm.count("skolemfc");
   const bool autoDispatch = !explicitEngine;
@@ -1643,7 +1629,7 @@ int main(int argc, char *argv[]) {
     setenv("TTC_XOR_CNF", "1", 1);
   }
   bool useToCNF = vm.count("tocnf") > 0;
-  bool useBvCnf = vm.count("bvcnf") > 0 || autoBvCnf;
+  bool useBvCnf = vm.count("bvcnf") > 0 || vm.count("cnf") > 0 || autoBvCnf;
   bool writeFB = vm.count("FB") > 0;
   bool useMono = vm.count("mono") > 0 || vm.count("mono-true") > 0;
   bool monoTrue = vm.count("mono-true") > 0;
@@ -2101,13 +2087,29 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Eager bit-blasting BV model counter: write a model-preserving CNF and run
-  // ApproxMC over the bits of the bit-vector variables.
+  // Eager bit-blasting BV model counter: bit-blast a model-preserving CNF in
+  // memory and count its bit-vector models in-process with Arjun + ApproxMC
+  // (no intermediate file). With --cnf (or --bvcnf <file>) the same CNF is
+  // also written to disk for inspection.
   if (useBvCnf)
   {
-    const std::string bvCnfPath = vm.count("bvcnf")
-                                      ? vm["bvcnf"].as<std::string>()
-                                      : makeAutoCnfPath(filename);
+    // Resolve the optional CNF dump path. Both --cnf and --bvcnf accept an
+    // implicit (empty) value meaning "force engine 1"; a non-empty value
+    // requests a dump. When --cnf is given with no path, default to
+    // <input>.cnf next to the input file.
+    std::string dumpPath;
+    bool wantDump = false;
+    if (vm.count("cnf"))
+    {
+      wantDump = true;
+      const std::string val = vm["cnf"].as<std::string>();
+      dumpPath = val.empty() ? (filename + ".cnf") : val;
+    }
+    else if (vm.count("bvcnf") && !vm["bvcnf"].as<std::string>().empty())
+    {
+      wantDump = true;
+      dumpPath = vm["bvcnf"].as<std::string>();
+    }
 
     // Sampling set: every declared bit-vector variable, including those that
     // do not occur in any assertion (counted as free bits), so the projected
@@ -2124,29 +2126,33 @@ int main(int argc, char *argv[]) {
 
     try
     {
-      double bbStart = Log.elapsed();
-      ttc::eager::BvCnfResult cnf = ttc::eager::writeBvCnf(
-          parser.solver(), parser.assertions(), bvVars, bvCnfPath);
-      double bbEnd = Log.elapsed();
+      std::optional<ttc::eager::BvCountResult> res = ttc::eager::countBvModels(
+          parser.solver(), parser.assertions(), bvVars, approxSeed,
+          approxEpsilon, approxDelta, verbosity,
+          wantDump ? &dumpPath : nullptr);
+      if (!res.has_value())
+      {
+        std::cerr << "Error: ApproxMC did not produce a count" << std::endl;
+        return 1;
+      }
 
-      std::cout << "c [ttc->bvcnf] wrote model-preserving CNF to '" << cnf.path
-                << "'" << std::endl;
-      std::cout << "c [ttc->bvcnf] variables: " << cnf.numVars
-                << " clauses: " << cnf.numClauses
-                << " sampling: " << cnf.numSamplingVars << std::endl;
+      if (wantDump)
+      {
+        std::cout << "c [ttc->bvcnf] wrote model-preserving CNF to '"
+                  << dumpPath << "'" << std::endl;
+      }
+      std::cout << "c [ttc->bvcnf] variables: " << res->numVars
+                << " clauses: " << res->numClauses
+                << " sampling: " << res->numSamplingVars << std::endl;
+      std::cout << "c [ttc->bvcnf] after arjun: variables: "
+                << res->simplifiedVars
+                << " sampling: " << res->simplifiedSamplingVars << std::endl;
       std::cout << "c [ttc->bvcnf] bit-blasted in " << std::fixed
-                << std::setprecision(2) << (bbEnd - bbStart) << " seconds"
+                << std::setprecision(2) << res->bitblastSeconds << " seconds"
                 << std::endl;
 
-      std::optional<std::string> count =
-          ttc::eager::runApproxMc(bvCnfPath, approxSeed, verbosity);
-      if (count.has_value())
-      {
-        std::cout << "s mc " << *count << std::endl;
-        return 0;
-      }
-      std::cerr << "Error: ApproxMC did not produce a count" << std::endl;
-      return 1;
+      std::cout << "s mc " << res->count << std::endl;
+      return 0;
     }
     catch (const std::exception& ex)
     {
