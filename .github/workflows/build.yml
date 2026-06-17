@@ -95,6 +95,11 @@ jobs:
           build/ttc example/volume/box.smt2 2>&1 | tee /tmp/vol.txt
           grep -q "^s volume " /tmp/vol.txt
 
+      - name: Test — SkolemFC engine
+        run: |
+          build/ttc example/function/multiplier.smt2 --skolemfc 2>&1 | tee /tmp/sk.txt
+          grep -q "^s fc 2 \*\*" /tmp/sk.txt
+
       - name: Upload artifact
         if: matrix.static_compile
         uses: actions/upload-artifact@v4
@@ -152,6 +157,11 @@ jobs:
         run: |
           build/ttc example/volume/box.smt2 2>&1 | tee /tmp/vol.txt
           grep -q "^s volume " /tmp/vol.txt
+
+      - name: Test — SkolemFC engine
+        run: |
+          build/ttc example/function/multiplier.smt2 --skolemfc 2>&1 | tee /tmp/sk.txt
+          grep -q "^s fc 2 \*\*" /tmp/sk.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

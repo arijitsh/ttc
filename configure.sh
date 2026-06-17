@@ -198,8 +198,14 @@ if [ "$OS" = "Darwin" ]; then
   BREW="$(brew --prefix)"
   CMAKE_ARGS+=("-DCMAKE_PREFIX_PATH=$BREW")
   CMAKE_ARGS+=("-DBOOST_ROOT=$(brew --prefix boost 2>/dev/null || echo "$BREW")")
-  # libomp is keg-only; hand find_package(OpenMP) its location.
-  CMAKE_ARGS+=("-DOpenMP_ROOT=$(brew --prefix libomp 2>/dev/null || echo "$BREW")")
+  # AppleClang doesn't enable OpenMP on its own, so find_package(OpenMP) fails
+  # with just OpenMP_ROOT. Hand it the Homebrew libomp flags/lib explicitly.
+  LIBOMP="$(brew --prefix libomp 2>/dev/null || echo "$BREW")"
+  CMAKE_ARGS+=("-DOpenMP_C_FLAGS=-Xclang -fopenmp -I$LIBOMP/include")
+  CMAKE_ARGS+=("-DOpenMP_CXX_FLAGS=-Xclang -fopenmp -I$LIBOMP/include")
+  CMAKE_ARGS+=("-DOpenMP_C_LIB_NAMES=omp")
+  CMAKE_ARGS+=("-DOpenMP_CXX_LIB_NAMES=omp")
+  CMAKE_ARGS+=("-DOpenMP_omp_LIBRARY=$LIBOMP/lib/libomp.dylib")
   $DEBUG        && CMAKE_ARGS+=("-DENABLE_DEBUG=ON")  || CMAKE_ARGS+=("-DENABLE_DEBUG=OFF")
   $ENABLE_DDNNF && CMAKE_ARGS+=("-DENABLE_DDNNF=ON")  || CMAKE_ARGS+=("-DENABLE_DDNNF=OFF")
   if $STATIC; then
