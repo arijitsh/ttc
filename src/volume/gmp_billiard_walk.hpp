@@ -1,0 +1,146 @@
+#pragma once
+
+// Self-contained billiard walk in GMP (boost mpf_float) arithmetic, used by the
+// LRA volume engine's --fullgmp mode.  volesti's templated billiard walk cannot
+// be instantiated on mpf_float without an extensive port (boost.random does not
+// support variable-precision floats, and several volesti routines narrow NT to
+// int/double), so we implement the walk directly here.  The geometry is the
+// standard billiard reflection walk (the same one volesti uses); only the
+// arithmetic differs -- every dot product and reflection runs at the configured
+// mpf precision, so points near a facet are placed without double cancellation.
+
+#include <cstddef>
+#include <random>
+#include <vector>
+
+#include <Eigen/Dense>
+#include <boost/multiprecision/eigen.hpp>
+#include <boost/multiprecision/gmp.hpp>
+
+namespace ttc
+{
+
+// GMP float for the sampling / union bookkeeping.  Runtime precision is set
+// globally via MpFloat::default_precision(digits) before sampling starts.
+using MpFloat = boost::multiprecision::mpf_float;
+using MpVector = Eigen::Matrix<MpFloat, Eigen::Dynamic, 1>;
+
+// Draws `n` points from the billiard walk inside {x : A x <= b}, each `n`
+// separated by `walkLength` reflection steps, starting from `startCenter` (the
+// double Chebyshev centre, converted to mpf).  `innerRadius` sizes the walk
+// step.  Direction draws use a double Mersenne twister seeded with `seed`
+// (randomness need not exceed double precision); all geometry is in mpf.
+inline std::vector<MpVector> sampleGmpBilliard(const Eigen::MatrixXd& Ad,
+                                               const Eigen::VectorXd& bd,
+                                               const Eigen::VectorXd& startCenter,
+                                               double innerRadius, long long n,
+                                               unsigned walkLength, unsigned seed)
+{
+  const Eigen::Index m = Ad.rows();
+  const Eigen::Index dim = Ad.cols();
+  std::vector<MpVector> out;
+  if (n <= 0 || m == 0 || dim == 0)
+  {
+    return out;
+  }
+
+  Eigen::Matrix<MpFloat, Eigen::Dynamic, Eigen::Dynamic> Am = Ad.cast<MpFloat>();
+  MpVector bm = bd.cast<MpFloat>();
+  // Per-row squared norm <a_i, a_i> for the reflection, precomputed once.
+  MpVector rowSqNorm(m);
+  for (Eigen::Index i = 0; i < m; ++i)
+  {
+    rowSqNorm(i) = Am.row(i).dot(Am.row(i));
+  }
+
+  // Walk step length, mirroring volesti's diameter estimate 2*sqrt(dim)*r.
+  MpFloat len = MpFloat(2) * sqrt(MpFloat(static_cast<long>(dim)))
+                * MpFloat(innerRadius);
+  if (len <= 0)
+  {
+    len = MpFloat(1);
+  }
+  const MpFloat dl(0.995);  // back off slightly from each facet (volesti)
+  const MpFloat eps("1e-12");
+
+  std::mt19937 rng(seed);
+  std::normal_distribution<double> ndist(0.0, 1.0);
+  std::uniform_real_distribution<double> udist(0.0, 1.0);
+
+  MpVector p = startCenter.cast<MpFloat>();
+  MpVector v(dim);
+  out.reserve(static_cast<std::size_t>(n));
+
+  auto sampleDirection = [&]() {
+    MpFloat sq(0);
+    for (Eigen::Index j = 0; j < dim; ++j)
+    {
+      v(j) = MpFloat(ndist(rng));
+      sq += v(j) * v(j);
+    }
+    MpFloat norm = sqrt(sq);
+    if (norm <= 0)
+    {
+      norm = MpFloat(1);
+    }
+    for (Eigen::Index j = 0; j < dim; ++j)
+    {
+      v(j) /= norm;
+    }
+  };
+
+  const long maxReflections = 50 * static_cast<long>(dim);
+  for (long long pt = 0; pt < n; ++pt)
+  {
+    for (unsigned step = 0; step < walkLength; ++step)
+    {
+      MpFloat budget = MpFloat(udist(rng)) * len;
+      sampleDirection();
+      MpVector p0 = p;
+      long it = 0;
+      for (; it < maxReflections; ++it)
+      {
+        // First positive facet along v: t_i = (b_i - a_i.p) / (a_i.v).
+        MpVector av = Am * v;
+        MpVector ap = Am * p;
+        MpFloat minPlus(0);
+        Eigen::Index facet = -1;
+        for (Eigen::Index i = 0; i < m; ++i)
+        {
+          if (av(i) > eps)
+          {
+            MpFloat t = (bm(i) - ap(i)) / av(i);
+            if (facet < 0 || t < minPlus)
+            {
+              minPlus = t;
+              facet = i;
+            }
+          }
+        }
+        if (facet < 0)
+        {
+          break;  // unbounded along v (should not happen for a bounded body)
+        }
+        if (budget <= minPlus)
+        {
+          p += budget * v;
+          break;
+        }
+        MpFloat advance = dl * minPlus;
+        p += advance * v;
+        budget -= advance;
+        // Reflect v about the facet normal a: v -= 2 <v,a>/<a,a> a.
+        MpFloat coeff = MpFloat(2) * Am.row(facet).dot(v) / rowSqNorm(facet);
+        v -= coeff * Am.row(facet).transpose();
+      }
+      if (it == maxReflections)
+      {
+        p = p0;  // numerical trouble: discard this step
+      }
+    }
+    out.push_back(p);
+  }
+  return out;
+}
+
+}  // namespace ttc
