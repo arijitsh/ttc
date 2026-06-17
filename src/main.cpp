@@ -1188,6 +1188,13 @@ void printUnsupportedEngine(const std::string& logicUpper,
 }  // namespace
 
 int main(int argc, char *argv[]) {
+  // The xor-branch CaDiCaL defaults factor=1 + factorcheck=1, which fatal-errors
+  // on add() for any variable not explicitly declared (max_var). cvc5 (and
+  // arjun/cadiback) add literals lazily, relying on add() to auto-extend
+  // max_var, so disable the strict declaration check globally before any solver
+  // is constructed. The factor (bounded variable addition) optimization stays on.
+  setenv("CADICAL_FACTORCHECK", "0", 1);
+
   // General options shared by every engine. By default ttc auto-selects an
   // engine from the (set-logic ...) directive and the projection variables;
   // the options below are grouped by the engine they configure.
@@ -1227,16 +1234,14 @@ int main(int argc, char *argv[]) {
   po::options_description classBv(
       "Engine 1 -- bit-vector counting (auto: logic BV / UFBV)");
   classBv.add_options()
-      ("bvcnf", po::value<std::string>()->implicit_value(""),
+      ("bvcnf",
        "Force engine 1: eagerly bit-blast a QF_BV formula to a "
        "model-preserving CNF in memory and count its bit-vector models with "
        "Arjun+ApproxMC in-process (no intermediate file). Auto-selected for "
-       "BV/UFBV logics. If a path is given the bit-blasted CNF is also written "
-       "to that file (equivalent to --cnf <file>)")
-      ("cnf", po::value<std::string>()->implicit_value(""),
-       "Also write the eager bit-blasted, model-preserving CNF used by engine 1 "
-       "to a DIMACS file (defaults to <input>.cnf when no path is given); the "
-       "count is still produced in-process");
+       "BV/UFBV logics")
+      ("cnf",
+       "Engine 1: also write the eager bit-blasted, model-preserving CNF to "
+       "<input>.cnf in DIMACS form; the count is still produced in-process");
 
   // Engine 2: other theories with BV/Bool projection variables -> --pact.
   po::options_description classPb(
@@ -2093,23 +2098,10 @@ int main(int argc, char *argv[]) {
   // also written to disk for inspection.
   if (useBvCnf)
   {
-    // Resolve the optional CNF dump path. Both --cnf and --bvcnf accept an
-    // implicit (empty) value meaning "force engine 1"; a non-empty value
-    // requests a dump. When --cnf is given with no path, default to
-    // <input>.cnf next to the input file.
-    std::string dumpPath;
-    bool wantDump = false;
-    if (vm.count("cnf"))
-    {
-      wantDump = true;
-      const std::string val = vm["cnf"].as<std::string>();
-      dumpPath = val.empty() ? (filename + ".cnf") : val;
-    }
-    else if (vm.count("bvcnf") && !vm["bvcnf"].as<std::string>().empty())
-    {
-      wantDump = true;
-      dumpPath = vm["bvcnf"].as<std::string>();
-    }
+    // --cnf additionally writes the bit-blasted CNF to <input>.cnf; the count
+    // is always produced in-process from the in-memory CNF.
+    const bool wantDump = vm.count("cnf") > 0;
+    const std::string dumpPath = filename + ".cnf";
 
     // Sampling set: every declared bit-vector variable, including those that
     // do not occur in any assertion (counted as free bits), so the projected

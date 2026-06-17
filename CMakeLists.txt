@@ -3,6 +3,17 @@ project(ttc)
 
 include(CTest)
 
+# Directory holding the vendored solver dependencies (cvc5, cadical,
+# cryptominisat, skolemfc). configure.sh clones+builds them here and passes
+# -DTTC_DEPS_DIR. All solver paths below resolve under it, so ttc links ONLY
+# against deps/ and never against a host-specific ~/solvers layout. System
+# libraries (Boost, GMP, ISL, cddlib, lpsolve, SuiteSparse) stay as system pkgs.
+if(NOT DEFINED TTC_DEPS_DIR)
+  set(TTC_DEPS_DIR "${CMAKE_SOURCE_DIR}/deps")
+endif()
+set(TTC_DEPS_DIR "${TTC_DEPS_DIR}" CACHE PATH "Directory holding vendored dependencies")
+message(STATUS "TTC dependency directory: ${TTC_DEPS_DIR}")
+
 # Option to build a static binary (default is OFF)
 option(BUILD_STATIC "Build static binary" OFF)
 
@@ -44,13 +55,13 @@ if(ENABLE_DDNNF)
     add_compile_definitions(TTC_ENABLE_DDNNF)
 endif()
 
-# Locate cvc5 headers and libraries manually
+# Locate cvc5 headers and libraries manually (vendored at deps/cvc5)
 find_path(CVC5_INCLUDE_DIR NAMES cvc5/cvc5.h
-          HINTS $ENV{HOME}/solvers/cvc5_solver/include)
+          HINTS ${TTC_DEPS_DIR}/cvc5/include)
 find_library(CVC5_LIB NAMES cvc5
-            HINTS $ENV{HOME}/solvers/cvc5_solver/build/src)
+            HINTS ${TTC_DEPS_DIR}/cvc5/build/src)
 find_library(CVC5PARSER_LIB NAMES cvc5parser
-            HINTS $ENV{HOME}/solvers/cvc5_solver/build/src/parser)
+            HINTS ${TTC_DEPS_DIR}/cvc5/build/src/parser)
 if(NOT CVC5_INCLUDE_DIR OR NOT CVC5_LIB OR NOT CVC5PARSER_LIB)
   message(FATAL_ERROR "cvc5 library not found. Please install libcvc5-dev and libcvc5parser1")
 endif()
@@ -74,7 +85,7 @@ endif()
 # cvc5 static builds depend on the poly, CaDiCaL and CryptoMiniSat libraries.
 # Prefer the versions shipped with the local cvc5 build (e.g. the XOR-patched
 # CaDiCaL), falling back to system-wide installs.
-set(CVC5_DEPS_LIB_DIR "$ENV{HOME}/solvers/cvc5_solver/build/deps/lib")
+set(CVC5_DEPS_LIB_DIR "${TTC_DEPS_DIR}/cvc5/build/deps/lib")
 find_library(PICPOLY_LIB picpoly HINTS ${CVC5_DEPS_LIB_DIR})
 if(NOT PICPOLY_LIB)
   message(WARNING "picpoly library not found; continuing without explicit linkage")
@@ -85,9 +96,12 @@ if(NOT PICPOLYXX_LIB)
   message(WARNING "picpolyxx library not found; continuing without explicit linkage")
   set(PICPOLYXX_LIB "")
 endif()
-# CaDiCaL: link ONLY the hand-patched v3.0.0 build at ~/solvers/cadical, whose
-# gauss.cpp XOR engine has the residual-Gaussian-elimination GJ propagation.
-set(NEW_CADICAL_ROOT "$ENV{HOME}/solvers/cadical")
+# CaDiCaL: the vendored `xor` branch (deps/cadical) is the SINGLE cadical for
+# the whole link. It exports Solver::add_xor(int) (cvc5's static libcvc5.a needs
+# it) AND cadiback's extras Solver::traverse_red_clauses()/get_eqiv_lits(), so
+# the same archive satisfies cvc5 AND SkolemFC's cadiback -- no second cadical in
+# the link means no "multiple definition" collision.
+set(NEW_CADICAL_ROOT "${TTC_DEPS_DIR}/cadical")
 find_library(CADICAL_LIB cadical
              HINTS "${NEW_CADICAL_ROOT}/build"
              NO_DEFAULT_PATH)
@@ -130,9 +144,9 @@ endif()
 # locally built libskolemfc and its CryptoMiniSat / ApproxMC / UniGen / Arjun
 # dependencies. The dynamic build uses build_test/ (shared .so); a fully static
 # ttc (BUILD_STATIC) uses build_static/ which holds the whole stack as .a
-# archives (build it with: cd ~/solvers/skolemfc && ./configure.sh --static
-# --build-dir build_static && cd build_static && make -j).
-set(SKOLEMFC_ROOT "$ENV{HOME}/solvers/skolemfc")
+# archives (configure.sh builds it: cd deps/skolemfc && ./configure.sh --static
+# --build-dir build_static && cmake --build build_static -j).
+set(SKOLEMFC_ROOT "${TTC_DEPS_DIR}/skolemfc")
 if(BUILD_STATIC)
   set(SKOLEMFC_BUILD "${SKOLEMFC_ROOT}/build_static")
 else()
@@ -153,22 +167,46 @@ if(SKOLEMFC_LIB AND EXISTS "${SKOLEMFC_ROOT}/src/skolemfc.h")
     # -static link must name every archive explicitly.
     find_library(SKOLEMFC_LOUVAIN_LIB louvain_communities HINTS ${SKOLEMFC_DEPS_LIB_DIR} NO_DEFAULT_PATH)
     find_library(SKOLEMFC_SBVA_LIB sbva HINTS ${SKOLEMFC_DEPS_LIB_DIR} NO_DEFAULT_PATH)
-    set(SKOLEMFC_CADICAL_LIB "${SKOLEMFC_ROOT}/deps/cadical/build/libcadical.a")
-    set(SKOLEMFC_CADIBACK_LIB "${SKOLEMFC_ROOT}/deps/cadiback/libcadiback.a")
-    # CryptoMiniSat collision: both cvc5 and SkolemFC bundle their own
-    # libcryptominisat5.a, so a single -static link sees "multiple definition"
-    # on the shared CCNR/CMSat objects. Resolve by linking ONE shared copy --
-    # the user's canonical ~/solvers/cryptominisat (5.13) -- and dropping both
-    # bundled archives. cvc5 needs only the 10 stable CMSat::SATSolver facade
-    # methods, and SkolemFC's approxmc/arjun/unigen archives resolve all of
-    # their CMSat references against 5.13, so one copy satisfies both.
-    set(SHARED_CMS_LIB "$ENV{HOME}/solvers/cryptominisat/build/lib/libcryptominisat5.a")
+    # Use the SAME (xor-branch) CaDiCaL as cvc5 (CADICAL_LIB) for cadiback too.
+    # The bundled SkolemFC cadical is v2.1.3; linking it alongside ours pulls
+    # both archives' elim.o and triggers "multiple definition". The xor-branch
+    # cadical exports cadiback's traverse_red_clauses()/get_eqiv_lits() extras,
+    # so the single archive resolves cadiback's CaDiCaL refs with no second
+    # cadical in the link -- mirroring the single-CMS fix below.
+    set(SKOLEMFC_CADICAL_LIB "${CADICAL_LIB}")
+    # The shipped libcadiback.a was compiled against the v2.1.3 cadical headers;
+    # linking it against the xor-branch lib is an ABI mismatch (heap corruption
+    # in CadiBack::doit). Recompile cadiback.cpp against the xor-branch headers
+    # so its inlines/struct layouts match the single cadical we link.
+    set(CADIBACK_SRC "${SKOLEMFC_ROOT}/deps/cadiback/cadiback.cpp")
+    set(CADIBACK_XOR_LIB "${CMAKE_BINARY_DIR}/libcadiback_xor.a")
+    add_custom_command(
+        OUTPUT "${CADIBACK_XOR_LIB}"
+        COMMAND ${CMAKE_CXX_COMPILER} -fPIC -O3 -std=c++17 -DNDEBUG
+                -I${NEW_CADICAL_ROOT}/src -c "${CADIBACK_SRC}"
+                -o "${CMAKE_BINARY_DIR}/cadiback_xor.o"
+        COMMAND ${CMAKE_AR} rcs "${CADIBACK_XOR_LIB}" "${CMAKE_BINARY_DIR}/cadiback_xor.o"
+        DEPENDS "${CADIBACK_SRC}" "${NEW_CADICAL_ROOT}/src/cadical.hpp"
+        VERBATIM
+        COMMENT "Recompiling cadiback against xor-branch CaDiCaL headers")
+    add_custom_target(cadiback_xor DEPENDS "${CADIBACK_XOR_LIB}")
+    set(SKOLEMFC_CADIBACK_LIB "${CADIBACK_XOR_LIB}")
+    # CryptoMiniSat collision: cvc5 bundles its own libcryptominisat5.a and so
+    # does SkolemFC; a single -static link would see "multiple definition" on
+    # the shared CCNR/CMSat objects. Resolve by linking exactly ONE copy and
+    # dropping cvc5's bundled one. We use SkolemFC's own built CMS
+    # (deps_install/lib/libcryptominisat5.a, pinned commit b09bd6b): it is the
+    # version arjun/approxmc/unigen and cadiback were all built against (6-arg
+    # CadiBack::doit, translate_sampl_set/update_var_mapping present), so the
+    # whole SkolemFC stack is ABI-consistent with it. cvc5 needs only the stable
+    # CMSat::SATSolver facade methods, which this 5.13 archive also provides.
+    set(SHARED_CMS_LIB "${SKOLEMFC_DEPS_LIB_DIR}/libcryptominisat5.a")
     if(NOT EXISTS "${SHARED_CMS_LIB}")
-      message(FATAL_ERROR "Shared CryptoMiniSat static lib not found at ${SHARED_CMS_LIB}; "
-                          "build it with: cd ~/solvers/cryptominisat && cmake -B build -DSTATICCOMPILE=ON && cmake --build build")
+      message(FATAL_ERROR "SkolemFC CryptoMiniSat static lib not found at ${SHARED_CMS_LIB}; "
+                          "run ./configure.sh to build the SkolemFC stack.")
     endif()
     set(CMS_LIB "")                       # drop cvc5's bundled copy
-    set(SKOLEMFC_CMS_LIB "${SHARED_CMS_LIB}")  # drop SkolemFC's bundled copy
+    set(SKOLEMFC_CMS_LIB "${SHARED_CMS_LIB}")  # single CMS for the whole link
   endif()
   set(HAVE_SKOLEMFC ON)
   add_compile_definitions(TTC_ENABLE_SKOLEMFC)
@@ -381,6 +419,9 @@ endif()
 # make ttc wait for it.
 if(BUILD_STATIC AND TARGET lpsolve_patched)
     add_dependencies(ttc lpsolve_patched)
+endif()
+if(BUILD_STATIC AND TARGET cadiback_xor)
+    add_dependencies(ttc cadiback_xor)
 endif()
 
 # Link against the cvc5 libraries, Boost, optional STP and optional D4 support
