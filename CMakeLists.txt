@@ -276,7 +276,8 @@ else()
 endif()
 
 find_path(EIGEN3_INCLUDE_DIR Eigen/Dense
-          HINTS $ENV{EIGEN3_INCLUDE_DIR} /usr/include/eigen3)
+          HINTS $ENV{EIGEN3_INCLUDE_DIR} /usr/include/eigen3
+          PATH_SUFFIXES eigen3)   # Homebrew/others install under <prefix>/include/eigen3
 if(NOT EIGEN3_INCLUDE_DIR)
     message(FATAL_ERROR "Eigen3 headers not found. Please install libeigen3-dev")
 endif()
