@@ -66,17 +66,29 @@ if(ENABLE_DDNNF)
     add_compile_definitions(TTC_ENABLE_DDNNF)
 endif()
 
-# Locate cvc5 headers and libraries manually (vendored at deps/cvc5)
+# Locate cvc5 headers and libraries manually (vendored at deps/cvc5).
+# NO_DEFAULT_PATH pins resolution to the vendored tree -- otherwise a stray
+# system/${HOME} cvc5 install can satisfy the lookup and mask the build-tree
+# include below (which only the vendored build has).
 find_path(CVC5_INCLUDE_DIR NAMES cvc5/cvc5.h
-          HINTS ${TTC_DEPS_DIR}/cvc5/include)
+          HINTS ${TTC_DEPS_DIR}/cvc5/include NO_DEFAULT_PATH)
 find_library(CVC5_LIB NAMES cvc5
-            HINTS ${TTC_DEPS_DIR}/cvc5/build/src)
+            HINTS ${TTC_DEPS_DIR}/cvc5/build/src NO_DEFAULT_PATH)
 find_library(CVC5PARSER_LIB NAMES cvc5parser
-            HINTS ${TTC_DEPS_DIR}/cvc5/build/src/parser)
+            HINTS ${TTC_DEPS_DIR}/cvc5/build/src/parser NO_DEFAULT_PATH)
 if(NOT CVC5_INCLUDE_DIR OR NOT CVC5_LIB OR NOT CVC5PARSER_LIB)
-  message(FATAL_ERROR "cvc5 library not found. Please install libcvc5-dev and libcvc5parser1")
+  message(FATAL_ERROR "cvc5 not found under ${TTC_DEPS_DIR}/cvc5. Run ./configure.sh to build it.")
 endif()
 include_directories(${CVC5_INCLUDE_DIR})
+# cvc5 generates some public headers (cvc5_export.h, cvc5_proof_rule.h) into its
+# build tree's include/, NOT the source include/. cvc5.h #includes
+# <cvc5/cvc5_export.h>, so add the build-tree include dir too.
+set(CVC5_BUILD_INCLUDE_DIR "${TTC_DEPS_DIR}/cvc5/build/include")
+if(EXISTS "${CVC5_BUILD_INCLUDE_DIR}/cvc5/cvc5_export.h")
+  include_directories(${CVC5_BUILD_INCLUDE_DIR})
+else()
+  message(WARNING "cvc5_export.h not found in ${CVC5_BUILD_INCLUDE_DIR}; cvc5 may not be built yet")
+endif()
 # Print the full paths of cvc5 headers and libraries
 message(STATUS "CVC5 include directory: ${CVC5_INCLUDE_DIR}")
 message(STATUS "CVC5 library: ${CVC5_LIB}")
