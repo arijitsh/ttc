@@ -1,0 +1,72 @@
+diff --git a/src/skolemfc.cpp b/src/skolemfc.cpp
+index 544d62e..95eca3d 100644
+--- a/src/skolemfc.cpp
++++ b/src/skolemfc.cpp
+@@ -994,6 +994,11 @@ void SkolemFC::SklFC::count()
+   }
+   count += get_est1(s2size);
+ 
++  // Publish the result for library embedders before any potential early exit
++  // in the error-bound check below.
++  final_count_log2 = count.get_d();
++  count_computed = true;
++
+   if (check_if_approxmc_error_exceeds(count, s2size, max_error_logcounter))
+     exit(0);
+ 
+@@ -1003,6 +1008,25 @@ void SkolemFC::SklFC::count()
+   cout << "s fc 2 ** " << count << endl;
+ }
+ 
++void SkolemFC::SklFC::apply_default_config()
++{
++  // Mirror the default configuration used by the skolemfc command line tool so
++  // that an embedding application can drive a count after only adding the CNF,
++  // forall and exists variables. The ordering of these setters is
++  // interdependent and must match main.cpp.
++  set_noguarntee_mode(false);
++  set_oracles(/*use_unisamp=*/true, /*exact_f=*/true, /*exact_g=*/false);
++  set_g_counter_parameters(/*epsilon_g=*/0.08, /*delta_g=*/0.08);
++  check_ready();
++  set_num_threads(1);
++  set_parameters();
++  set_ignore_unsat(/*ignore_unsat=*/true);
++  set_static_samp(/*static_samp=*/true);
++  set_dklr_parameters(
++      /*epsilon_weightage_fc=*/0.6, /*delta_weightage_fc=*/0.5,
++      /*max_error_logcounter=*/0.1);
++}
++
+ const char* SkolemFC::SklFC::get_version_info()
+ {
+   return SkolemFCInt::get_version_sha1();
+diff --git a/src/skolemfc.h b/src/skolemfc.h
+index 51d5a84..90d18db 100644
+--- a/src/skolemfc.h
++++ b/src/skolemfc.h
+@@ -106,6 +106,16 @@ struct SklFC
+ 
+   void count();
+ 
++  // ---- Library convenience interface ------------------------------------
++  // Apply the same default oracle/parameter configuration that the command
++  // line front-end uses, so an embedding application can drive a count with a
++  // single setup call instead of replicating every setter.
++  void apply_default_config();
++  // Result of the last count() call, as log2 of the number of Skolem
++  // functions (the value printed on the "s fc 2 ** <x>" line).
++  double get_count_log2() const { return final_count_log2; }
++  bool count_succeeded() const { return count_computed; }
++
+   bool show_count();
+   uint64_t get_iteration() { return iteration; }
+ 
+@@ -154,6 +164,8 @@ struct SklFC
+   vector<vector<int>> samples_from_unisamp;
+   uint32_t sample_clearance_iteration = 0;
+   bool ganak_timeout;
++  double final_count_log2 = 0.0;
++  bool count_computed = false;
+ };
+ 
+ }  // namespace SkolemFC

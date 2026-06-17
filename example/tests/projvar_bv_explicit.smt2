@@ -1,0 +1,6 @@
+(set-logic QF_BV)
+(declare-const a (_ BitVec 2))
+(declare-const b (_ BitVec 2))
+(declare-projvar a)
+(assert (= b #b00))
+(check-sat)

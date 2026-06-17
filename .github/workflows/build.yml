@@ -1,0 +1,191 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-linux:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: static (linux)
+            static_compile: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ttc links a number of static system archives. SuiteSparse / ISL / Boost
+      # ship .a via apt; cddlib only ships .so, so its static lib is built from
+      # source below. cvc5's build needs python3 + pyparsing/tomli for codegen.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config git \
+            autoconf automake libtool autoconf-archive \
+            libboost-all-dev libgmp-dev libmpfr-dev zlib1g-dev \
+            libisl-dev libsuitesparse-dev liblpsolve55-dev libcdd-dev \
+            python3 python3-pip
+          python3 -m pip install --break-system-packages pyparsing tomli
+
+      # apt's libcdd-dev provides only libcdd.so; the fully static link needs the
+      # double-precision libcdd.a (NOT GMPRATIONAL), so build + install it.
+      - name: Build cddlib (static, double)
+        run: |
+          git clone --depth 1 https://github.com/cddlib/cddlib /tmp/cddlib
+          cd /tmp/cddlib
+          ./bootstrap
+          ./configure --prefix=/usr/local
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+
+      # Cache the vendored solver stack (deps/cvc5, deps/cadical, deps/skolemfc).
+      # configure.sh is idempotent: on a cache hit it skips the heavy builds
+      # (cvc5 alone is ~40 min) and only re-runs cmake. Key on the dep pins +
+      # patches that define what gets built.
+      - name: Cache vendored deps
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: deps-${{ runner.os }}-${{ hashFiles('configure.sh', 'patches/**') }}
+          restore-keys: deps-${{ runner.os }}-
+
+      # Clones + builds cvc5/cadical/skolemfc into deps/ and configures ttc to
+      # link only against them (static). Subsequent steps just compile ttc.
+      - name: Configure (fetch + build deps)
+        run: ./configure.sh --static
+
+      - name: Build ttc
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: Verify static binary
+        run: |
+          ldd build/ttc 2>&1 | tee /tmp/ldd.txt
+          grep -q "not a dynamic executable" /tmp/ldd.txt
+
+      - name: Test — exact BV projected count
+        run: |
+          build/ttc example/projection/bv.smt2 2>&1 | tee /tmp/bv.txt
+          grep -q "^s mc 4" /tmp/bv.txt
+
+      - name: Test — LIA count
+        run: |
+          build/ttc example/projection/lia.smt2 2>&1 | tee /tmp/lia.txt
+          grep -q "^s mc 3" /tmp/lia.txt
+
+      - name: Test — approximate count (ApproxMC)
+        run: |
+          build/ttc -a example/BV/test.smt2 2>&1 | tee /tmp/amc.txt
+          grep -q "^s mc " /tmp/amc.txt
+
+      - name: Test — LRA volume (volesti)
+        run: |
+          build/ttc example/volume/box.smt2 2>&1 | tee /tmp/vol.txt
+          grep -q "^s volume " /tmp/vol.txt
+
+      - name: Upload artifact
+        if: matrix.static_compile
+        uses: actions/upload-artifact@v4
+        with:
+          name: ttc-linux-amd64
+          path: build/ttc
+
+  # Best-effort macOS build. ttc has no fully-static macOS path (Apple has no
+  # static libc), so BUILD_STATIC here links the .a deps into a dynamic binary.
+  # continue-on-error keeps it non-blocking while the macOS path is stabilised.
+  build-macos:
+    name: ${{ matrix.name }}
+    runs-on: macos-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: best-effort (macos)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install cmake pkg-config autoconf automake libtool autoconf-archive \
+            boost gmp mpfr isl suite-sparse cddlib lp_solve libomp
+          python3 -m pip install --break-system-packages pyparsing tomli || \
+            pip3 install pyparsing tomli
+
+      - name: Cache vendored deps
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: deps-${{ runner.os }}-${{ hashFiles('configure.sh', 'patches/**') }}
+          restore-keys: deps-${{ runner.os }}-
+
+      - name: Configure (fetch + build deps)
+        run: ./configure.sh --static
+
+      - name: Build ttc
+        run: cmake --build build --parallel "$(sysctl -n hw.logicalcpu)"
+
+      - name: Link info
+        run: otool -L build/ttc || true
+
+      - name: Test — exact BV projected count
+        run: |
+          build/ttc example/projection/bv.smt2 2>&1 | tee /tmp/bv.txt
+          grep -q "^s mc 4" /tmp/bv.txt
+
+      - name: Test — LRA volume (volesti)
+        run: |
+          build/ttc example/volume/box.smt2 2>&1 | tee /tmp/vol.txt
+          grep -q "^s volume " /tmp/vol.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ttc-macos-arm64
+          path: build/ttc
+
+  release:
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && contains(github.event.head_commit.message, '[release]')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(date +%Y.%m.%d)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ttc-linux-amd64
+          path: artifacts/linux
+
+      - name: Prepare release artifacts
+        run: |
+          set -euo pipefail
+          chmod +x artifacts/linux/ttc
+          strip artifacts/linux/ttc
+          zip -j artifacts/ttc-linux-amd64.zip artifacts/linux/ttc
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: ttc v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            artifacts/ttc-linux-amd64.zip

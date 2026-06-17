@@ -41,10 +41,19 @@ endif()
 
 if(BUILD_STATIC)
     message(STATUS "Building a static binary")
-    # Linux-specific flag for static linking; adjust for your environment.
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
-    # Make every find_library() below resolve to the static archive (.a) rather
-    # than the shared object, so nothing sneaks a .so into the -static link.
+    if(APPLE)
+        # Apple's toolchain has no static libc, so a fully `-static` binary is
+        # not possible. On macOS BUILD_STATIC keeps the static-archive wiring
+        # (build_static deps, single CMS, cadiback recompile) but links the .a
+        # archives into an otherwise dynamic binary -- no `-static`, no GNU-only
+        # objcopy/--exclude-libs (all guarded by `if(NOT APPLE)` below).
+        message(STATUS "  (macOS: archives linked into a dynamic binary; not fully static)")
+    else()
+        # Linux: a genuinely static binary.
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+    endif()
+    # Prefer the static archive (.a) over the shared object so nothing sneaks a
+    # .so/.dylib into the link.
     set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
     # Boost components (program_options) must also come from static archives.
     set(Boost_USE_STATIC_LIBS ON)
@@ -235,12 +244,14 @@ find_path(LPSOLVE_INCLUDE_DIR lp_lib.h PATH_SUFFIXES lpsolve)
 if(LPSOLVE_LIB AND LPSOLVE_INCLUDE_DIR)
     message(STATUS "Found lpsolve library: ${LPSOLVE_LIB}")
     include_directories(${LPSOLVE_INCLUDE_DIR})
-    if(BUILD_STATIC)
+    if(BUILD_STATIC AND NOT APPLE)
         # liblpsolve55.a and libcdd.a both export the C symbol `set_int` (two
         # unrelated functions). The shared build tolerated it (separate .so);
         # a -static link reports "multiple definition". Nothing outside lpsolve
         # references lpsolve's set_int, so rewrite that symbol in a patched copy
         # of the archive, leaving cddlib's set_int as the sole definition.
+        # (GNU objcopy only; macOS lacks it -- the dynamic macOS link tolerates
+        # the duplicate the same way a shared Linux build did.)
         set(LPSOLVE_PATCHED "${CMAKE_BINARY_DIR}/liblpsolve55_patched.a")
         add_custom_command(
             OUTPUT "${LPSOLVE_PATCHED}"
@@ -467,7 +478,7 @@ if(HAVE_SKOLEMFC)
             ${SUITESPARSECONFIG_LIB}
             ${GMPXX_LIB}
             ${GMP_LIB}
-            dl)
+            ${CMAKE_DL_LIBS})   # `dl` on Linux, empty on macOS (in libSystem)
     else()
         # Resolve libskolemfc and its CryptoMiniSat/ApproxMC/UniGen deps at runtime
         # without polluting LD_LIBRARY_PATH.
@@ -482,8 +493,11 @@ if(HAVE_SKOLEMFC)
     # libcryptominisat5.so.5.13 (a different, incompatible ABI), crashing inside
     # ApproxMC. Hiding all static-archive symbols from the executable's dynamic
     # symbol table lets the SkolemFC shared libraries resolve CryptoMiniSat
-    # among themselves.
-    target_link_options(ttc PRIVATE "LINKER:--exclude-libs,ALL")
+    # among themselves. GNU-ld only; macOS ld64 has no equivalent (and the
+    # single-static-CMS design has no shared SkolemFC libs to interpose into).
+    if(NOT APPLE)
+        target_link_options(ttc PRIVATE "LINKER:--exclude-libs,ALL")
+    endif()
 endif()
 
 if(ENABLE_DDNNF)

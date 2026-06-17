@@ -16,7 +16,12 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPS_DIR="$SCRIPT_DIR/deps"
 BUILD_DIR="$SCRIPT_DIR/build"
-JOBS="$(nproc)"
+OS="$(uname -s)"
+if [ "$OS" = "Darwin" ]; then
+  JOBS="$(sysctl -n hw.logicalcpu)"
+else
+  JOBS="$(nproc)"
+fi
 
 # ----------------------------------------------------------------------------
 # Dependency pins (repo + branch + exact commit). Keep in sync with CMakeLists
@@ -72,6 +77,20 @@ done
 log()  { echo -e "\033[1;34m[deps]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[deps]\033[0m $*" >&2; }
 
+# dep_fresh <dir> <lib> -- true if <lib> exists AND was built from the commit
+# currently checked out in <dir> (recorded in <dir>/.ttc-built). This makes the
+# "already built" guards commit-aware: bumping a pin (or restoring a stale CI
+# cache via restore-keys) forces a rebuild instead of linking an old archive.
+dep_fresh() {
+  local dir="$1" lib="$2"
+  $REBUILD_DEPS && return 1
+  [ -f "$lib" ] || return 1
+  [ "$(cat "$dir/.ttc-built" 2>/dev/null)" = "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" ]
+}
+
+# dep_stamp <dir> -- record the built commit so dep_fresh can validate it later.
+dep_stamp() { git -C "$1" rev-parse HEAD > "$1/.ttc-built" 2>/dev/null || true; }
+
 # clone_dep <name> <repo> <branch> <commit>
 clone_dep() {
   local name="$1" repo="$2" branch="$3" commit="$4"
@@ -95,17 +114,18 @@ clone_dep() {
 # ----------------------------------------------------------------------------
 build_cadical() {
   local dir="$DEPS_DIR/cadical"
-  if [ -f "$dir/build/libcadical.a" ] && ! $REBUILD_DEPS; then
+  if dep_fresh "$dir" "$dir/build/libcadical.a"; then
     log "cadical already built (deps/cadical/build/libcadical.a)"; return
   fi
   log "building cadical (xor branch, static)"
   cmake -S "$dir" -B "$dir/build" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
   cmake --build "$dir/build" -j"$JOBS"
+  dep_stamp "$dir"
 }
 
 build_skolemfc() {
   local dir="$DEPS_DIR/skolemfc"
-  if [ -f "$dir/build_static/src/libskolemfc.a" ] && ! $REBUILD_DEPS; then
+  if dep_fresh "$dir" "$dir/build_static/src/libskolemfc.a"; then
     log "skolemfc already built (deps/skolemfc/build_static/src/libskolemfc.a)"; return
   fi
   log "building skolemfc + its deps (approxmc/arjun/unigen/sbva/louvain/cadiback, static)"
@@ -133,11 +153,12 @@ build_skolemfc() {
   fi
   ( cd "$dir" && ./configure.sh --static --build-dir build_static )
   cmake --build "$dir/build_static" -j"$JOBS"
+  dep_stamp "$dir"
 }
 
 build_cvc5() {
   local dir="$DEPS_DIR/cvc5"
-  if [ -f "$dir/build/src/libcvc5.a" ] && ! $REBUILD_DEPS; then
+  if dep_fresh "$dir" "$dir/build/src/libcvc5.a"; then
     log "cvc5 already built (deps/cvc5/build/src/libcvc5.a)"; return
   fi
   log "building cvc5 (static, auto-download deps) -- this is the long pole"
@@ -147,6 +168,7 @@ build_cvc5() {
   # resolved against the single SkolemFC CMS (see CMakeLists).
   ( cd "$dir" && ./configure.sh --static --auto-download --cryptominisat --name=build )
   cmake --build "$dir/build" -j"$JOBS"
+  dep_stamp "$dir"
 }
 
 if ! $SKIP_DEPS; then
@@ -169,21 +191,41 @@ fi
 # Configure ttc to link only against deps/
 # ----------------------------------------------------------------------------
 CMAKE_ARGS+=("-DTTC_DEPS_DIR=$DEPS_DIR")
-CMAKE_ARGS+=("-DCMAKE_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu")
-CMAKE_ARGS+=("-DCMAKE_IGNORE_PATH=$HOME/anaconda3")
-# Force system Boost 1.83 static (not anaconda's), GMP archives for -static.
-CMAKE_ARGS+=("-DBoost_NO_BOOST_CMAKE=ON" "-DBoost_NO_SYSTEM_PATHS=ON")
-CMAKE_ARGS+=("-DBOOST_ROOT=/usr" "-DBOOST_LIBRARYDIR=/usr/lib/x86_64-linux-gnu")
-CMAKE_ARGS+=("-DBoost_DIR=Boost_DIR-NOTFOUND")
 
-$DEBUG        && CMAKE_ARGS+=("-DENABLE_DEBUG=ON")  || CMAKE_ARGS+=("-DENABLE_DEBUG=OFF")
-$ENABLE_DDNNF && CMAKE_ARGS+=("-DENABLE_DDNNF=ON")  || CMAKE_ARGS+=("-DENABLE_DDNNF=OFF")
-if $STATIC; then
-  CMAKE_ARGS+=("-DBUILD_STATIC=ON")
-  CMAKE_ARGS+=("-DGMP_LIB=/usr/lib/x86_64-linux-gnu/libgmp.a")
-  CMAKE_ARGS+=("-DGMPXX_LIB=/usr/lib/x86_64-linux-gnu/libgmpxx.a")
+if [ "$OS" = "Darwin" ]; then
+  # macOS: resolve system libs from Homebrew. BUILD_STATIC links the .a archives
+  # into an otherwise dynamic binary (Apple has no static libc) -- see CMakeLists.
+  BREW="$(brew --prefix)"
+  CMAKE_ARGS+=("-DCMAKE_PREFIX_PATH=$BREW")
+  CMAKE_ARGS+=("-DBOOST_ROOT=$(brew --prefix boost 2>/dev/null || echo "$BREW")")
+  # libomp is keg-only; hand find_package(OpenMP) its location.
+  CMAKE_ARGS+=("-DOpenMP_ROOT=$(brew --prefix libomp 2>/dev/null || echo "$BREW")")
+  $DEBUG        && CMAKE_ARGS+=("-DENABLE_DEBUG=ON")  || CMAKE_ARGS+=("-DENABLE_DEBUG=OFF")
+  $ENABLE_DDNNF && CMAKE_ARGS+=("-DENABLE_DDNNF=ON")  || CMAKE_ARGS+=("-DENABLE_DDNNF=OFF")
+  if $STATIC; then
+    GMP_PREFIX="$(brew --prefix gmp 2>/dev/null || echo "$BREW")"
+    CMAKE_ARGS+=("-DBUILD_STATIC=ON")
+    CMAKE_ARGS+=("-DGMP_LIB=$GMP_PREFIX/lib/libgmp.a")
+    CMAKE_ARGS+=("-DGMPXX_LIB=$GMP_PREFIX/lib/libgmpxx.a")
+  else
+    CMAKE_ARGS+=("-DBUILD_STATIC=OFF")
+  fi
 else
-  CMAKE_ARGS+=("-DBUILD_STATIC=OFF")
+  # Linux: force system Boost 1.83 static (not anaconda's), GMP archives for -static.
+  CMAKE_ARGS+=("-DCMAKE_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu")
+  CMAKE_ARGS+=("-DCMAKE_IGNORE_PATH=$HOME/anaconda3")
+  CMAKE_ARGS+=("-DBoost_NO_BOOST_CMAKE=ON" "-DBoost_NO_SYSTEM_PATHS=ON")
+  CMAKE_ARGS+=("-DBOOST_ROOT=/usr" "-DBOOST_LIBRARYDIR=/usr/lib/x86_64-linux-gnu")
+  CMAKE_ARGS+=("-DBoost_DIR=Boost_DIR-NOTFOUND")
+  $DEBUG        && CMAKE_ARGS+=("-DENABLE_DEBUG=ON")  || CMAKE_ARGS+=("-DENABLE_DEBUG=OFF")
+  $ENABLE_DDNNF && CMAKE_ARGS+=("-DENABLE_DDNNF=ON")  || CMAKE_ARGS+=("-DENABLE_DDNNF=OFF")
+  if $STATIC; then
+    CMAKE_ARGS+=("-DBUILD_STATIC=ON")
+    CMAKE_ARGS+=("-DGMP_LIB=/usr/lib/x86_64-linux-gnu/libgmp.a")
+    CMAKE_ARGS+=("-DGMPXX_LIB=/usr/lib/x86_64-linux-gnu/libgmpxx.a")
+  else
+    CMAKE_ARGS+=("-DBUILD_STATIC=OFF")
+  fi
 fi
 
 mkdir -p "$BUILD_DIR"

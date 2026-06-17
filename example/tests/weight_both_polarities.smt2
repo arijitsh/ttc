@@ -1,0 +1,7 @@
+(set-logic QF_UF)
+(declare-const p Bool)
+(declare-projvar p)
+(declare-weight p 0.8)
+(declare-weight -p 1.0)
+(assert true)
+(check-sat)
