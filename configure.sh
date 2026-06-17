@@ -203,10 +203,9 @@ if [ "$OS" = "Darwin" ]; then
   $DEBUG        && CMAKE_ARGS+=("-DENABLE_DEBUG=ON")  || CMAKE_ARGS+=("-DENABLE_DEBUG=OFF")
   $ENABLE_DDNNF && CMAKE_ARGS+=("-DENABLE_DDNNF=ON")  || CMAKE_ARGS+=("-DENABLE_DDNNF=OFF")
   if $STATIC; then
-    GMP_PREFIX="$(brew --prefix gmp 2>/dev/null || echo "$BREW")"
+    # Dynamic macOS binary: let find_library resolve GMP (and other system libs)
+    # to Homebrew dylibs via CMAKE_PREFIX_PATH; only the vendored solver .a stay.
     CMAKE_ARGS+=("-DBUILD_STATIC=ON")
-    CMAKE_ARGS+=("-DGMP_LIB=$GMP_PREFIX/lib/libgmp.a")
-    CMAKE_ARGS+=("-DGMPXX_LIB=$GMP_PREFIX/lib/libgmpxx.a")
   else
     CMAKE_ARGS+=("-DBUILD_STATIC=OFF")
   fi

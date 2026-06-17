@@ -51,12 +51,14 @@ if(BUILD_STATIC)
     else()
         # Linux: a genuinely static binary.
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+        # Prefer the static archive (.a) over the shared object so nothing sneaks
+        # a .so into the -static link, and pull Boost from static archives too.
+        # On macOS the binary is dynamic, so let system libs (cddlib, lpsolve,
+        # isl, gmp, boost...) resolve to .dylib -- many Homebrew kegs ship no .a;
+        # only the vendored solver deps (found by explicit path) stay .a.
+        set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+        set(Boost_USE_STATIC_LIBS ON)
     endif()
-    # Prefer the static archive (.a) over the shared object so nothing sneaks a
-    # .so/.dylib into the link.
-    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
-    # Boost components (program_options) must also come from static archives.
-    set(Boost_USE_STATIC_LIBS ON)
 endif()
 
 # Enable feature macro when DDNNF/D4 support is requested
