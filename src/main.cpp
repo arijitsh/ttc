@@ -1299,7 +1299,12 @@ int main(int argc, char *argv[]) {
        "TDD construction: carry the residual LRA region in each leaf (so leaves "
        "expose the range of each real variable) via bottom-up apply(AND, .). "
        "Richer for --printdd but does not scale; default is theory-pruned "
-       "Shannon expansion with TRUE/FALSE terminals");
+       "Shannon expansion with TRUE/FALSE terminals")
+      ("tdd-plan",
+       "TDD construction: a planning phase first picks the decision-variable "
+       "order and the assertion apply order (minimizing the induced width of the "
+       "variable-interaction graph, a proxy for the number of theory checks), "
+       "then builds bottom-up with apply(AND, .) one assertion at a time");
 
   // Advanced d-DNNF / exact CNF counting knobs are inactive by
   // default and hidden from --help. They are still accepted on the command line
@@ -2027,11 +2032,21 @@ int main(int argc, char *argv[]) {
     }
 
     const bool tddRegions = vm.count("tdd-regions") > 0;
+    const bool tddPlan = vm.count("tdd-plan") > 0;
+    if (tddRegions && tddPlan)
+    {
+      std::cerr << "Error: --tdd-regions and --tdd-plan are mutually exclusive"
+                << std::endl;
+      return 1;
+    }
     const ttc::tdd::TheoryDD::Mode tddMode =
-        tddRegions ? ttc::tdd::TheoryDD::Mode::Regions
-                   : ttc::tdd::TheoryDD::Mode::Shannon;
+        tddPlan      ? ttc::tdd::TheoryDD::Mode::Planned
+        : tddRegions ? ttc::tdd::TheoryDD::Mode::Regions
+                     : ttc::tdd::TheoryDD::Mode::Shannon;
     const char* tddModeName =
-        tddRegions ? "regions (LRA leaves)" : "shannon (feasibility BDD)";
+        tddPlan      ? "planned (ordered apply)"
+        : tddRegions ? "regions (LRA leaves)"
+                     : "shannon (feasibility BDD)";
 
     auto emitTddDot = [&](ttc::tdd::TheoryDD& dd) -> int {
       if (!vm.count("printdd"))
@@ -2111,23 +2126,52 @@ int main(int argc, char *argv[]) {
       std::cout << "c constraints: " << parser.numConstraints() << std::endl;
       std::cout << "c" << std::endl;
 
-      print_section("compiling decision diagram", false);
-      {
-        std::ostringstream hdr;
-        hdr << "c " << std::setw(8) << "sec";
-        hdr << ' ' << std::setw(4) << "lvl";
-        hdr << ' ' << std::setw(9) << "nodes";
-        hdr << ' ' << std::setw(11) << "checks";
-        hdr << ' ' << std::setw(12) << "feasible";
-        std::cout << hdr.str() << std::endl;
-      }
-
       ttc::tdd::TheoryDD dd(parser.solver(),
                             parser.projectionVars(),
                             parser.realVariables(),
                             parser.literalWeights(),
                             parser.hasWeights(),
                             tddMode);
+
+      // Planning phase first, so the chosen order is reported before the
+      // (possibly long) build -- important for large inputs that may not finish.
+      if (tddPlan)
+      {
+        dd.runPlanning(parser.assertions());
+        print_section("planning");
+        std::cout << "c objective: minimize theory checks (induced width proxy)"
+                  << std::endl;
+        std::cout << "c candidate orders (induced width of elimination order):"
+                  << std::endl;
+        const auto& cands = dd.planCandidates();
+        for (int i = 0; i < static_cast<int>(cands.size()); ++i)
+        {
+          std::cout << "c   " << std::setw(12) << std::left << cands[i].name
+                    << std::right << " width " << std::setw(4)
+                    << cands[i].width
+                    << (i == dd.planChosen() ? "   <- chosen" : "")
+                    << std::endl;
+        }
+        std::ostringstream order;
+        for (const std::string& nm : dd.decisionOrderNames())
+        {
+          order << ' ' << nm;
+        }
+        std::cout << "c decision-variable order:" << order.str() << std::endl;
+        std::cout << "c" << std::endl;
+      }
+
+      print_section("compiling decision diagram", false);
+      {
+        std::ostringstream hdr;
+        hdr << "c " << std::setw(8) << "sec";
+        hdr << ' ' << std::setw(4) << (tddPlan ? "appl" : "lvl");
+        hdr << ' ' << std::setw(9) << "nodes";
+        hdr << ' ' << std::setw(11) << "checks";
+        hdr << ' ' << std::setw(12) << (tddPlan ? "leaves" : "feasible");
+        std::cout << hdr.str() << std::endl;
+      }
+
       const double countStart = Log.elapsed();
       double lastProgress = countStart;
       auto printRow = [&](double sec, const ttc::tdd::TheoryDD::Progress& p) {
@@ -2156,7 +2200,9 @@ int main(int argc, char *argv[]) {
       ttc::tdd::TddResult r = dd.result();
       printRow(countEnd - countStart,
                {static_cast<int>(r.numVars), r.numNodes + r.numLeaves + 2,
-                r.smtCalls, r.feasiblePaths});
+                r.smtCalls,
+                tddPlan ? static_cast<std::uint64_t>(r.numLeaves)
+                        : r.feasiblePaths});
       std::cout << "c" << std::endl;
 
       if (int rc = emitTddDot(dd); rc != 0)

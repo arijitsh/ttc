@@ -3,10 +3,15 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <numeric>
 #include <ostream>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "features.hpp"
+#if defined(TTC_ENABLE_DDNNF)
+#include "var_order.hpp"
+#endif
 
 namespace ttc::tdd
 {
@@ -163,6 +168,7 @@ int TheoryDD::makeLeaf(const cvc5::Term& constraint)
   int id = static_cast<int>(d_nodes.size());
   d_nodes.push_back(Node{true, -1, kFalse, kFalse, constraint});
   d_leafTable.emplace(key, id);
+  ++d_leafCount;
   return id;
 }
 
@@ -385,6 +391,379 @@ int TheoryDD::buildShannon(int level)
   return makeNode(level, lo, hi);
 }
 
+// ---------------------------------------------------------------------------
+// Planning phase
+// ---------------------------------------------------------------------------
+void TheoryDD::collectVars(const cvc5::Term& term, std::vector<int>& out) const
+{
+  std::unordered_set<cvc5::Term> visited;
+  std::vector<cvc5::Term> stack{term};
+  std::unordered_set<int> seen;
+  while (!stack.empty())
+  {
+    cvc5::Term t = stack.back();
+    stack.pop_back();
+    if (!visited.insert(t).second)
+    {
+      continue;
+    }
+    auto it = d_vertexOf.find(t);
+    if (it != d_vertexOf.end() && seen.insert(it->second).second)
+    {
+      out.push_back(it->second);
+    }
+    for (std::size_t i = 0, n = t.getNumChildren(); i < n; ++i)
+    {
+      stack.push_back(t[i]);
+    }
+  }
+}
+
+int TheoryDD::inducedWidth(const std::vector<std::vector<int>>& adj,
+                           const std::vector<int>& order) const
+{
+  const int n = static_cast<int>(adj.size());
+  std::vector<std::unordered_set<int>> g(n);
+  for (int u = 0; u < n; ++u)
+  {
+    g[u].insert(adj[u].begin(), adj[u].end());
+  }
+  std::vector<int> rank(n);
+  for (int i = 0; i < static_cast<int>(order.size()); ++i)
+  {
+    rank[order[i]] = i;
+  }
+  int width = 0;
+  for (int v : order)
+  {
+    // Neighbours not yet eliminated form this vertex's bag.
+    std::vector<int> nb;
+    for (int u : g[v])
+    {
+      if (rank[u] > rank[v])
+      {
+        nb.push_back(u);
+      }
+    }
+    width = std::max(width, static_cast<int>(nb.size()));
+    for (std::size_t i = 0; i < nb.size(); ++i)
+    {
+      for (std::size_t j = i + 1; j < nb.size(); ++j)
+      {
+        g[nb[i]].insert(nb[j]);
+        g[nb[j]].insert(nb[i]);
+      }
+    }
+  }
+  return width;
+}
+
+std::vector<int> TheoryDD::greedyOrder(const std::vector<std::vector<int>>& adj,
+                                       bool byFill, int& widthOut) const
+{
+  const int n = static_cast<int>(adj.size());
+  std::vector<std::unordered_set<int>> g(n);
+  for (int u = 0; u < n; ++u)
+  {
+    g[u].insert(adj[u].begin(), adj[u].end());
+  }
+  std::vector<bool> done(n, false);
+  std::vector<int> order;
+  order.reserve(n);
+  widthOut = 0;
+  for (int step = 0; step < n; ++step)
+  {
+    int best = -1;
+    long bestCost = LONG_MAX;
+    for (int v = 0; v < n; ++v)
+    {
+      if (done[v])
+      {
+        continue;
+      }
+      long cost;
+      if (byFill)
+      {
+        // Number of non-adjacent neighbour pairs that eliminating v would link.
+        std::vector<int> nb(g[v].begin(), g[v].end());
+        long fill = 0;
+        for (std::size_t i = 0; i < nb.size(); ++i)
+        {
+          for (std::size_t j = i + 1; j < nb.size(); ++j)
+          {
+            if (g[nb[i]].find(nb[j]) == g[nb[i]].end())
+            {
+              ++fill;
+            }
+          }
+        }
+        cost = fill;
+      }
+      else
+      {
+        cost = static_cast<long>(g[v].size());  // min-degree
+      }
+      if (cost < bestCost)
+      {
+        bestCost = cost;
+        best = v;
+      }
+    }
+    order.push_back(best);
+    done[best] = true;
+    std::vector<int> nb(g[best].begin(), g[best].end());
+    widthOut = std::max(widthOut, static_cast<int>(nb.size()));
+    for (std::size_t i = 0; i < nb.size(); ++i)
+    {
+      g[nb[i]].erase(best);
+      for (std::size_t j = i + 1; j < nb.size(); ++j)
+      {
+        g[nb[i]].insert(nb[j]);
+        g[nb[j]].insert(nb[i]);
+      }
+    }
+    g[best].clear();
+  }
+  return order;
+}
+
+void TheoryDD::plan(const std::vector<cvc5::Term>& assertions)
+{
+  // Vertices: Boolean decision variables first, then real variables. The
+  // Boolean order chosen here becomes the BDD decision order.
+  const int numBool = static_cast<int>(d_boolVars.size());
+  d_vertexOf.clear();
+  std::vector<cvc5::Term> vertexTerm;
+  for (int i = 0; i < numBool; ++i)
+  {
+    d_vertexOf.emplace(d_boolVars[i], static_cast<int>(vertexTerm.size()));
+    vertexTerm.push_back(d_boolVars[i]);
+  }
+  for (const cvc5::Term& r : d_realVars)
+  {
+    if (d_vertexOf.emplace(r, static_cast<int>(vertexTerm.size())).second)
+    {
+      vertexTerm.push_back(r);
+    }
+  }
+  const int n = static_cast<int>(vertexTerm.size());
+
+  // Interaction graph: a clique over the variables of each assertion.
+  std::vector<std::vector<int>> assertVars(assertions.size());
+  std::vector<std::unordered_set<int>> adjSet(n);
+  for (std::size_t a = 0; a < assertions.size(); ++a)
+  {
+    collectVars(assertions[a], assertVars[a]);
+    const std::vector<int>& vs = assertVars[a];
+    for (std::size_t i = 0; i < vs.size(); ++i)
+    {
+      for (std::size_t j = i + 1; j < vs.size(); ++j)
+      {
+        adjSet[vs[i]].insert(vs[j]);
+        adjSet[vs[j]].insert(vs[i]);
+      }
+    }
+  }
+  std::vector<std::vector<int>> adj(n);
+  for (int u = 0; u < n; ++u)
+  {
+    adj[u].assign(adjSet[u].begin(), adjSet[u].end());
+  }
+
+  // Candidate elimination orders, scored by induced width (a proxy for the
+  // number of distinct residual regions, i.e. theory checks, the build issues).
+  struct Cand
+  {
+    std::string name;
+    std::vector<int> order;
+    int width = 0;
+    bool usable = true;
+  };
+  std::vector<Cand> cands;
+
+  int wFill = 0;
+  std::vector<int> oFill = greedyOrder(adj, /*byFill=*/true, wFill);
+  cands.push_back({"min-fill", oFill, wFill, true});
+
+  int wDeg = 0;
+  std::vector<int> oDeg = greedyOrder(adj, /*byFill=*/false, wDeg);
+  cands.push_back({"min-degree", oDeg, wDeg, true});
+
+  std::vector<int> oDecl(n);
+  std::iota(oDecl.begin(), oDecl.end(), 0);
+  cands.push_back({"declaration", oDecl, inducedWidth(adj, oDecl), true});
+
+#if defined(TTC_ENABLE_DDNNF)
+  // Flowcutter tree-decomposition order over the Boolean projection variables.
+  // Extend it to the full vertex set by placing each real variable right after
+  // the last Boolean (in that order) it co-occurs with.
+  try
+  {
+    auto& tm = ttc::getTermBuilder(d_solver);
+    cvc5::Term formula = assertions.empty()
+                             ? tm.mkBoolean(true)
+                             : (assertions.size() == 1
+                                    ? assertions[0]
+                                    : tm.mkTerm(cvc5::Kind::AND, assertions));
+    std::vector<cvc5::Term> ordered =
+        computeProjVarOrder(formula, d_boolVars, d_solver, /*printTD=*/false);
+    std::vector<int> boolRank(n, INT_MAX);
+    int rk = 0;
+    for (const cvc5::Term& t : ordered)
+    {
+      auto it = d_vertexOf.find(t);
+      if (it != d_vertexOf.end())
+      {
+        boolRank[it->second] = rk++;
+      }
+    }
+    // Key each vertex: Booleans by their flowcutter rank; reals by the max rank
+    // of the Booleans they share an assertion with (so a real is eliminated just
+    // after its last Boolean). Stable-sort vertices by key for the full order.
+    std::vector<int> key(n, 0);
+    for (int v = 0; v < numBool; ++v)
+    {
+      key[v] = boolRank[v] == INT_MAX ? rk : boolRank[v];
+    }
+    for (const auto& vs : assertVars)
+    {
+      int mx = 0;
+      for (int v : vs)
+      {
+        if (v < numBool && boolRank[v] != INT_MAX)
+        {
+          mx = std::max(mx, boolRank[v]);
+        }
+      }
+      for (int v : vs)
+      {
+        if (v >= numBool)
+        {
+          key[v] = std::max(key[v], mx);
+        }
+      }
+    }
+    std::vector<int> oFc(n);
+    std::iota(oFc.begin(), oFc.end(), 0);
+    std::stable_sort(oFc.begin(), oFc.end(),
+                     [&](int a, int b) { return key[a] < key[b]; });
+    cands.push_back({"flowcutter", oFc, inducedWidth(adj, oFc), true});
+  }
+  catch (const std::exception&)
+  {
+    // computeProjVarOrder may throw on degenerate inputs; just skip it.
+  }
+#endif
+
+  // Choose the minimum-width candidate.
+  int chosen = 0;
+  for (int i = 1; i < static_cast<int>(cands.size()); ++i)
+  {
+    if (cands[i].width < cands[chosen].width)
+    {
+      chosen = i;
+    }
+  }
+  d_planCandidates.clear();
+  for (const Cand& c : cands)
+  {
+    d_planCandidates.push_back({c.name, c.width, c.usable});
+  }
+  d_planChosen = chosen;
+  const std::vector<int>& elim = cands[chosen].order;
+
+  // Decision order: Boolean variables sorted by their elimination rank. Reorder
+  // d_boolVars / d_varIndex so the new index is the BDD level.
+  std::vector<int> rank(n);
+  for (int i = 0; i < n; ++i)
+  {
+    rank[elim[i]] = i;
+  }
+  std::vector<cvc5::Term> reordered = d_boolVars;
+  std::stable_sort(reordered.begin(), reordered.end(),
+                   [&](const cvc5::Term& a, const cvc5::Term& b) {
+                     return rank[d_vertexOf.at(a)] < rank[d_vertexOf.at(b)];
+                   });
+  d_boolVars = std::move(reordered);
+  d_varIndex.clear();
+  for (std::size_t i = 0; i < d_boolVars.size(); ++i)
+  {
+    d_varIndex.emplace(d_boolVars[i], static_cast<int>(i));
+  }
+
+  // Apply schedule: conjoin each assertion once the last of its variables enters
+  // play -- i.e. sorted by the maximum elimination rank among its variables
+  // (bucket elimination). Empty assertions go first.
+  d_applySchedule.resize(assertions.size());
+  std::iota(d_applySchedule.begin(), d_applySchedule.end(), std::size_t{0});
+  std::vector<int> assertKey(assertions.size(), -1);
+  for (std::size_t a = 0; a < assertions.size(); ++a)
+  {
+    int mx = -1;
+    for (int v : assertVars[a])
+    {
+      mx = std::max(mx, rank[v]);
+    }
+    assertKey[a] = mx;
+  }
+  std::stable_sort(d_applySchedule.begin(), d_applySchedule.end(),
+                   [&](std::size_t a, std::size_t b) {
+                     return assertKey[a] < assertKey[b];
+                   });
+  d_planned = true;
+}
+
+void TheoryDD::runPlanning(const std::vector<cvc5::Term>& assertions)
+{
+  if (!d_planned)
+  {
+    plan(assertions);
+  }
+}
+
+std::vector<std::string> TheoryDD::decisionOrderNames() const
+{
+  std::vector<std::string> names;
+  names.reserve(d_boolVars.size());
+  for (const cvc5::Term& v : d_boolVars)
+  {
+    names.push_back(v.toString());
+  }
+  return names;
+}
+
+// Bottom-up apply over the planned schedule. The decision order is fixed by
+// plan(); each assertion is compiled from the pre-built atom/variable nodes and
+// conjoined into the accumulator one at a time.
+int TheoryDD::compilePlanned(const std::vector<cvc5::Term>& assertions)
+{
+  // Bottom nodes first: materialize a leaf for every distinct theory atom (and
+  // an elementary node per decision variable) so each is a shared building block
+  // and its feasibility check is issued once, up front.
+  for (const cvc5::Term& a : assertions)
+  {
+    compileTerm(a);  // populates the atom-leaf / var-node tables
+  }
+
+  int acc = kTrue;
+  std::size_t applied = 0;
+  for (std::size_t idx : d_applySchedule)
+  {
+    if (d_progress)
+    {
+      d_progress(Progress{static_cast<int>(applied), d_nodes.size(),
+                          d_smtCalls, d_leafCount});
+    }
+    acc = apply(cvc5::Kind::AND, acc, compileTerm(assertions[idx]));
+    ++applied;
+    if (acc == kFalse)
+    {
+      break;  // whole formula is theory-unsatisfiable
+    }
+  }
+  return acc;
+}
+
 void TheoryDD::compile(const std::vector<cvc5::Term>& assertions)
 {
   if (d_mode == Mode::Shannon)
@@ -395,6 +774,16 @@ void TheoryDD::compile(const std::vector<cvc5::Term>& assertions)
     ++d_smtCalls;
     d_root = d_solver.checkSat().isSat() ? buildShannon(0) : kFalse;
     d_solver.pop();
+    return;
+  }
+
+  if (d_mode == Mode::Planned)
+  {
+    if (!d_planned)
+    {
+      plan(assertions);
+    }
+    d_root = compilePlanned(assertions);
     return;
   }
 

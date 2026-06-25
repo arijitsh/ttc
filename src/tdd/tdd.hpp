@@ -55,10 +55,27 @@ class TheoryDD
   //               residual LRA region in each leaf (so leaves expose the range
   //               of each real variable). Richer for --printdd but does not
   //               scale: the per-path regions never merge.
+  //  - Planned  : bottom-up apply(AND, .) like Regions, but a planning phase
+  //               first chooses the decision-variable order and the order in
+  //               which assertions are conjoined so as to minimize the number
+  //               of theory checks (i.e. distinct residual regions). Bottom
+  //               atom nodes are built first, then combined one assertion at a
+  //               time in the planned schedule.
   enum class Mode
   {
     Shannon,
-    Regions
+    Regions,
+    Planned
+  };
+
+  // One candidate variable order considered by the planning phase, scored by
+  // the induced width of its elimination order on the variable-interaction
+  // graph (a proxy for the number of theory checks the build will issue).
+  struct PlanCandidate
+  {
+    std::string name;
+    int width = 0;
+    bool usable = true;
   };
 
   // The solver must already carry the parsed assertions (it is used, via
@@ -80,6 +97,10 @@ class TheoryDD
     std::uint64_t paths = 0;   // complete feasible assignments found so far
   };
 
+  // Run only the planning phase (Planned mode), so callers can report the chosen
+  // order before the (possibly long) build. compile() reuses it if already run.
+  void runPlanning(const std::vector<cvc5::Term>& assertions);
+
   // Bottom-up compile the conjunction of the assertions into the diagram.
   void compile(const std::vector<cvc5::Term>& assertions);
 
@@ -89,6 +110,16 @@ class TheoryDD
   void writeDot(std::ostream& os) const;
 
   std::uint64_t smtCalls() const { return d_smtCalls; }
+
+  // Planning-phase report (Planned mode): the candidate orders considered, the
+  // index of the chosen one, and the resulting decision-variable order. Empty
+  // until compile() runs in Planned mode.
+  const std::vector<PlanCandidate>& planCandidates() const
+  {
+    return d_planCandidates;
+  }
+  int planChosen() const { return d_planChosen; }
+  std::vector<std::string> decisionOrderNames() const;
 
   // Register a callback fired repeatedly during compilation. The callback is
   // expected to rate-limit its own output (e.g. by elapsed time).
@@ -111,7 +142,24 @@ class TheoryDD
     cvc5::Term constraint;      // residual theory constraint (leaf nodes)
   };
 
+  // --- planning phase (Planned mode) ----------------------------------------
+  // Build the variable-interaction graph, score candidate elimination orders by
+  // induced width, pick the cheapest, and derive the decision-variable order
+  // (reorders d_boolVars / d_varIndex) and the assertion apply schedule.
+  void plan(const std::vector<cvc5::Term>& assertions);
+  // Collect the tracked variables (Boolean projvars + real vars) of a term as
+  // interaction-graph vertex ids.
+  void collectVars(const cvc5::Term& term, std::vector<int>& out) const;
+  // Greedy elimination order over the interaction graph (min-fill if byFill,
+  // else min-degree); returns the order and sets widthOut to its induced width.
+  std::vector<int> greedyOrder(const std::vector<std::vector<int>>& adj,
+                               bool byFill, int& widthOut) const;
+  // Induced width of an arbitrary elimination order on the interaction graph.
+  int inducedWidth(const std::vector<std::vector<int>>& adj,
+                   const std::vector<int>& order) const;
+
   // --- diagram construction -------------------------------------------------
+  int compilePlanned(const std::vector<cvc5::Term>& assertions);
   int buildShannon(int level);             // theory-pruned Shannon expansion
   int compileTerm(const cvc5::Term& term);  // Regions mode (apply leaves)
   int makeNode(int var, int lo, int hi);
@@ -156,7 +204,15 @@ class TheoryDD
 
   std::uint64_t d_smtCalls = 0;
   std::uint64_t d_paths = 0;  // complete feasible assignments found (Shannon)
+  std::uint64_t d_leafCount = 0;  // distinct feasible leaves materialized
   std::function<void(const Progress&)> d_progress;
+
+  // Planning-phase results (Planned mode).
+  std::unordered_map<cvc5::Term, int> d_vertexOf;  // var term -> graph vertex id
+  std::vector<PlanCandidate> d_planCandidates;
+  int d_planChosen = -1;
+  std::vector<std::size_t> d_applySchedule;  // assertion indices, apply order
+  bool d_planned = false;
 };
 
 }  // namespace ttc::tdd
