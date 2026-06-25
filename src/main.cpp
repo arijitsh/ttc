@@ -2026,63 +2026,165 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    try
-    {
-      ttc::tdd::TheoryDD::Mode tddMode =
-          vm.count("tdd-regions") ? ttc::tdd::TheoryDD::Mode::Regions
-                                  : ttc::tdd::TheoryDD::Mode::Shannon;
-      ttc::tdd::TheoryDD dd(parser.solver(),
-                            parser.projectionVars(),
-                            parser.realVariables(),
-                            parser.literalWeights(),
-                            parser.hasWeights(),
-                            tddMode);
-      double countStart = Log.elapsed();
-      dd.compile(parser.assertions());
-      double countEnd = Log.elapsed();
-      Profile.addSearch(countEnd - countStart);
-      ttc::tdd::TddResult r = dd.result();
+    const bool tddRegions = vm.count("tdd-regions") > 0;
+    const ttc::tdd::TheoryDD::Mode tddMode =
+        tddRegions ? ttc::tdd::TheoryDD::Mode::Regions
+                   : ttc::tdd::TheoryDD::Mode::Shannon;
+    const char* tddModeName =
+        tddRegions ? "regions (LRA leaves)" : "shannon (feasibility BDD)";
 
-      if (vm.count("printdd"))
+    auto emitTddDot = [&](ttc::tdd::TheoryDD& dd) -> int {
+      if (!vm.count("printdd"))
       {
-        std::string target = vm["printdd"].as<std::string>();
-        if (target == "-")
-        {
-          dd.writeDot(std::cout);
-        }
-        else
-        {
-          std::ofstream dot(target);
-          if (!dot)
-          {
-            std::cerr << "Error: --printdd could not open '" << target << "'"
-                      << std::endl;
-            return 1;
-          }
-          dd.writeDot(dot);
-          std::cout << "c [ttc->tdd] wrote decision diagram to '" << target
-                    << "'" << std::endl;
-        }
+        return 0;
       }
-
-      if (verbosity > 0)
+      std::string target = vm["printdd"].as<std::string>();
+      if (target == "-")
       {
-        std::cout << "c [ttc->tdd] mode: "
-                  << (tddMode == ttc::tdd::TheoryDD::Mode::Regions
-                          ? "regions (LRA leaves)"
-                          : "shannon (feasibility BDD)")
+        dd.writeDot(std::cout);
+        return 0;
+      }
+      std::ofstream dot(target);
+      if (!dot)
+      {
+        std::cerr << "Error: --printdd could not open '" << target << "'"
                   << std::endl;
-        std::cout << "c [ttc->tdd] decision vars: " << r.numVars
-                  << " nodes: " << r.numNodes << " leaves: " << r.numLeaves
-                  << " theory checks: " << r.smtCalls << std::endl;
+        return 1;
       }
-      std::cout << "s mc " << r.modelCount << std::endl;
+      dd.writeDot(dot);
+      std::cout << "c wrote decision diagram to '" << target << "'"
+                << std::endl;
+      return 0;
+    };
+
+    auto emitTddResult = [&](const ttc::tdd::TddResult& r) {
       if (r.hasWeights)
       {
         std::cout << "s wmc ";
         printWeightedCount(r.weightedCount);
         std::cout << std::endl;
       }
+      std::cout << "s mc " << r.modelCount << std::endl;
+    };
+
+    try
+    {
+      if (verbosity == 0)
+      {
+        ttc::tdd::TheoryDD dd(parser.solver(),
+                              parser.projectionVars(),
+                              parser.realVariables(),
+                              parser.literalWeights(),
+                              parser.hasWeights(),
+                              tddMode);
+        dd.compile(parser.assertions());
+        ttc::tdd::TddResult r = dd.result();
+        if (int rc = emitTddDot(dd); rc != 0)
+        {
+          return rc;
+        }
+        emitTddResult(r);
+        return 0;
+      }
+
+      print_banner();
+
+      print_section("parsing input");
+      std::cout << "c reading SMT2 file from '" << filename << "'" << std::endl;
+      std::cout << "c parsed formula in " << std::fixed << std::setprecision(2)
+                << (parseEnd - parseStart) << " seconds" << std::endl;
+      std::cout << "c" << std::endl;
+
+      print_section("options");
+      std::cout << "c counting: "
+                << (parser.hasWeights() ? "weighted theory decision diagram"
+                                        : "theory decision diagram")
+                << std::endl;
+      std::cout << "c construction: " << tddModeName << std::endl;
+      std::cout << "c" << std::endl;
+
+      print_section("statistics");
+      std::cout << "c decision variables: " << parser.numProjVars()
+                << std::endl;
+      std::cout << "c Boolean variables: " << parser.numBoolVars() << std::endl;
+      std::cout << "c Real variables: " << parser.numRealVars() << std::endl;
+      std::cout << "c constraints: " << parser.numConstraints() << std::endl;
+      std::cout << "c" << std::endl;
+
+      print_section("compiling decision diagram", false);
+      {
+        std::ostringstream hdr;
+        hdr << "c " << std::setw(8) << "sec";
+        hdr << ' ' << std::setw(4) << "lvl";
+        hdr << ' ' << std::setw(9) << "nodes";
+        hdr << ' ' << std::setw(11) << "checks";
+        hdr << ' ' << std::setw(12) << "feasible";
+        std::cout << hdr.str() << std::endl;
+      }
+
+      ttc::tdd::TheoryDD dd(parser.solver(),
+                            parser.projectionVars(),
+                            parser.realVariables(),
+                            parser.literalWeights(),
+                            parser.hasWeights(),
+                            tddMode);
+      const double countStart = Log.elapsed();
+      double lastProgress = countStart;
+      auto printRow = [&](double sec, const ttc::tdd::TheoryDD::Progress& p) {
+        std::ostringstream line;
+        line << "c " << std::setw(8) << std::fixed << std::setprecision(2)
+             << sec;
+        line << ' ' << std::setw(4) << p.level;
+        line << ' ' << std::setw(9) << p.nodes;
+        line << ' ' << std::setw(11) << p.checks;
+        line << ' ' << std::setw(12) << p.paths;
+        std::cout << line.str() << std::endl;
+      };
+      dd.setProgressCallback(
+          [&](const ttc::tdd::TheoryDD::Progress& p) {
+            double now = Log.elapsed();
+            if (now - lastProgress >= progress_interval)
+            {
+              lastProgress = now;
+              printRow(now - countStart, p);
+            }
+          });
+
+      dd.compile(parser.assertions());
+      const double countEnd = Log.elapsed();
+      Profile.addSearch(countEnd - countStart);
+      ttc::tdd::TddResult r = dd.result();
+      printRow(countEnd - countStart,
+               {static_cast<int>(r.numVars), r.numNodes + r.numLeaves + 2,
+                r.smtCalls, r.feasiblePaths});
+      std::cout << "c" << std::endl;
+
+      if (int rc = emitTddDot(dd); rc != 0)
+      {
+        return rc;
+      }
+
+      print_section("result");
+      emitTddResult(r);
+      std::cout << "c" << std::endl;
+
+      print_section("statistics");
+      std::cout << "c decision-diagram nodes: " << r.numNodes << std::endl;
+      if (tddRegions)
+      {
+        std::cout << "c theory-region leaves: " << r.numLeaves << std::endl;
+      }
+      std::cout << "c theory feasibility checks: " << r.smtCalls << std::endl;
+      std::cout << "c compile time: " << std::fixed << std::setprecision(2)
+                << (countEnd - countStart) << " seconds" << std::endl;
+      std::cout.unsetf(std::ios::floatfield);
+      std::cout.precision(6);
+      std::cout << "c" << std::endl;
+
+      double totalTime = Log.elapsed();
+      print_resources(totalTime);
+      print_section("shutting down");
+      std::cout << "c exit 0" << std::endl;
       return 0;
     }
     catch (const std::exception& ex)

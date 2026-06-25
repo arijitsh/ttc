@@ -359,10 +359,16 @@ int TheoryDD::buildShannon(int level)
 {
   if (level == static_cast<int>(d_boolVars.size()))
   {
-    return kTrue;  // a complete, theory-feasible assignment
+    ++d_paths;  // a complete, theory-feasible assignment
+    return kTrue;
   }
   auto& tm = ttc::getTermBuilder(d_solver);
   const cvc5::Term& v = d_boolVars[level];
+
+  if (d_progress)
+  {
+    d_progress(Progress{level, d_nodes.size(), d_smtCalls, d_paths});
+  }
 
   d_solver.push();
   d_solver.assertFormula(v);
@@ -457,6 +463,7 @@ TddResult TheoryDD::result() const
   }
   r.numNodes = nodes;
   r.numLeaves = leaves;
+  r.feasiblePaths = d_paths;
 
   const int n = static_cast<int>(d_boolVars.size());
 

@@ -3,6 +3,7 @@
 #include <cvc5/cvc5.h>
 
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <map>
 #include <string>
@@ -38,6 +39,7 @@ struct TddResult
   std::size_t numLeaves = 0;      // distinct feasible theory leaves
   std::size_t numVars = 0;        // Boolean decision variables
   std::uint64_t smtCalls = 0;     // theory feasibility checks issued to cvc5
+  std::uint64_t feasiblePaths = 0;  // complete feasible assignments (Shannon)
 };
 
 class TheoryDD
@@ -68,6 +70,16 @@ class TheoryDD
            bool hasWeights,
            Mode mode = Mode::Shannon);
 
+  // Live progress, reported periodically during compile() so callers can render
+  // a progress table in the style of the other engines.
+  struct Progress
+  {
+    int level = 0;             // current decision depth being explored
+    std::size_t nodes = 0;     // diagram nodes allocated so far
+    std::uint64_t checks = 0;  // theory feasibility checks issued so far
+    std::uint64_t paths = 0;   // complete feasible assignments found so far
+  };
+
   // Bottom-up compile the conjunction of the assertions into the diagram.
   void compile(const std::vector<cvc5::Term>& assertions);
 
@@ -77,6 +89,13 @@ class TheoryDD
   void writeDot(std::ostream& os) const;
 
   std::uint64_t smtCalls() const { return d_smtCalls; }
+
+  // Register a callback fired repeatedly during compilation. The callback is
+  // expected to rate-limit its own output (e.g. by elapsed time).
+  void setProgressCallback(std::function<void(const Progress&)> cb)
+  {
+    d_progress = std::move(cb);
+  }
 
  private:
   // Terminal ids are reserved: 0 = FALSE, 1 = TRUE.
@@ -136,6 +155,8 @@ class TheoryDD
   mutable std::unordered_map<std::string, int> d_projCache;   // term->minProj
 
   std::uint64_t d_smtCalls = 0;
+  std::uint64_t d_paths = 0;  // complete feasible assignments found (Shannon)
+  std::function<void(const Progress&)> d_progress;
 };
 
 }  // namespace ttc::tdd
