@@ -298,6 +298,7 @@ include_directories(${EIGEN3_INCLUDE_DIR})
 set(SOURCES
     src/main.cpp
     src/parser.cpp
+    src/ddnnf/arjun.cpp
     src/pact/pact.cpp
     src/pact/saturatingcount.cpp
     src/pact/hash_constraint.cpp
@@ -336,7 +337,6 @@ if(ENABLE_DDNNF)
         src/ddnnf/iflowcutter.cpp
         src/ddnnf/flowcutter/src/greedy_order.cpp
         src/ddnnf/TreeDecomposition.cpp
-        src/ddnnf/arjun.cpp
         src/d4_interface.cpp
     )
 

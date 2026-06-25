@@ -57,6 +57,19 @@ public:
     std::size_t numProjVars() const { return d_projVars.size(); }
     std::size_t projVarsBeforeMin() const { return d_projVarsBefore; }
     std::size_t projVarsAfterMin() const { return d_projVarsAfter; }
+    // Weight factor that arjun preprocessing folded out of the projection set
+    // (the product of the fixed weights of removed forced/defined variables,
+    // and the summed weight of each removed unconstrained variable). 1.0 unless
+    // --arjun removed weighted variables; the weighted count must be multiplied
+    // by this to stay correct.
+    long double arjunWeightMultiplier() const { return d_arjunWeightMultiplier; }
+    // Count factor for the unweighted projected count: each removed
+    // unconstrained variable doubles the model count, so this is 2^(#removed
+    // unconstrained vars). 1 unless --arjun dropped unconstrained variables.
+    unsigned long long arjunCountMultiplier() const
+    {
+        return d_arjunCountMultiplier;
+    }
     std::size_t numConstraints() const { return d_numConstraints; }
 
     // Promote all Boolean and bit-vector variables to projection variables when
@@ -116,6 +129,8 @@ private:
     std::unordered_map<cvc5::Term, LiteralWeight> d_literalWeights;
     std::size_t d_projVarsBefore = 0;
     std::size_t d_projVarsAfter = 0;
+    long double d_arjunWeightMultiplier = 1.0L;
+    unsigned long long d_arjunCountMultiplier = 1ULL;
 
     // Sets of variables by sort.
     std::unordered_set<std::string> d_boolVars;

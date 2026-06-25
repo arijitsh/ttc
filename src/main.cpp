@@ -162,71 +162,6 @@ struct WeightedPbResult
   long double multiplier = 1.0L;
 };
 
-int findOrAddCnfVar(ToCNF::CNFFormula& cnf, const cvc5::Term& term)
-{
-  auto termIt = cnf.termToIdx.find(term);
-  if (termIt != cnf.termToIdx.end())
-  {
-    return termIt->second;
-  }
-
-  auto strIt = cnf.varToIdx.find(term.toString());
-  if (strIt != cnf.varToIdx.end())
-  {
-    cnf.termToIdx.emplace(term, strIt->second);
-    return strIt->second;
-  }
-
-  if (term.hasSymbol())
-  {
-    auto symIt = cnf.varToIdx.find(term.getSymbol());
-    if (symIt != cnf.varToIdx.end())
-    {
-      cnf.termToIdx.emplace(term, symIt->second);
-      return symIt->second;
-    }
-  }
-
-  int id = ++cnf.varCount;
-  if (static_cast<int>(cnf.idxToTerm.size()) <= id)
-  {
-    cnf.idxToTerm.resize(id + 1);
-  }
-  cnf.idxToTerm[id] = term;
-  cnf.termToIdx.emplace(term, id);
-  cnf.varToIdx.emplace(term.toString(), id);
-  if (term.hasSymbol())
-  {
-    cnf.varToIdx.emplace(term.getSymbol(), id);
-  }
-  return id;
-}
-
-void configureWeightedPbSolver(cvc5::Solver& solver,
-                               bool useBvPact,
-                               bool useNativeXor)
-{
-  try { solver.setOption("print-success", "false"); }
-  catch (const cvc5::CVC5ApiException&) {}
-  try { solver.setOption("incremental", "true"); }
-  catch (const cvc5::CVC5ApiException&) {}
-  try { solver.setOption("produce-models", "true"); }
-  catch (const cvc5::CVC5ApiException&) {}
-  try { solver.setOption("produce-learned-literals", "true"); }
-  catch (const cvc5::CVC5ApiException&) {}
-  try { solver.setOption("bv-sat-solver", "cryptominisat"); }
-  catch (const cvc5::CVC5ApiException&) {}
-  if (useBvPact)
-  {
-    try { solver.setOption("bv-to-bool", "false"); }
-    catch (const cvc5::CVC5ApiException&) {}
-  }
-  try { solver.setLogic("QF_BV"); }
-  catch (const cvc5::CVC5ApiException&) {}
-  try { applyNativeXor(solver, useNativeXor); }
-  catch (const cvc5::CVC5ApiException&) {}
-}
-
 void configureCvc5ParallelJobs(cvc5::Solver& solver, int jobs)
 {
   if (jobs <= 1)
@@ -285,36 +220,50 @@ void assertCnf(cvc5::Solver& solver,
   }
 }
 
-WeightedPbResult runWeightedProjectionBoost(TTCParser& parser,
-                                            std::uint64_t seed,
-                                            bool useNativeXor,
-                                            bool useBvPact,
-                                            double epsilon = 0.8,
-                                            double delta = 0.2)
+// A theory-preserving weighted-to-unweighted plan for the --pact weighted path.
+// Unlike a CNF blast of the whole formula (which would drop LRA/other theory
+// semantics), we keep the original assertions on the real solver and only add
+// the Chakraborty et al. weight-encoding gadget. The gadget clauses are CNF over
+// integer ids: ids 1..N are the original (deduplicated) Boolean projection
+// variables, ids > N are freshly introduced encoding variables.
+struct WeightedPbPlan
+{
+  ttc::weighted::UnweightedCnf unweighted;  // gadget-only clauses + sampling set
+  std::vector<cvc5::Term> projById;         // id (1..N) -> original projection term
+};
+
+// Build the encoding gadget for the weighted projection variables. Kept separate
+// from the counting loop so the conversion blow-up (extra encoding variables,
+// divisor power) can be reported during preprocessing, before the potentially
+// very long approximate count begins.
+WeightedPbPlan buildWeightedUnweighted(TTCParser& parser)
 {
   for (const cvc5::Term& term : parser.projectionVars())
   {
     if (!term.getSort().isBoolean())
     {
       throw std::runtime_error(
-          "weighted --PB currently supports Boolean projection variables only");
+          "weighted --pact currently supports Boolean projection variables only");
     }
   }
 
-  ToCNF cnfBuilder(parser.solver(), parser.assertions());
-  ToCNF::CNFFormula cnf = cnfBuilder.build();
-
+  // Assign each distinct projection variable a dense id 1..N and gather weights.
+  // The gadget is built over an *empty* base formula, so the converter emits only
+  // the weight-encoding clauses; the original theory stays on the real solver.
   ttc::weighted::WeightedCnf weighted;
-  weighted.clauses = cnf.clauses;
-  std::unordered_set<int> seenSampling;
+  std::unordered_map<cvc5::Term, int> idByTerm;
+  std::vector<cvc5::Term> projById(1);  // index 0 unused
   const auto& weights = parser.literalWeights();
   for (const cvc5::Term& term : parser.projectionVars())
   {
-    int id = findOrAddCnfVar(cnf, term);
-    if (seenSampling.insert(id).second)
+    auto [it, inserted] = idByTerm.try_emplace(term, static_cast<int>(projById.size()));
+    if (!inserted)
     {
-      weighted.samplingVars.push_back(id);
+      continue;
     }
+    const int id = it->second;
+    projById.push_back(term);
+    weighted.samplingVars.push_back(id);
 
     TTCParser::LiteralWeight literalWeight;
     auto weightIt = weights.find(term);
@@ -327,22 +276,41 @@ WeightedPbResult runWeightedProjectionBoost(TTCParser& parser,
          static_cast<long double>(literalWeight.positive),
          static_cast<long double>(literalWeight.negative)});
   }
-  weighted.varCount = cnf.varCount;
+  weighted.varCount = static_cast<int>(projById.size()) - 1;
 
   ttc::weighted::ToUnweightedConverter converter;
-  ttc::weighted::UnweightedCnf unweighted = converter.convert(weighted);
+  WeightedPbPlan plan;
+  plan.unweighted = converter.convert(weighted);
+  plan.projById = std::move(projById);
+  return plan;
+}
 
-  ttc::TermBuilderHelper<cvc5::Solver>::storage_type storage;
-  cvc5::Solver solver = ttc::createSolverWithStorage<cvc5::Solver>(storage);
-  configureWeightedPbSolver(solver, useBvPact, useNativeXor);
+WeightedPbResult runWeightedProjectionBoost(TTCParser& parser,
+                                            const WeightedPbPlan& plan,
+                                            std::uint64_t seed,
+                                            bool useNativeXor,
+                                            bool useBvPact,
+                                            double epsilon = 0.8,
+                                            double delta = 0.2)
+{
+  const ttc::weighted::UnweightedCnf& unweighted = plan.unweighted;
+  cvc5::Solver& solver = parser.solver();
   auto& tm = ttc::getTermBuilder(solver);
   cvc5::Sort boolSort = tm.getBooleanSort();
-  std::vector<cvc5::Term> cnfVars(unweighted.varCount + 1);
+
+  // Map gadget ids to solver terms: ids 1..N are the original projection terms
+  // (already asserted with their theory constraints); ids > N are fresh encoding
+  // Booleans. Then assert the gadget clauses onto the real solver so it still
+  // reasons about LRA (or any other theory) while counting.
+  const int numProj = static_cast<int>(plan.projById.size()) - 1;
+  std::vector<cvc5::Term> vars(unweighted.varCount + 1);
   for (int i = 1; i <= unweighted.varCount; ++i)
   {
-    cnfVars[i] = tm.mkConst(boolSort, "__ttc_w2u_" + std::to_string(i));
+    vars[i] = (i <= numProj)
+                  ? plan.projById[i]
+                  : tm.mkConst(boolSort, "__ttc_w2u_" + std::to_string(i));
   }
-  assertCnf(solver, cnfVars, unweighted.clauses);
+  assertCnf(solver, vars, unweighted.clauses);
 
   std::vector<cvc5::Term> projectionVars;
   projectionVars.reserve(unweighted.samplingVars.size());
@@ -352,7 +320,7 @@ WeightedPbResult runWeightedProjectionBoost(TTCParser& parser,
     {
       throw std::runtime_error("converted sampling variable is out of range");
     }
-    projectionVars.push_back(cnfVars[var]);
+    projectionVars.push_back(vars[var]);
   }
 
   Pact counter(
@@ -362,8 +330,8 @@ WeightedPbResult runWeightedProjectionBoost(TTCParser& parser,
   WeightedPbResult result;
   result.unweightedCount = unweightedCount;
   result.smtCalls = counter.getSmtCallCount();
-  result.originalVars = unweighted.originalVarCount;
-  result.originalClauses = unweighted.originalClauseCount;
+  result.originalVars = numProj;
+  result.originalClauses = 0;
   result.convertedVars = unweighted.varCount;
   result.convertedClauses = static_cast<int>(unweighted.clauses.size());
   result.samplingVars = static_cast<int>(unweighted.samplingVars.size());
@@ -372,7 +340,8 @@ WeightedPbResult runWeightedProjectionBoost(TTCParser& parser,
   result.weightedCount =
       std::ldexp(static_cast<long double>(unweightedCount) *
                      unweighted.multiplier,
-                 -unweighted.divisorPower);
+                 -unweighted.divisorPower) *
+      parser.arjunWeightMultiplier();
   return result;
 }
 
@@ -2378,14 +2347,15 @@ int main(int argc, char *argv[]) {
     {
       if (parser.hasWeights())
       {
-        long double res = enumerator.countWeighted(parser.literalWeights());
+        long double res = enumerator.countWeighted(parser.literalWeights()) *
+                          parser.arjunWeightMultiplier();
         std::cout << "s wmc ";
         printWeightedCount(res);
         std::cout << std::endl;
       }
       else
       {
-        std::uint64_t res = enumerator.count();
+        std::uint64_t res = enumerator.count() * parser.arjunCountMultiplier();
         std::cout << "s mc " << res << std::endl;
       }
       return 0;
@@ -2430,11 +2400,12 @@ int main(int argc, char *argv[]) {
     long double weightedRes = 0.0L;
     if (parser.hasWeights())
     {
-      weightedRes = enumerator.countWeighted(parser.literalWeights());
+      weightedRes = enumerator.countWeighted(parser.literalWeights()) *
+                    parser.arjunWeightMultiplier();
     }
     else
     {
-      res = enumerator.count();
+      res = enumerator.count() * parser.arjunCountMultiplier();
     }
     double countEnd = Log.elapsed();
     Profile.addSearch(countEnd - countStart);
@@ -2484,6 +2455,7 @@ int main(int argc, char *argv[]) {
         {
           WeightedPbResult weighted =
               runWeightedProjectionBoost(parser,
+                                         buildWeightedUnweighted(parser),
                                          approxSeed,
                                          g_useNativeXor,
                                          useBvPact,
@@ -2529,6 +2501,9 @@ int main(int argc, char *argv[]) {
         Pact counter(parser.solver(), parser.projectionVars(), approxSeed, g_useNativeXor, useBvPact, approxEpsilon, approxDelta);
         res = counter.count();
       }
+      // Fold back the unconstrained variables arjun dropped (each doubled the
+      // model count); 1 when none were removed.
+      res *= parser.arjunCountMultiplier();
       cpp_int unsatTotal;
       bool haveUnsat = false;
       if (countUnsatAssignments) {
@@ -2549,8 +2524,11 @@ int main(int argc, char *argv[]) {
                       << " bit-vector projection variables" << std::endl;
             return 1;
           }
+          // Scale the assignment space by the dropped unconstrained vars too so
+          // it matches the folded-back sat count.
+          cpp_int total = *totalAssignments * cpp_int(parser.arjunCountMultiplier());
           cpp_int satCount = cpp_int(res);
-          unsatTotal = clampNonNegative(*totalAssignments - satCount);
+          unsatTotal = clampNonNegative(total - satCount);
           haveUnsat = true;
         }
       }
@@ -2598,8 +2576,43 @@ int main(int argc, char *argv[]) {
                 << std::endl;
       std::cout << "c projection vars after : " << parser.projVarsAfterMin()
                 << std::endl;
+      if (parser.hasWeights() && parser.arjunWeightMultiplier() != 1.0L) {
+        std::cout << "c arjun weight multiplier: ";
+        printWeightedCount(parser.arjunWeightMultiplier());
+        std::cout << std::endl;
+      }
     } else {
       std::cout << "c projection vars: " << parser.numProjVars() << std::endl;
+    }
+    std::optional<WeightedPbPlan> preparedPlan;
+    if (parser.hasWeights() && useProjectionBoost)
+    {
+      try
+      {
+        preparedPlan = buildWeightedUnweighted(parser);
+      }
+      catch (const std::exception& ex)
+      {
+        std::cerr << "Error: weighted-to-unweighted conversion failed: "
+                  << ex.what() << std::endl;
+        return 1;
+      }
+      const auto& u = preparedPlan->unweighted;
+      const int numProj = static_cast<int>(preparedPlan->projById.size()) - 1;
+      const int encodingVars = u.varCount - numProj;
+      std::cout << "c weighted-to-unweighted projection vars: " << numProj
+                << std::endl;
+      std::cout << "c weighted-to-unweighted encoding vars added: "
+                << encodingVars << std::endl;
+      std::cout << "c weighted-to-unweighted gadget clauses: "
+                << u.clauses.size() << std::endl;
+      std::cout << "c weighted-to-unweighted sampling vars: "
+                << u.samplingVars.size() << std::endl;
+      std::cout << "c weighted-to-unweighted divisor: 2^" << u.divisorPower
+                << std::endl;
+      std::cout << "c weighted-to-unweighted multiplier: ";
+      printWeightedCount(u.multiplier);
+      std::cout << std::endl;
     }
     std::cout << "c" << std::endl;
 
@@ -2627,6 +2640,7 @@ int main(int argc, char *argv[]) {
       if (parser.hasWeights() && useProjectionBoost)
       {
         weighted = runWeightedProjectionBoost(parser,
+                                             *preparedPlan,
                                              approxSeed,
                                              g_useNativeXor,
                                              useBvPact,
@@ -2676,6 +2690,11 @@ int main(int argc, char *argv[]) {
     }
     double countEnd = Log.elapsed();
     Profile.addSearch(countEnd - countStart);
+    // Fold back the unconstrained variables arjun dropped (each doubled the
+    // model count); 1 when none were removed. Only the unweighted count is
+    // carried in res -- the weighted path applies its factor in
+    // runWeightedProjectionBoost.
+    res *= parser.arjunCountMultiplier();
     std::uint64_t totalSmtCalls = weighted.smtCalls;
     cpp_int unsatTotal;
     bool haveUnsat = false;
@@ -2705,8 +2724,9 @@ int main(int argc, char *argv[]) {
                     << " bit-vector projection variables" << std::endl;
           return 1;
         }
+        cpp_int total = *totalAssignments * cpp_int(parser.arjunCountMultiplier());
         cpp_int satCount = cpp_int(res);
-        unsatTotal = clampNonNegative(*totalAssignments - satCount);
+        unsatTotal = clampNonNegative(total - satCount);
         haveUnsat = true;
       }
     }
@@ -2729,14 +2749,6 @@ int main(int argc, char *argv[]) {
     print_section("statistics");
     if (parser.hasWeights() && useProjectionBoost)
     {
-      std::cout << "c weighted-to-unweighted original vars: "
-                << weighted.originalVars << std::endl;
-      std::cout << "c weighted-to-unweighted original clauses: "
-                << weighted.originalClauses << std::endl;
-      std::cout << "c weighted-to-unweighted converted vars: "
-                << weighted.convertedVars << std::endl;
-      std::cout << "c weighted-to-unweighted converted clauses: "
-                << weighted.convertedClauses << std::endl;
       std::cout << "c weighted-to-unweighted sampling vars: "
                 << weighted.samplingVars << std::endl;
       std::cout << "c weighted-to-unweighted divisor: 2^"

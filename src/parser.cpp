@@ -15,8 +15,8 @@
 #include "stp_sat.hpp"
 #include "volume/allsat_volume.hpp"
 
-#ifdef TTC_ENABLE_DDNNF
 #include "arjun.hpp"
+#ifdef TTC_ENABLE_DDNNF
 #include "proj_ddnnf.hpp"
 #include "var_order.hpp"
 #endif
@@ -642,15 +642,6 @@ void TTCParser::printTreeDecomposition(bool contract, bool netrel)
 {
     computeProjVarOrder(d_formula, d_projVars, d_solver, true, contract, netrel);
 }
-
-void TTCParser::minimizeProjectionSet()
-{
-    d_projVarsBefore = d_projVars.size();
-    Log(3) << "Minimizing projection set of size " << d_projVarsBefore << std::endl;
-    arjun::minimizeProjectionSet(d_solver, d_formula, d_projVars);
-    d_projVarsAfter = d_projVars.size();
-    Log(3) << "Projection set reduced to " << d_projVarsAfter << std::endl;
-}
 #else
 std::uint64_t TTCParser::projectedModelCount(CacheMode,
                                              bool,
@@ -669,14 +660,114 @@ void TTCParser::printTreeDecomposition(bool, bool)
 {
     Log(2) << "Tree decomposition requested but DDNNF support is disabled" << std::endl;
 }
+#endif
 
+// Projection-set minimization is independent of the d-DNNF/D4 stack: it only
+// needs the incremental cvc5 solver, so it is always available (--arjun).
 void TTCParser::minimizeProjectionSet()
 {
-    Log(2) << "Projection minimization requested but DDNNF support is disabled" << std::endl;
     d_projVarsBefore = d_projVars.size();
+    d_arjunWeightMultiplier = 1.0L;
+    if (d_projVars.empty())
+    {
+        d_projVarsAfter = 0;
+        return;
+    }
+    Log(3) << "Minimizing projection set of size " << d_projVarsBefore
+           << std::endl;
+
+    arjun::Reduction r =
+        arjun::analyzeProjectionSet(d_solver, d_formula, d_projVars);
+
+    auto weightOf = [&](const cvc5::Term& v, bool value) -> long double {
+        auto it = d_literalWeights.find(v);
+        LiteralWeight w =
+            (it != d_literalWeights.end()) ? it->second : LiteralWeight{};
+        return static_cast<long double>(value ? w.positive : w.negative);
+    };
+
+    std::vector<cvc5::Term> kept = std::move(r.support);
+
+    // Backbone variables are constant in every model. Dropping them never
+    // changes the unweighted projected count; under weighted counting each
+    // contributes the fixed weight of its forced value.
+    for (const auto& [v, value] : r.forced)
+    {
+        if (d_hasWeights)
+        {
+            d_arjunWeightMultiplier *= weightOf(v, value);
+        }
+        Log(4) << "  forced " << v << " = " << (value ? "true" : "false")
+               << std::endl;
+    }
+
+    // Implicitly-defined variables are functionally determined by the support,
+    // so dropping one preserves the unweighted count. Under weighted counting
+    // the removed variable's value -- and thus its weight factor -- varies per
+    // model, so removal is only sound when its two weights are equal (the
+    // factor is then constant); otherwise it must stay in the projection set.
+    std::size_t definedDropped = 0;
+    for (const cvc5::Term& v : r.defined)
+    {
+        if (!d_hasWeights)
+        {
+            ++definedDropped;
+            continue;
+        }
+        auto it = d_literalWeights.find(v);
+        LiteralWeight w =
+            (it != d_literalWeights.end()) ? it->second : LiteralWeight{};
+        if (w.positive == w.negative)
+        {
+            d_arjunWeightMultiplier *= static_cast<long double>(w.positive);
+            ++definedDropped;
+        }
+        else
+        {
+            kept.push_back(v);  // unsafe to drop under asymmetric weights
+        }
+    }
+
+    // Unconstrained variables occur in no constraint, so each one doubles the
+    // model count: dropping it from the projection set requires multiplying the
+    // unweighted count back by 2, and the weighted count by the sum of its two
+    // literal weights (the contribution of summing over both values).
+    for (const cvc5::Term& v : r.free)
+    {
+        if (d_hasWeights)
+        {
+            auto it = d_literalWeights.find(v);
+            LiteralWeight w =
+                (it != d_literalWeights.end()) ? it->second : LiteralWeight{};
+            d_arjunWeightMultiplier *=
+                static_cast<long double>(w.positive + w.negative);
+        }
+        else
+        {
+            // The model count gains one factor per value the variable can take:
+            // 2 for a Boolean, 2^width for a bit-vector.
+            cvc5::Sort sort = v.getSort();
+            unsigned width = sort.isBitVector() ? sort.getBitVectorSize() : 1u;
+            // A 64-bit unsigned count cannot represent 2^64 or beyond; leave such
+            // (degenerate) variables in the projection set rather than overflow.
+            if (width < 64u)
+            {
+                d_arjunCountMultiplier *= (1ULL << width);
+            }
+            else
+            {
+                kept.push_back(v);
+            }
+        }
+        Log(4) << "  unconstrained " << v << std::endl;
+    }
+
+    d_projVars = std::move(kept);
     d_projVarsAfter = d_projVars.size();
+    Log(3) << "Projection set reduced to " << d_projVarsAfter << " (forced "
+           << r.forced.size() << ", defined " << definedDropped
+           << ", unconstrained " << r.free.size() << ")" << std::endl;
 }
-#endif
 
 std::optional<bool> TTCParser::checkSatWithSTP(const std::string& smtFormula)
 {
