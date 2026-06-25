@@ -43,13 +43,30 @@ struct TddResult
 class TheoryDD
 {
  public:
+  // How the diagram is built:
+  //  - Shannon  : theory-pruned Shannon expansion. The whole formula stays on
+  //               the solver as a feasibility oracle; an infeasible Boolean
+  //               prefix prunes its entire subtree immediately, and the
+  //               terminals are just TRUE/FALSE (a reduced feasibility BDD).
+  //               Scales to many decision variables -- the default.
+  //  - Regions  : bottom-up apply(AND, .) of the assertions, carrying the
+  //               residual LRA region in each leaf (so leaves expose the range
+  //               of each real variable). Richer for --printdd but does not
+  //               scale: the per-path regions never merge.
+  enum class Mode
+  {
+    Shannon,
+    Regions
+  };
+
   // The solver must already carry the parsed assertions (it is used, via
-  // push/assert/checkSat/pop, only to test feasibility of theory leaves).
+  // push/assert/checkSat/pop, only to test feasibility).
   TheoryDD(cvc5::Solver& solver,
            std::vector<cvc5::Term> boolVars,
            std::vector<cvc5::Term> realVars,
            std::unordered_map<cvc5::Term, TTCParser::LiteralWeight> weights,
-           bool hasWeights);
+           bool hasWeights,
+           Mode mode = Mode::Shannon);
 
   // Bottom-up compile the conjunction of the assertions into the diagram.
   void compile(const std::vector<cvc5::Term>& assertions);
@@ -76,7 +93,8 @@ class TheoryDD
   };
 
   // --- diagram construction -------------------------------------------------
-  int compileTerm(const cvc5::Term& term);
+  int buildShannon(int level);             // theory-pruned Shannon expansion
+  int compileTerm(const cvc5::Term& term);  // Regions mode (apply leaves)
   int makeNode(int var, int lo, int hi);
   int makeLeaf(const cvc5::Term& constraint);
   int negate(int node);
@@ -105,6 +123,7 @@ class TheoryDD
   std::unordered_map<cvc5::Term, TTCParser::LiteralWeight> d_weights;
   std::unordered_map<cvc5::Term, int> d_varIndex;
   bool d_hasWeights = false;
+  Mode d_mode = Mode::Shannon;
 
   std::vector<Node> d_nodes;  // index 0 = FALSE, 1 = TRUE
   int d_root = kFalse;

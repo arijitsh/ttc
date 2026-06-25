@@ -16,12 +16,14 @@ TheoryDD::TheoryDD(cvc5::Solver& solver,
                    std::vector<cvc5::Term> boolVars,
                    std::vector<cvc5::Term> realVars,
                    std::unordered_map<cvc5::Term, TTCParser::LiteralWeight> weights,
-                   bool hasWeights)
+                   bool hasWeights,
+                   Mode mode)
     : d_solver(solver),
       d_boolVars(std::move(boolVars)),
       d_realVars(std::move(realVars)),
       d_weights(std::move(weights)),
-      d_hasWeights(hasWeights)
+      d_hasWeights(hasWeights),
+      d_mode(mode)
 {
   for (std::size_t i = 0; i < d_boolVars.size(); ++i)
   {
@@ -346,8 +348,51 @@ int TheoryDD::compileTerm(const cvc5::Term& term)
   return makeNode(sv, lo, hi);
 }
 
+// Theory-pruned Shannon expansion. The full formula is already asserted on the
+// solver, so we only push the current decision literal and ask whether the
+// prefix is still theory-satisfiable. An UNSAT child is the FALSE terminal,
+// which prunes the entire subtree below it; makeNode then reduces the result
+// into a feasibility BDD with TRUE/FALSE terminals.
+//
+// Precondition: the current solver context (formula + asserted prefix) is SAT.
+int TheoryDD::buildShannon(int level)
+{
+  if (level == static_cast<int>(d_boolVars.size()))
+  {
+    return kTrue;  // a complete, theory-feasible assignment
+  }
+  auto& tm = ttc::getTermBuilder(d_solver);
+  const cvc5::Term& v = d_boolVars[level];
+
+  d_solver.push();
+  d_solver.assertFormula(v);
+  ++d_smtCalls;
+  int hi = d_solver.checkSat().isSat() ? buildShannon(level + 1) : kFalse;
+  d_solver.pop();
+
+  d_solver.push();
+  d_solver.assertFormula(tm.mkTerm(cvc5::Kind::NOT, {v}));
+  ++d_smtCalls;
+  int lo = d_solver.checkSat().isSat() ? buildShannon(level + 1) : kFalse;
+  d_solver.pop();
+
+  return makeNode(level, lo, hi);
+}
+
 void TheoryDD::compile(const std::vector<cvc5::Term>& assertions)
 {
+  if (d_mode == Mode::Shannon)
+  {
+    // The assertions are already on the solver; isolate the exploration in a
+    // push so the solver is left untouched afterwards.
+    d_solver.push();
+    ++d_smtCalls;
+    d_root = d_solver.checkSat().isSat() ? buildShannon(0) : kFalse;
+    d_solver.pop();
+    return;
+  }
+
+  // Regions mode: bottom-up apply(AND, .) with residual LRA leaves.
   int acc = kTrue;
   for (const cvc5::Term& a : assertions)
   {

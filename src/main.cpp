@@ -1294,7 +1294,12 @@ int main(int argc, char *argv[]) {
        "variables with LRA leaves and report the exact (weighted) model count")
       ("printdd", po::value<std::string>()->implicit_value("-"),
        "Print the compiled decision diagram in Graphviz dot format (to the "
-       "given file, or to stdout when no file is given)");
+       "given file, or to stdout when no file is given)")
+      ("tdd-regions",
+       "TDD construction: carry the residual LRA region in each leaf (so leaves "
+       "expose the range of each real variable) via bottom-up apply(AND, .). "
+       "Richer for --printdd but does not scale; default is theory-pruned "
+       "Shannon expansion with TRUE/FALSE terminals");
 
   // Advanced d-DNNF / exact CNF counting knobs are inactive by
   // default and hidden from --help. They are still accepted on the command line
@@ -2023,11 +2028,15 @@ int main(int argc, char *argv[]) {
 
     try
     {
+      ttc::tdd::TheoryDD::Mode tddMode =
+          vm.count("tdd-regions") ? ttc::tdd::TheoryDD::Mode::Regions
+                                  : ttc::tdd::TheoryDD::Mode::Shannon;
       ttc::tdd::TheoryDD dd(parser.solver(),
                             parser.projectionVars(),
                             parser.realVariables(),
                             parser.literalWeights(),
-                            parser.hasWeights());
+                            parser.hasWeights(),
+                            tddMode);
       double countStart = Log.elapsed();
       dd.compile(parser.assertions());
       double countEnd = Log.elapsed();
@@ -2058,6 +2067,11 @@ int main(int argc, char *argv[]) {
 
       if (verbosity > 0)
       {
+        std::cout << "c [ttc->tdd] mode: "
+                  << (tddMode == ttc::tdd::TheoryDD::Mode::Regions
+                          ? "regions (LRA leaves)"
+                          : "shannon (feasibility BDD)")
+                  << std::endl;
         std::cout << "c [ttc->tdd] decision vars: " << r.numVars
                   << " nodes: " << r.numNodes << " leaves: " << r.numLeaves
                   << " theory checks: " << r.smtCalls << std::endl;
