@@ -38,6 +38,7 @@
 #include "var_order.hpp"
 #endif
 #include "volume/lra_volume.hpp"
+#include "tdd/tdd.hpp"
 
 namespace po = boost::program_options;
 
@@ -1280,6 +1281,21 @@ int main(int argc, char *argv[]) {
       ("func", po::value<std::string>(),
        "Name of the uninterpreted function to count (default: mainfunc)");
 
+  // Engine 6: theory decision diagram (TDD). Bottom-up compile the formula into
+  // a reduced ordered BDD whose decision nodes are the Boolean projection
+  // variables and whose leaves carry the residual LRA region (FALSE when that
+  // region is theory-unsatisfiable). The (weighted) model count is the sum over
+  // all root->leaf paths not reaching FALSE.
+  po::options_description classTdd(
+      "Engine 6 -- theory decision diagram (exact weighted model count)");
+  classTdd.add_options()
+      ("tdd",
+       "Force engine 6: bottom-up compile a TDD over the Boolean projection "
+       "variables with LRA leaves and report the exact (weighted) model count")
+      ("printdd", po::value<std::string>()->implicit_value("-"),
+       "Print the compiled decision diagram in Graphviz dot format (to the "
+       "given file, or to stdout when no file is given)");
+
   // Advanced d-DNNF / exact CNF counting knobs are inactive by
   // default and hidden from --help. They are still accepted on the command line
   // so existing invocations keep working.
@@ -1333,7 +1349,8 @@ int main(int argc, char *argv[]) {
   // (engine 4 / exact CNF) options and the positional input-file are accepted
   // by the parser but hidden from --help.
   po::options_description visible("Allowed options");
-  visible.add(general).add(classBv).add(classPb).add(classLra).add(classSkolem);
+  visible.add(general).add(classBv).add(classPb).add(classLra).add(classSkolem)
+      .add(classTdd);
   po::options_description all;
   all.add(visible).add(advanced).add(hidden);
 
@@ -1389,6 +1406,7 @@ int main(int argc, char *argv[]) {
   bool useProjectionBoost = vm.count("pact") > 0;
   bool useProjectionEnumerate = vm.count("enum") > 0;
   bool useSkolemFc = vm.count("skolemfc") > 0;
+  bool useTdd = vm.count("tdd") > 0;
   std::string skolemFuncName =
       vm.count("func") ? vm["func"].as<std::string>() : std::string("mainfunc");
   std::uint64_t approxSeed = vm["seed"].as<std::uint64_t>();
@@ -1505,7 +1523,8 @@ int main(int argc, char *argv[]) {
       vm.count("pact") || vm.count("enum") || vm.count("bvcnf")
       || vm.count("cnf")
       || vm.count("tocnf") || vm.count("d4") || vm.count("FB")
-      || vm.count("unsat") || vm.count("unsat-q") || vm.count("skolemfc");
+      || vm.count("unsat") || vm.count("unsat-q") || vm.count("skolemfc")
+      || vm.count("tdd");
   const bool autoDispatch = !explicitEngine;
   bool autoBvCnf = false;     // rule 1: BV/UFBV -> eager bit-blast + ApproxMC
   bool autoDeferred = false;  // rule 2 (PB) or rule 3 (volume), resolved after parsing
@@ -1984,6 +2003,81 @@ int main(int argc, char *argv[]) {
 #endif
   }
 
+  // Engine 6: theory decision diagram. Bottom-up compile the assertions into a
+  // reduced ordered BDD over the Boolean projection variables, with the
+  // residual LRA region carried in the leaves (an infeasible region is the
+  // FALSE terminal). The (weighted) model count is the sum over every
+  // root->leaf path not reaching FALSE.
+  if (useTdd)
+  {
+    for (const cvc5::Term& v : parser.projectionVars())
+    {
+      if (!v.getSort().isBoolean())
+      {
+        std::cerr << "Error: --tdd currently supports Boolean projection "
+                     "variables only (got "
+                  << v.getSort().toString() << ")" << std::endl;
+        return 1;
+      }
+    }
+
+    try
+    {
+      ttc::tdd::TheoryDD dd(parser.solver(),
+                            parser.projectionVars(),
+                            parser.realVariables(),
+                            parser.literalWeights(),
+                            parser.hasWeights());
+      double countStart = Log.elapsed();
+      dd.compile(parser.assertions());
+      double countEnd = Log.elapsed();
+      Profile.addSearch(countEnd - countStart);
+      ttc::tdd::TddResult r = dd.result();
+
+      if (vm.count("printdd"))
+      {
+        std::string target = vm["printdd"].as<std::string>();
+        if (target == "-")
+        {
+          dd.writeDot(std::cout);
+        }
+        else
+        {
+          std::ofstream dot(target);
+          if (!dot)
+          {
+            std::cerr << "Error: --printdd could not open '" << target << "'"
+                      << std::endl;
+            return 1;
+          }
+          dd.writeDot(dot);
+          std::cout << "c [ttc->tdd] wrote decision diagram to '" << target
+                    << "'" << std::endl;
+        }
+      }
+
+      if (verbosity > 0)
+      {
+        std::cout << "c [ttc->tdd] decision vars: " << r.numVars
+                  << " nodes: " << r.numNodes << " leaves: " << r.numLeaves
+                  << " theory checks: " << r.smtCalls << std::endl;
+      }
+      std::cout << "s mc " << r.modelCount << std::endl;
+      if (r.hasWeights)
+      {
+        std::cout << "s wmc ";
+        printWeightedCount(r.weightedCount);
+        std::cout << std::endl;
+      }
+      return 0;
+    }
+    catch (const std::exception& ex)
+    {
+      std::cerr << "Error: --tdd failed: " << ex.what() << std::endl;
+      return 1;
+    }
+  }
+
   // Resolve the deferred automatic engine choice now that the projection
   // variables (and their sorts) are known. --bvcnf (rule 1) was already
   // committed pre-parse.
@@ -2152,7 +2246,7 @@ int main(int argc, char *argv[]) {
   // bit-vector support of the formula, not the LRA volume. Even for pure-LRA
   // logics they must run projected counting (pact) rather than fall into the
   // volume-computation path below.
-  if (useProjectionBoost || useProjectionEnumerate)
+  if (useProjectionBoost || useProjectionEnumerate || useD4)
   {
     isLraInput = false;
   }
