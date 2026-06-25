@@ -1304,7 +1304,10 @@ int main(int argc, char *argv[]) {
        "TDD construction: a planning phase first picks the decision-variable "
        "order and the assertion apply order (minimizing the induced width of the "
        "variable-interaction graph, a proxy for the number of theory checks), "
-       "then builds bottom-up with apply(AND, .) one assertion at a time");
+       "then builds bottom-up with apply(AND, .) one assertion at a time")
+      ("tdd-no-project",
+       "With --tdd-plan, disable Stage-2 frontier projection (no quantifier "
+       "elimination of eliminated real variables); for A/B comparison");
 
   // Advanced d-DNNF / exact CNF counting knobs are inactive by
   // default and hidden from --help. They are still accepted on the command line
@@ -2132,6 +2135,10 @@ int main(int argc, char *argv[]) {
                             parser.literalWeights(),
                             parser.hasWeights(),
                             tddMode);
+      if (vm.count("tdd-no-project"))
+      {
+        dd.setProjection(false);
+      }
 
       // Planning phase first, so the chosen order is reported before the
       // (possibly long) build -- important for large inputs that may not finish.
@@ -2152,12 +2159,6 @@ int main(int argc, char *argv[]) {
                     << (i == dd.planChosen() ? "   <- chosen" : "")
                     << std::endl;
         }
-        std::ostringstream order;
-        for (const std::string& nm : dd.decisionOrderNames())
-        {
-          order << ' ' << nm;
-        }
-        std::cout << "c decision-variable order:" << order.str() << std::endl;
         std::cout << "c" << std::endl;
       }
 
@@ -2221,6 +2222,15 @@ int main(int argc, char *argv[]) {
         std::cout << "c theory-region leaves: " << r.numLeaves << std::endl;
       }
       std::cout << "c theory feasibility checks: " << r.smtCalls << std::endl;
+      if (tddPlan)
+      {
+        std::cout << "c quantifier-elimination projections: " << r.qeCalls;
+        if (r.qeFails > 0)
+        {
+          std::cout << " (" << r.qeFails << " fell back)";
+        }
+        std::cout << std::endl;
+      }
       std::cout << "c compile time: " << std::fixed << std::setprecision(2)
                 << (countEnd - countStart) << " seconds" << std::endl;
       std::cout.unsetf(std::ios::floatfield);

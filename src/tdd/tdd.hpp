@@ -6,6 +6,7 @@
 #include <functional>
 #include <iosfwd>
 #include <map>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -40,6 +41,8 @@ struct TddResult
   std::size_t numVars = 0;        // Boolean decision variables
   std::uint64_t smtCalls = 0;     // theory feasibility checks issued to cvc5
   std::uint64_t feasiblePaths = 0;  // complete feasible assignments (Shannon)
+  std::uint64_t qeCalls = 0;        // quantifier-elimination projections (Planned)
+  std::uint64_t qeFails = 0;        // projections that fell back (QE unavailable)
 };
 
 class TheoryDD
@@ -96,6 +99,9 @@ class TheoryDD
     std::uint64_t checks = 0;  // theory feasibility checks issued so far
     std::uint64_t paths = 0;   // complete feasible assignments found so far
   };
+
+  // Stage-2 frontier projection on/off (Planned mode). Default on.
+  void setProjection(bool on) { d_project = on; }
 
   // Run only the planning phase (Planned mode), so callers can report the chosen
   // order before the (possibly long) build. compile() reuses it if already run.
@@ -158,6 +164,18 @@ class TheoryDD
   int inducedWidth(const std::vector<std::vector<int>>& adj,
                    const std::vector<int>& order) const;
 
+  // --- frontier projection (Planned mode, Stage 2) --------------------------
+  // Eliminate the given real variables from a leaf region with cvc5 quantifier
+  // elimination (∃ vars. constraint), so leaves that become equivalent merge.
+  cvc5::Term projectConstraint(const cvc5::Term& constraint,
+                               const std::vector<cvc5::Term>& vars);
+  // Rebuild a diagram, projecting the given real variables out of every leaf and
+  // re-reducing; equivalent residual regions collapse to one leaf.
+  int projectVars(int node, const std::vector<cvc5::Term>& vars);
+  int rebuildProject(int node, const std::vector<cvc5::Term>& vars,
+                     std::unordered_map<int, int>& memo);
+  cvc5::Solver& qeSolver();  // lazily-created quantifier-capable helper solver
+
   // --- diagram construction -------------------------------------------------
   int compilePlanned(const std::vector<cvc5::Term>& assertions);
   int buildShannon(int level);             // theory-pruned Shannon expansion
@@ -212,7 +230,15 @@ class TheoryDD
   std::vector<PlanCandidate> d_planCandidates;
   int d_planChosen = -1;
   std::vector<std::size_t> d_applySchedule;  // assertion indices, apply order
+  // d_projectAfter[s] = real variables eliminated (projectable) once the s-th
+  // scheduled assertion has been applied.
+  std::vector<std::vector<cvc5::Term>> d_projectAfter;
   bool d_planned = false;
+  bool d_project = true;  // Stage 2: frontier projection on/off
+
+  std::unique_ptr<cvc5::Solver> d_qeSolver;  // quantifier-elimination helper
+  std::uint64_t d_qeCalls = 0;
+  std::uint64_t d_qeFails = 0;
 };
 
 }  // namespace ttc::tdd

@@ -710,6 +710,34 @@ void TheoryDD::plan(const std::vector<cvc5::Term>& assertions)
                    [&](std::size_t a, std::size_t b) {
                      return assertKey[a] < assertKey[b];
                    });
+
+  // Projection schedule (Stage 2): a real variable can be projected out of the
+  // leaves once the last (in apply order) assertion mentioning it has been
+  // applied. Record, per schedule step, the real variables eliminated after it.
+  std::vector<int> schedPos(assertions.size(), 0);
+  for (std::size_t s = 0; s < d_applySchedule.size(); ++s)
+  {
+    schedPos[d_applySchedule[s]] = static_cast<int>(s);
+  }
+  std::vector<int> elimStep(n, -1);
+  for (std::size_t a = 0; a < assertions.size(); ++a)
+  {
+    for (int v : assertVars[a])
+    {
+      if (v >= numBool)  // real variable
+      {
+        elimStep[v] = std::max(elimStep[v], schedPos[a]);
+      }
+    }
+  }
+  d_projectAfter.assign(d_applySchedule.size(), {});
+  for (int v = numBool; v < n; ++v)
+  {
+    if (elimStep[v] >= 0)
+    {
+      d_projectAfter[elimStep[v]].push_back(vertexTerm[v]);
+    }
+  }
   d_planned = true;
 }
 
@@ -732,33 +760,127 @@ std::vector<std::string> TheoryDD::decisionOrderNames() const
   return names;
 }
 
+// A lazily-created helper solver with a quantifier-capable logic, used only for
+// quantifier elimination on leaf regions. It shares the term manager with the
+// main solver so leaf-constraint terms can be passed directly.
+cvc5::Solver& TheoryDD::qeSolver()
+{
+  if (!d_qeSolver)
+  {
+    // Construct in place from the shared term manager (cvc5::Solver is not
+    // movable, so it cannot be returned-by-value into the unique_ptr).
+    d_qeSolver = std::make_unique<cvc5::Solver>(d_solver.getTermManager());
+    try { d_qeSolver->setLogic("ALL"); }
+    catch (const cvc5::CVC5ApiException&) {}
+  }
+  return *d_qeSolver;
+}
+
+// Project the given real variables out of a leaf region: return a quantifier-
+// free constraint equivalent to (exists vars. constraint). On any failure the
+// original constraint is returned (sound -- it just forgoes the merge).
+cvc5::Term TheoryDD::projectConstraint(const cvc5::Term& constraint,
+                                       const std::vector<cvc5::Term>& vars)
+{
+  if (vars.empty() || constraint.getKind() == cvc5::Kind::CONST_BOOLEAN)
+  {
+    return constraint;
+  }
+  auto& tm = ttc::getTermBuilder(d_solver);
+  ++d_qeCalls;
+  try
+  {
+    std::vector<cvc5::Term> bound;
+    bound.reserve(vars.size());
+    for (std::size_t i = 0; i < vars.size(); ++i)
+    {
+      bound.push_back(tm.mkVar(vars[i].getSort(), "__tdd_qe_" + std::to_string(i)));
+    }
+    cvc5::Term body = constraint.substitute(vars, bound);
+    cvc5::Term varList = tm.mkTerm(cvc5::Kind::VARIABLE_LIST, bound);
+    cvc5::Term existsTerm = tm.mkTerm(cvc5::Kind::EXISTS, {varList, body});
+    cvc5::Solver& qe = qeSolver();
+    cvc5::Term result = qe.getQuantifierElimination(existsTerm);
+    try { result = qe.simplify(result); }
+    catch (const cvc5::CVC5ApiException&) {}
+    return result;
+  }
+  catch (const cvc5::CVC5ApiException&)
+  {
+    ++d_qeFails;
+    return constraint;
+  }
+}
+
+int TheoryDD::rebuildProject(int node, const std::vector<cvc5::Term>& vars,
+                             std::unordered_map<int, int>& memo)
+{
+  if (node <= kTrue)
+  {
+    return node;  // FALSE / TRUE terminals are unaffected
+  }
+  auto it = memo.find(node);
+  if (it != memo.end())
+  {
+    return it->second;
+  }
+  // Copy: makeLeaf/makeNode below may reallocate d_nodes.
+  const Node n = d_nodes[node];
+  int res;
+  if (n.leaf)
+  {
+    res = makeLeaf(projectConstraint(n.constraint, vars));
+  }
+  else
+  {
+    int lo = rebuildProject(n.lo, vars, memo);
+    int hi = rebuildProject(n.hi, vars, memo);
+    res = makeNode(n.var, lo, hi);
+  }
+  memo.emplace(node, res);
+  return res;
+}
+
+int TheoryDD::projectVars(int node, const std::vector<cvc5::Term>& vars)
+{
+  std::unordered_map<int, int> memo;
+  return rebuildProject(node, vars, memo);
+}
+
 // Bottom-up apply over the planned schedule. The decision order is fixed by
 // plan(); each assertion is compiled from the pre-built atom/variable nodes and
-// conjoined into the accumulator one at a time.
+// conjoined into the accumulator one at a time. Stage 2: after the last
+// assertion mentioning a real variable is applied, that variable is projected
+// out of every leaf so equivalent residual regions merge (bounding the leaf
+// count by the frontier rather than the path count).
 int TheoryDD::compilePlanned(const std::vector<cvc5::Term>& assertions)
 {
-  // Bottom nodes first: materialize a leaf for every distinct theory atom (and
-  // an elementary node per decision variable) so each is a shared building block
-  // and its feasibility check is issued once, up front.
-  for (const cvc5::Term& a : assertions)
+  // Bottom nodes first: compile each assertion once into its own diagram (this
+  // materializes a leaf per theory atom and an elementary node per decision
+  // variable -- the shared building blocks -- and issues each atom's feasibility
+  // check up front). Cache the per-assertion node so the apply phase reuses it.
+  std::vector<int> assertionNode(assertions.size(), kTrue);
+  for (std::size_t i = 0; i < assertions.size(); ++i)
   {
-    compileTerm(a);  // populates the atom-leaf / var-node tables
+    assertionNode[i] = compileTerm(assertions[i]);
   }
 
   int acc = kTrue;
-  std::size_t applied = 0;
-  for (std::size_t idx : d_applySchedule)
+  for (std::size_t s = 0; s < d_applySchedule.size(); ++s)
   {
     if (d_progress)
     {
-      d_progress(Progress{static_cast<int>(applied), d_nodes.size(),
+      d_progress(Progress{static_cast<int>(s), d_nodes.size(),
                           d_smtCalls, d_leafCount});
     }
-    acc = apply(cvc5::Kind::AND, acc, compileTerm(assertions[idx]));
-    ++applied;
+    acc = apply(cvc5::Kind::AND, acc, assertionNode[d_applySchedule[s]]);
     if (acc == kFalse)
     {
       break;  // whole formula is theory-unsatisfiable
+    }
+    if (d_project && s < d_projectAfter.size() && !d_projectAfter[s].empty())
+    {
+      acc = projectVars(acc, d_projectAfter[s]);
     }
   }
   return acc;
@@ -841,6 +963,8 @@ TddResult TheoryDD::result() const
   r.numVars = d_boolVars.size();
   r.hasWeights = d_hasWeights;
   r.smtCalls = d_smtCalls;
+  r.qeCalls = d_qeCalls;
+  r.qeFails = d_qeFails;
   std::size_t nodes = 0;
   std::size_t leaves = 0;
   for (std::size_t id = 2; id < d_nodes.size(); ++id)
