@@ -305,6 +305,7 @@ set(SOURCES
     src/pact/bool_hash.cpp
     src/pact/bv_hash.cpp
     src/projected_enumerator.cpp
+    src/tdd/tdd.cpp
     src/csb/stp_sat.cpp
     src/tocnf/tocnf.cpp
     src/eager/bvcnf.cpp
