@@ -2,10 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-TTC is a C++ tool for counting models of SMT-LIB formulas.  Given a formula
-with projection variables prefixed by `proj`, TTC reports the number of models
-projected onto those variables.  The tool can perform exact or approximate
-counting and uses tree decompositions and component caching under the hood.
+**ttc**, the Toolbox for Theory Counting, is a tool for measuring the solution space of Satisfiability Modulo Theories (SMT) formulas. It supports counting over a number of theories and their combinations, including bit-vectors and uninterpreted functions, as well as volume computation for the theory of linear real arithmetic.
 
 ## Documentation
 
