@@ -7,38 +7,27 @@ with projection variables prefixed by `proj`, TTC reports the number of models
 projected onto those variables.  The tool can perform exact or approximate
 counting and uses tree decompositions and component caching under the hood.
 
-`ttc` also covers a set of experimental features like sampling and exact projected counting. See [extras.md]() for more details.
+## Documentation
 
-This complements our tool [csb](https://github.com/meelgroup/ttc), which is designed for counting over bitvectors.
+A documentation on usage and building is available at https://arijitsh.github.io/docs-ttc/
 
-## How to Build a Binary
-To build on Linux, install the required dependencies:
-```
-sudo apt install build-essential cmake git libboost-program-options-dev liblpsolve55-dev libeigen3-dev libisl-dev libgmp-dev
-```
+## Different Usage
 
-Clone the repository and build the project:
-```
-git clone https://github.com/meelgroup/ttc
-cd ttc
-./configure.sh
-cd build && make -j8
-```
+### Usage: Bitvector Counting
+To counts the models of formulas over the theory of fixed-size bit-vectors (logics BV and UFBV), use this mode. The formula is eagerly bit-blasted to a model-preserving CNF in memory and counted with Arjun + ApproxMC in-process, so no intermediate file is written. This engine is auto-selected for bit-vector logics.
 
-This compiles the tool against a modified version of `cvc5` from [this repository](https://github.com/meelgroup/ttc). If you want something else, please see `./configure.sh -h`, and [extras.md](). Detailed instructions on building on MacOS is also there.
 
-## Usage: Volume Computation
-Translate your problem into an SMT-LIB 2 file.  Mark the Boolean variables to be
-projected with the prefix `proj` and pass the file to TTC:
-```
-$ ./ttc path/to/formula.smt2
-...
-s mc 42
-...
-```
+### Usage: Volume Computation
+Computes the volume of the solution space of linear real arithmetic (QF_LRA) formulas — that is, the measure of the region of real assignments that satisfy the formula. The polytopes are estimated with the volesti random-walk sampler. This engine is auto-selected for QF_LRA inputs with no projection variables.
 
-## Usage: Projected Counting
-By default if there are combination of theories, where a subset of theories is BV or Boolean, then `ttc` considers those BV/Boolean variables as projection variables and computes the projected count. If you want a subset of variables as projection variables then use `declare-projvar` keyword. If your formula is a pure LRA formula, and you want the counts to be projected on the Boolean variables, the use `-P` options.
+### Usage: Projected Counting
+Hybrid formulas mix discrete and continuous variables. Engine 2 handles them with projection-based approximate counting (PACT): it counts the satisfying assignments to the discrete (bit-vector / Boolean) projection variables, while the continuous part is discharged by the SMT solver.
+
+This engine is auto-selected for non-BV, non-LRA logics that have bit-vector or Boolean projection variables. 
+
+### Usage: Skolem Function Counting
+
+To count the interpretations (Skolem functions) of an uninterpreted function that satisfy a formula, use the SkolemFC mode. It is intended for QF_UFBV formulas that constrain the behaviour of an uninterpreted function.
 
 ### Example
 ```
