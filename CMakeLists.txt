@@ -175,6 +175,7 @@ if(BUILD_STATIC)
 else()
   set(SKOLEMFC_BUILD "${SKOLEMFC_ROOT}/build_test")
 endif()
+
 find_library(SKOLEMFC_LIB skolemfc HINTS "${SKOLEMFC_BUILD}/src" NO_DEFAULT_PATH)
 set(SKOLEMFC_DEPS_LIB_DIR "${SKOLEMFC_BUILD}/deps_install/lib")
 set(SKOLEMFC_DEPS_INCLUDE_DIR "${SKOLEMFC_BUILD}/deps_install/include")
@@ -240,6 +241,48 @@ else()
   message(WARNING "SkolemFC library not found at ${SKOLEMFC_BUILD}/src; "
                   "--skolemfc engine disabled")
   set(HAVE_SKOLEMFC OFF)
+endif()
+
+# The eager BV engine also uses ApproxMC/Arjun directly.  Some development
+# configurations have only the static dependency stack populated even when
+# the optional SkolemFC frontend itself is disabled.  Discover that stack
+# independently so an unrelated optional frontend does not make bvcnf.cpp
+# uncompilable (or leave its symbols unlinked).
+if(NOT SKOLEMFC_APPROXMC_LIB OR NOT SKOLEMFC_ARJUN_LIB)
+  set(TTC_STATIC_COUNT_DEPS "${SKOLEMFC_ROOT}/build_static/deps_install")
+  find_library(EAGER_APPROXMC_LIB approxmc
+               HINTS "${TTC_STATIC_COUNT_DEPS}/lib" NO_DEFAULT_PATH)
+  find_library(EAGER_ARJUN_LIB arjun
+               HINTS "${TTC_STATIC_COUNT_DEPS}/lib" NO_DEFAULT_PATH)
+  find_library(EAGER_SBVA_LIB sbva
+               HINTS "${TTC_STATIC_COUNT_DEPS}/lib" NO_DEFAULT_PATH)
+  find_library(EAGER_CMS_LIB cryptominisat5
+               HINTS "${TTC_STATIC_COUNT_DEPS}/lib" NO_DEFAULT_PATH)
+  if(EAGER_APPROXMC_LIB AND EAGER_ARJUN_LIB AND EAGER_CMS_LIB
+     AND EXISTS "${TTC_STATIC_COUNT_DEPS}/include/approxmc/approxmc.h")
+    include_directories("${TTC_STATIC_COUNT_DEPS}/include")
+    # ApproxMC/Arjun were built against this CMS ABI; use that single archive
+    # for cvc5 as well to avoid two incompatible CMS copies in one executable.
+    set(CMS_LIB "${EAGER_CMS_LIB}")
+    set(EAGER_COUNT_LIBS ${EAGER_APPROXMC_LIB} ${EAGER_ARJUN_LIB}
+                         ${EAGER_SBVA_LIB})
+  endif()
+endif()
+
+if(EAGER_COUNT_LIBS AND NOT TARGET cadiback_xor)
+  set(CADIBACK_SRC "${SKOLEMFC_ROOT}/deps/cadiback/cadiback.cpp")
+  set(CADIBACK_XOR_LIB "${CMAKE_BINARY_DIR}/libcadiback_xor.a")
+  add_custom_command(
+      OUTPUT "${CADIBACK_XOR_LIB}"
+      COMMAND ${CMAKE_CXX_COMPILER} -fPIC -O3 -std=c++17 -DNDEBUG
+              -I${NEW_CADICAL_ROOT}/src -c "${CADIBACK_SRC}"
+              -o "${CMAKE_BINARY_DIR}/cadiback_xor.o"
+      COMMAND ${CMAKE_AR} rcs "${CADIBACK_XOR_LIB}"
+              "${CMAKE_BINARY_DIR}/cadiback_xor.o"
+      DEPENDS "${CADIBACK_SRC}" "${NEW_CADICAL_ROOT}/src/cadical.hpp"
+      VERBATIM
+      COMMENT "Recompiling cadiback against xor-branch CaDiCaL headers")
+  add_custom_target(cadiback_xor DEPENDS "${CADIBACK_XOR_LIB}")
 endif()
 
 # Add our project source directories
@@ -312,6 +355,10 @@ set(SOURCES
     src/weighted/tounweighted.cpp
     src/volume/allsat_volume.cpp
     src/volume/lra_volume.cpp
+    src/nravol/polynomial.cpp
+    src/nravol/nra_region.cpp
+    src/nravol/component_decomposition.cpp
+    src/nravol/nra_volume.cpp
     src/allsat-circuits/src/AllSatAlgo/AllSatAlgoBase.cpp
     src/allsat-circuits/src/AllSatAlgo/Blocking/AllSatAlgoBlockingBase.cpp
     src/allsat-circuits/src/AllSatAlgo/Blocking/TseitinEnc/AllSatAlgoTseitinEnc.cpp
@@ -446,7 +493,7 @@ endif()
 if(BUILD_STATIC AND TARGET lpsolve_patched)
     add_dependencies(ttc lpsolve_patched)
 endif()
-if(BUILD_STATIC AND TARGET cadiback_xor)
+if(TARGET cadiback_xor)
     add_dependencies(ttc cadiback_xor)
 endif()
 
@@ -466,6 +513,12 @@ target_link_libraries(ttc
     ${AMD_LIB}
     PkgConfig::ISL
     m)
+
+if(EAGER_COUNT_LIBS)
+  # Static ordering matters: count clients first, then the shared CMS provider.
+  target_link_libraries(ttc ${EAGER_COUNT_LIBS} ${CMS_LIB}
+                        "${CADIBACK_XOR_LIB}" ${CADICAL_LIB})
+endif()
 
 find_library(GMP_LIB gmp REQUIRED)
 find_library(GMPXX_LIB gmpxx REQUIRED)
@@ -522,7 +575,8 @@ endif()
 
 if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
-    set(LRA_VOLUME_TEST_SCRIPT ${CMAKE_SOURCE_DIR}/tests/test_lra_volume.py)
+    set(VOLUME_TEST_DIR ${CMAKE_SOURCE_DIR}/example/tests)
+    set(LRA_VOLUME_TEST_SCRIPT ${VOLUME_TEST_DIR}/test_lra_volume.py)
 
     add_test(
         NAME lra_volume_union
@@ -530,7 +584,7 @@ if(BUILD_TESTING)
             ${Python3_EXECUTABLE}
             ${LRA_VOLUME_TEST_SCRIPT}
             $<TARGET_FILE:ttc>
-            ${CMAKE_SOURCE_DIR}/tests/lra_union.smt2
+            ${VOLUME_TEST_DIR}/lra_union.smt2
             --expected-polytopes 2
             --expected-rows 2
             --expected-volumes 400
@@ -543,7 +597,7 @@ if(BUILD_TESTING)
             ${Python3_EXECUTABLE}
             ${LRA_VOLUME_TEST_SCRIPT}
             $<TARGET_FILE:ttc>
-            ${CMAKE_SOURCE_DIR}/tests/lra_single_box.smt2
+            ${VOLUME_TEST_DIR}/lra_single_box.smt2
             --expected-polytopes 1
             --expected-rows 1
             --expected-volumes 400
@@ -557,7 +611,7 @@ if(BUILD_TESTING)
             ${Python3_EXECUTABLE}
             ${LRA_VOLUME_TEST_SCRIPT}
             $<TARGET_FILE:ttc>
-            ${CMAKE_SOURCE_DIR}/tests/lra_disjoint.smt2
+            ${VOLUME_TEST_DIR}/lra_disjoint.smt2
             --expected-polytopes 2
             --expected-rows 2
             --expected-volumes 400
@@ -571,11 +625,49 @@ if(BUILD_TESTING)
             ${Python3_EXECUTABLE}
             ${LRA_VOLUME_TEST_SCRIPT}
             $<TARGET_FILE:ttc>
-            ${CMAKE_SOURCE_DIR}/tests/lra_redundant.smt2
+            ${VOLUME_TEST_DIR}/lra_redundant.smt2
             --expected-polytopes 3
-            --expected-rows 3
-            --expected-volumes 100 40 0
-            --expected-deleted 0 44 0
+            --expected-rows 2
+            --expected-volumes 100 40
             --volume-tolerance 60
             --final-range 70 140)
+
+    set(NRA_VOLUME_TEST_SCRIPT ${VOLUME_TEST_DIR}/test_nra_volume.py)
+    add_test(
+        NAME nra_volume_positive_1d
+        COMMAND ${Python3_EXECUTABLE} ${NRA_VOLUME_TEST_SCRIPT}
+                $<TARGET_FILE:ttc> ${VOLUME_TEST_DIR}/nra_positive_1d.smt2
+                --expected-volume 0.9 --expected-components 1
+                --max-enclosure-width 0.01)
+    add_test(
+        NAME nra_volume_positive_2d
+        COMMAND ${Python3_EXECUTABLE} ${NRA_VOLUME_TEST_SCRIPT}
+                $<TARGET_FILE:ttc> ${VOLUME_TEST_DIR}/nra_positive_2d.smt2
+                --expected-volume 0.81 --expected-components 1
+                --max-enclosure-width 0.01)
+    add_test(
+        NAME nra_volume_unit_disk
+        COMMAND ${Python3_EXECUTABLE} ${NRA_VOLUME_TEST_SCRIPT}
+                $<TARGET_FILE:ttc> ${VOLUME_TEST_DIR}/nra_unit_disk.smt2
+                --expected-volume 3.141592653589793
+                --expected-components 1 --max-enclosure-width 0.08)
+    add_test(
+        NAME nra_volume_two_components
+        COMMAND ${Python3_EXECUTABLE} ${NRA_VOLUME_TEST_SCRIPT}
+                $<TARGET_FILE:ttc> ${VOLUME_TEST_DIR}/nra_two_disks.smt2
+                --expected-volume 1.5707963267948966
+                --expected-components 2 --max-enclosure-width 0.08)
+    add_test(
+        NAME nra_volume_punctured_interval
+        COMMAND ${Python3_EXECUTABLE} ${NRA_VOLUME_TEST_SCRIPT}
+                $<TARGET_FILE:ttc> ${VOLUME_TEST_DIR}/nra_punctured_interval.smt2
+                --expected-volume 4 --expected-components 3
+                --max-enclosure-width 0.000001)
+    add_test(
+        NAME nra_volume_zero_dimensional_component
+        COMMAND ${Python3_EXECUTABLE} ${NRA_VOLUME_TEST_SCRIPT}
+                $<TARGET_FILE:ttc>
+                ${VOLUME_TEST_DIR}/nra_zero_dim_component.smt2
+                --expected-volume 0.5 --expected-components 2
+                --max-enclosure-width 0.000001)
 endif()

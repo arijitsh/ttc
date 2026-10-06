@@ -50,6 +50,7 @@ enum class GmpMode
 // the volesti default" (volume: 10 + dim/10, sampling: 10).
 struct VolumeOptions
 {
+  std::uint64_t seed = 123;   // shared RNG seed for union bookkeeping/sampling
   int volumeWalkLength = -1;  // --walklen-vol N
   int sampleWalkLength = -1;  // --walklen-samp N
   bool cddSimplify = true;    // cleared by --no-cdd-simp
@@ -66,4 +67,3 @@ VolumeComputationResult computeLraVolume(
     const std::function<void(const VolumeComputationRow&)>& onRow = {});
 
 }  // namespace ttc
-

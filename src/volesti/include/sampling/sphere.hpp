@@ -12,6 +12,11 @@
 #ifndef SAMPLERS_SPHERE_HPP
 #define SAMPLERS_SPHERE_HPP
 
+#include <cmath>
+#include <iostream>
+
+#include <Eigen/Core>
+
 #include "convex_bodies/correlation_matrices/corre_matrix.hpp"
 
 template <typename Point>
@@ -61,13 +66,12 @@ struct GetDirection<CorreMatrix<NT>>
                               bool normalize=true)
     {
         typedef Eigen::Matrix<NT, Eigen::Dynamic, Eigen::Dynamic>   MT;
-        typedef Eigen::Matrix<NT, Eigen::Dynamic, 1>                VT;
 
         unsigned int n = std::ceil(std::sqrt(2*dim));
         MT mat = MT::Zero(n,n);
         NT normal = NT(0), coeff;
 
-        int i, j;
+        unsigned int i, j;
 
         if(normalize)
         {

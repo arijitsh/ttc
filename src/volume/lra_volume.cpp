@@ -633,7 +633,8 @@ struct PolytopeVolume
 
 // Phase 2: streaming union-volume (Karp-Luby style) estimation, templated on the
 // coordinate type used to store the surviving sample set `X`.  `p` is the
-// running sampling probability; the union volume is estimated as |X| / p.
+// Poisson-process intensity (it is not a probability and may exceed one); the
+// union volume is estimated as |X| / p.
 // `generate(A, b, n, samplingTime)` draws `n` fresh points inside {x : A x <= b}
 // (the only step that differs between the double and GMP walk backends).
 template <typename Coord, typename GenFn>
@@ -645,7 +646,16 @@ void runUnionAlgorithm(const std::vector<PolytopeVolume>& kept, double thresh,
   std::mt19937 auxRng(seed);  // drives Poisson draws and down-sampling
   SampleStore<Coord> store(1e-6);
 
-  double p = 1.0;
+  double maxVolume = 0.0;
+  for (const auto& entry : kept)
+  {
+    maxVolume = std::max(maxVolume, entry.volume);
+  }
+  // Start at a scale appropriate for the bodies.  The old hard-coded p=1
+  // reduced every sub-unit-volume result to a Pois(volume) integer with huge
+  // variance.  Half the budget leaves room for the surviving samples from
+  // earlier bodies before the normal down-sampling loop is needed.
+  double p = maxVolume > 0.0 ? (0.5 * thresh / maxVolume) : 1.0;
   std::size_t rowIndex = 0;
   std::size_t totalGenerated = 0;
   std::size_t totalDeleted = 0;
@@ -769,7 +779,6 @@ VolumeComputationResult computeLraVolume(
   // (src/cube_processor_nondis.py + src/global_storage.py).
   constexpr double kEpsilon = 0.8;
   constexpr double kDelta = 0.2;
-  constexpr unsigned kSeed = 123;
   const double mvcEps = kEpsilon / 2.0;
   const double numCubes = static_cast<double>(polytopes.size());
   const double thresh = std::max(
@@ -856,7 +865,27 @@ VolumeComputationResult computeLraVolume(
     MpFloat::default_precision(static_cast<unsigned>(precision));
   }
 
+  // A one-body union has no overlap to estimate.  Returning the already
+  // computed VolEsti estimate avoids adding an unnecessary Poisson layer (and
+  // fixes the former quantization of volumes below one).
+  if (kept.size() == 1)
+  {
+    VolumeComputationRow row;
+    row.index = 1;
+    row.volume = kept.front().volume;
+    result.rows.push_back(row);
+    result.volumeEstimate = kept.front().volume;
+    result.volumeComputationTime = totalVolumeTime;
+    if (onRow)
+    {
+      onRow(row);
+    }
+    return result;
+  }
+
   SampleRNG sampleRng(static_cast<int>(dimension));
+  sampleRng.set_seed(static_cast<unsigned>(options.seed));
+  std::uint64_t generatedBodyCount = 0;
 
   // Generator: run volesti's billiard walk in double inside {x : A x <= b} and
   // return the raw double points.  Shared by --nogmp and the default GMP path
@@ -868,7 +897,6 @@ VolumeComputationResult computeLraVolume(
     Point start = hpoly.ComputeInnerBall().first;
     PushBackWalkPolicy policy;
     std::list<Point> samples;
-    sampleRng.set_seed(kSeed);
     double samplingStart = Log.elapsed();
     RandomPointGenerator<SampleWalk>::apply(hpoly, start,
                                             static_cast<unsigned>(n),
@@ -887,7 +915,9 @@ VolumeComputationResult computeLraVolume(
   switch (options.gmpMode)
   {
     case GmpMode::None:
-      runUnionAlgorithm<double>(kept, thresh, kSeed, generateDouble, result,
+      runUnionAlgorithm<double>(kept, thresh,
+                                static_cast<unsigned>(options.seed),
+                                generateDouble, result,
                                 onRow);
       break;
     case GmpMode::PointRepr:
@@ -905,7 +935,9 @@ VolumeComputationResult computeLraVolume(
             }
             return out;
           };
-      runUnionAlgorithm<MpFloat>(kept, thresh, kSeed, generate, result, onRow);
+      runUnionAlgorithm<MpFloat>(kept, thresh,
+                                 static_cast<unsigned>(options.seed), generate,
+                                 result, onRow);
       break;
     }
     case GmpMode::Full:
@@ -920,12 +952,16 @@ VolumeComputationResult computeLraVolume(
             Eigen::VectorXd center = ball.first.getCoefficients();
             double radius = ball.second;
             double samplingStart = Log.elapsed();
+            const unsigned bodySeed = static_cast<unsigned>(
+                options.seed + 0x9e3779b97f4a7c15ULL * generatedBodyCount++);
             auto pts = sampleGmpBilliard(A, b, center, radius, n,
-                                         sampleWalkLength, kSeed);
+                                         sampleWalkLength, bodySeed);
             samplingTime = Log.elapsed() - samplingStart;
             return pts;
           };
-      runUnionAlgorithm<MpFloat>(kept, thresh, kSeed, generate, result, onRow);
+      runUnionAlgorithm<MpFloat>(kept, thresh,
+                                 static_cast<unsigned>(options.seed), generate,
+                                 result, onRow);
       break;
     }
   }
@@ -935,4 +971,3 @@ VolumeComputationResult computeLraVolume(
 }
 
 }  // namespace ttc
-

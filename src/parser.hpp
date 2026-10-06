@@ -48,6 +48,7 @@ public:
     void computePolytopes();
     const std::vector<ttc::Polytope>& polytopes() const { return d_polytopes; }
     std::vector<cvc5::Term> realVariables() const;
+    std::vector<cvc5::Term> volumeRealVariables() const;
 
     // Accessors for variable counts.
     std::size_t numBoolVars() const { return d_boolVars.size(); }
@@ -97,6 +98,10 @@ public:
         return d_declaredVars;
     }
     const cvc5::Term& formula() const { return d_formula; }
+    // Conjunction of user assertions with zero-arity define-fun symbols
+    // expanded. Unlike formula(), asserted equalities are not used as general
+    // substitutions when constructing this term.
+    const cvc5::Term& volumeFormula() const { return d_volumeFormula; }
 
     // If all variables are Boolean or bit-vector, check satisfiability with STP.
     // Returns std::nullopt if STP is unavailable or other sorts are present.
@@ -112,7 +117,12 @@ private:
     cvc5::parser::InputParser* d_parser;
 
     // Conjunction of all asserted formulas.
-     cvc5::Term d_formula;
+    cvc5::Term d_formula;
+
+    // Formula used for volume computation. This excludes the equality
+    // assertions generated for zero-arity define-fun commands and substitutes
+    // their right-hand sides into the actual user assertions instead.
+    cvc5::Term d_volumeFormula;
 
     // Individual assertions
     std::vector<cvc5::Term> d_assertions;

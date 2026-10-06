@@ -357,6 +357,35 @@ std::string termSymbol(const cvc5::Term& term)
   return term.hasSymbol() ? term.getSymbol() : term.toString();
 }
 
+bool getZeroArityDefinition(const cvc5::Term& assertion,
+                            cvc5::Term& symbol,
+                            cvc5::Term& value)
+{
+    if (assertion.getKind() != cvc5::Kind::EQUAL ||
+        assertion.getNumChildren() != 2)
+    {
+        return false;
+    }
+
+    const auto isNullarySymbol = [](const cvc5::Term& term) {
+        return term.getNumChildren() == 0 && term.hasSymbol() &&
+               !term.getSort().isFunction();
+    };
+    if (isNullarySymbol(assertion[0]))
+    {
+        symbol = assertion[0];
+        value = assertion[1];
+        return true;
+    }
+    if (isNullarySymbol(assertion[1]))
+    {
+        symbol = assertion[1];
+        value = assertion[0];
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 TTCParser::TTCParser()
@@ -364,6 +393,7 @@ TTCParser::TTCParser()
       d_solver(ttc::createSolverWithStorage<cvc5::Solver>(d_tm)),
       d_parser(nullptr),
       d_formula(),
+      d_volumeFormula(),
       d_projVars(),
       d_boolVars(),
       d_intVars(),
@@ -394,17 +424,72 @@ void TTCParser::parseFormula(const std::string &smtFormula) {
     d_parser = new cvc5::parser::InputParser(&d_solver);
     d_parser->setStreamInput(cvc5::modes::InputLanguage::SMT_LIB_2_6, iss, "input_stream");
 
+    std::vector<cvc5::Term> userAssertions;
+    std::vector<cvc5::Term> definitionAssertions;
     cvc5::parser::Command cmd;
     while (true) {
         cmd = d_parser->nextCommand();
         if (cmd.isNull()) {
             break;
         }
+        const std::string commandName = cmd.getCommandName();
+        const bool tracksAssertions =
+            commandName == "assert" || commandName == "define-fun";
+        const std::size_t oldAssertionCount =
+            tracksAssertions ? d_solver.getAssertions().size() : 0;
         std::stringstream out;
         cmd.invoke(&d_solver, d_parser->getSymbolManager(), out);
+        if (tracksAssertions)
+        {
+            const std::vector<cvc5::Term> currentAssertions =
+                d_solver.getAssertions();
+            if (currentAssertions.size() < oldAssertionCount)
+            {
+                throw std::runtime_error(
+                    "SMT command unexpectedly removed assertions");
+            }
+            for (std::size_t i = oldAssertionCount;
+                 i < currentAssertions.size();
+                 ++i)
+            {
+                if (commandName == "assert")
+                {
+                    continue;
+                }
+
+                cvc5::Term symbol;
+                cvc5::Term value;
+                if (getZeroArityDefinition(currentAssertions[i], symbol, value))
+                {
+                    definitionAssertions.push_back(currentAssertions[i]);
+                }
+            }
+        }
     }
     Log(3) << "Commands processed" << std::endl;
     auto assertions = d_solver.getAssertions();
+    // Reconstruct the active assertion view after all push/pop and
+    // reset-assertions commands.  Recording assert deltas directly would keep
+    // assertions that were subsequently popped.
+    std::unordered_set<cvc5::Term> definitionSet(definitionAssertions.begin(),
+                                                  definitionAssertions.end());
+    std::vector<cvc5::Term> activeDefinitions;
+    userAssertions.clear();
+    for (const cvc5::Term& assertion : assertions)
+    {
+        cvc5::Term symbol;
+        cvc5::Term value;
+        if (definitionSet.find(assertion) != definitionSet.end()
+            && getZeroArityDefinition(assertion, symbol, value))
+        {
+            activeDefinitions.push_back(assertion);
+        }
+        else
+        {
+            userAssertions.push_back(assertion);
+        }
+    }
+    definitionAssertions = std::move(activeDefinitions);
     d_assertions = assertions;
     d_declaredVars.clear();
     if (d_parser != nullptr)
@@ -414,6 +499,54 @@ void TTCParser::parseFormula(const std::string &smtFormula) {
         {
             d_declaredVars = sm->getDeclaredTerms();
         }
+    }
+    d_volumeFormula = cvc5::Term();
+    if (!userAssertions.empty())
+    {
+        std::vector<cvc5::Term> definitionSymbols;
+        std::vector<cvc5::Term> definitionValues;
+        definitionSymbols.reserve(definitionAssertions.size());
+        definitionValues.reserve(definitionAssertions.size());
+        for (const cvc5::Term& assertion : definitionAssertions)
+        {
+            cvc5::Term symbol;
+            cvc5::Term value;
+            if (!getZeroArityDefinition(assertion, symbol, value))
+            {
+                continue;
+            }
+            if (!definitionSymbols.empty())
+            {
+                value = value.substitute(definitionSymbols, definitionValues);
+            }
+            definitionSymbols.push_back(symbol);
+            definitionValues.push_back(value);
+        }
+
+        std::vector<cvc5::Term> volumeAssertions;
+        volumeAssertions.reserve(userAssertions.size());
+        for (const cvc5::Term& assertion : userAssertions)
+        {
+            volumeAssertions.push_back(
+                definitionSymbols.empty()
+                    ? assertion
+                    : assertion.substitute(definitionSymbols, definitionValues));
+        }
+
+        auto& tm = ttc::getTermBuilder(d_solver);
+        cvc5::Term rawVolumeFormula =
+            volumeAssertions.size() == 1
+                ? volumeAssertions[0]
+                : tm.mkTerm(cvc5::Kind::AND, volumeAssertions);
+        // Ordinary simplification is useful here, but applying substitutions
+        // learned from all asserted equalities would also eliminate genuine
+        // user variables. Only the explicit define-fun substitutions above are
+        // intended for the volume view.
+        d_volumeFormula = d_solver.simplify(rawVolumeFormula, false);
+    }
+    else if (assertions.empty())
+    {
+        d_volumeFormula = ttc::getTermBuilder(d_solver).mkBoolean(true);
     }
     d_projVars.clear();
     d_nonProjVars.clear();
@@ -822,6 +955,21 @@ std::vector<cvc5::Term> TTCParser::realVariables() const
         }
     }
     for (const auto& term : d_projVars)
+    {
+        if (term.getSort().isReal() && seen.insert(term).second)
+        {
+            vars.push_back(term);
+        }
+    }
+    return vars;
+}
+
+std::vector<cvc5::Term> TTCParser::volumeRealVariables() const
+{
+    std::unordered_set<cvc5::Term> seen;
+    std::vector<cvc5::Term> vars;
+    vars.reserve(d_declaredVars.size());
+    for (const cvc5::Term& term : d_declaredVars)
     {
         if (term.getSort().isReal() && seen.insert(term).second)
         {

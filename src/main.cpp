@@ -38,6 +38,7 @@
 #include "var_order.hpp"
 #endif
 #include "volume/lra_volume.hpp"
+#include "nravol/nra_volume.hpp"
 #include "tdd/tdd.hpp"
 
 namespace po = boost::program_options;
@@ -1051,7 +1052,7 @@ std::string ensureLogicIncludesBv(std::string input)
 // and the projection variables of the input:
 //   1. logic BV / UFBV                          -> eager bit-blast + ApproxMC
 //   2. other theories, BV/Bool projection vars  -> projection counting (--PB)
-//   3. QF_LRA with no projection variables       -> LRA volume computation
+//   3. QF_LRA/QF_NRA with no projection variables -> real volume computation
 //   4. otherwise                                 -> unsupported (reported)
 // ---------------------------------------------------------------------------
 
@@ -1146,7 +1147,7 @@ void printUnsupportedEngine(const std::string& logicUpper,
          "(eager bit-blast)\n"
       << "  2. other theories with BV/Bool projection   -> projection counting "
          "(--pact)\n"
-      << "  3. QF_LRA with no projection variables       -> LRA volume "
+      << "  3. QF_LRA/QF_NRA without projection variables -> real volume "
          "computation\n\n"
       << "This input matches none of these. Declare BV/Bool projection "
          "variables,\n"
@@ -1244,9 +1245,9 @@ int main(int argc, char *argv[]) {
        "measured faster here -- 'literal' accumulates every explored hash on "
        "the solver, which outweighs the saved rebuild.");
 
-  // Engine 3: pure QF_LRA with no projection variables -> LRA volume.
+  // Engine 3: pure QF_LRA/QF_NRA without projection variables -> volume.
   po::options_description classLra(
-      "Engine 3 -- LRA volume computation (auto: QF_LRA, no projection vars)");
+      "Engine 3 -- real volume computation (auto: QF_LRA/QF_NRA, no projection vars)");
   classLra.add_options()
       ("walklen-vol", po::value<int>(),
        "Random-walk length for the volesti volume estimator "
@@ -1266,7 +1267,30 @@ int main(int argc, char *argv[]) {
        "the point bookkeeping). Slower; mutually exclusive with --nogmp")
       ("precision", po::value<int>(),
        "Override the GMP sampling precision (decimal digits). Default: auto, "
-       "ceil(8*dim*sqrt(log(facets)))");
+       "ceil(8*dim*sqrt(log(facets)))")
+      ("nra-component-depth", po::value<int>(),
+       "Maximum dyadic-grid depth for NRA connected-component enumeration "
+       "(default 10)")
+      ("nra-min-component-depth", po::value<int>(),
+       "Initial dyadic-grid depth for NRA component enumeration (default 4)")
+      ("nra-max-cells", po::value<std::size_t>(),
+       "Maximum cells used by NRA component enumeration (default 2000000)")
+      ("nra-enclosure-relative", po::value<double>(),
+       "Target NRA certified-enclosure width as a fraction of the bounding "
+       "box volume (default 0.01)")
+      ("nra-volume-samples", po::value<std::size_t>(),
+       "IID samples in unresolved NRA boundary cells for the point estimate "
+       "and confidence interval (default 20000)")
+      ("nra-billiard-samples", po::value<std::size_t>(),
+       "Paper-style Billiard Walk samples generated in every connected NRA "
+       "component (default 64)")
+      ("nra-burn-in", po::value<int>(),
+       "Billiard Walk burn-in transitions per NRA component (default 100)")
+      ("nra-tau", po::value<double>(),
+       "Mean exponential NRA billiard trajectory length; default is the "
+       "bounding-box diagonal")
+      ("nra-max-reflections", po::value<int>(),
+       "Maximum reflections in one NRA trajectory; default is 10*dimension");
 
   // Engine 4: uninterpreted-function counting -> SkolemFC. Counts the number of
   // interpretations of an uninterpreted function that satisfy the formula by
@@ -2265,20 +2289,23 @@ int main(int argc, char *argv[]) {
     }
     else
     {
-      // Rule 3 candidate: pure LRA with no projection variables -> volume.
-      // Mirror the isLraInput detection used below; anything else (e.g. a
+      // Rule 3 candidate: pure LRA/NRA without projection variables -> volume.
+      // Mirror the real-volume detection used below; anything else (e.g. a
       // bare QF_LIA, or non-BV/Bool projection variables) is unsupported.
-      const bool lra =
-          (!autoLogic.empty() && autoLogic.find("LRA") != std::string::npos)
+      const bool realVolumeLogic =
+          (!autoLogic.empty()
+           && (autoLogic.find("LRA") != std::string::npos
+               || autoLogic.find("NRA") != std::string::npos))
           || (parser.numRealVars() > 0 && parser.numIntVars() == 0
               && parser.numBvVars() == 0);
-      const bool volumeOk = lra && pv.empty() && !parser.formula().isNull();
+      const bool volumeOk = realVolumeLogic && pv.empty()
+                            && !parser.volumeFormula().isNull();
       if (!volumeOk)
       {
         printUnsupportedEngine(autoLogic, parser.numProjVars());
         return 1;
       }
-      // else: leave useProjectionBoost false; the isLraInput path runs volume.
+      // else: leave useProjectionBoost false; the real-volume path runs.
     }
   }
 
@@ -2389,6 +2416,7 @@ int main(int argc, char *argv[]) {
   }
 
   bool isLraInput = false;
+  bool isNraInput = false;
   std::string logicName;
   try
   {
@@ -2401,7 +2429,15 @@ int main(int argc, char *argv[]) {
   std::string logicUpper = logicName;
   std::transform(logicUpper.begin(), logicUpper.end(), logicUpper.begin(),
                  [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
-  if (!logicUpper.empty() && logicUpper.find("LRA") != std::string::npos)
+  // get-info :logic is not consistently populated by every cvc5 parser path.
+  // The source declaration is authoritative for dispatch when present.
+  const std::string declaredLogicUpper = extractLogicUpper(filename);
+  if (declaredLogicUpper.find("NRA") != std::string::npos
+      || logicUpper.find("NRA") != std::string::npos)
+  {
+    isNraInput = true;
+  }
+  else if (!logicUpper.empty() && logicUpper.find("LRA") != std::string::npos)
   {
     isLraInput = true;
   }
@@ -2414,6 +2450,10 @@ int main(int argc, char *argv[]) {
   {
     isLraInput = false;
   }
+  if (isNraInput && parser.volumeFormula().isNull())
+  {
+    isNraInput = false;
+  }
   // Projection-based counting modes (--PB / --PE) count over the Boolean /
   // bit-vector support of the formula, not the LRA volume. Even for pure-LRA
   // logics they must run projected counting (pact) rather than fall into the
@@ -2421,6 +2461,171 @@ int main(int argc, char *argv[]) {
   if (useProjectionBoost || useProjectionEnumerate || useD4)
   {
     isLraInput = false;
+    isNraInput = false;
+  }
+  if (isNraInput)
+  {
+    try
+    {
+      ttc::nravol::NraVolumeOptions volumeOptions;
+      volumeOptions.seed = approxSeed;
+      if (vm.count("walklen-samp"))
+      {
+        const int value = vm["walklen-samp"].as<int>();
+        if (value < 1)
+          throw std::invalid_argument("--walklen-samp must be at least 1");
+        volumeOptions.walkLength = static_cast<unsigned>(value);
+      }
+      if (vm.count("nra-component-depth"))
+      {
+        const int value = vm["nra-component-depth"].as<int>();
+        if (value < 1 || value > 30)
+          throw std::invalid_argument(
+              "--nra-component-depth must be in [1,30]");
+        volumeOptions.componentMaxDepth = static_cast<unsigned>(value);
+      }
+      if (vm.count("nra-min-component-depth"))
+      {
+        const int value = vm["nra-min-component-depth"].as<int>();
+        if (value < 0 || value > 30)
+          throw std::invalid_argument(
+              "--nra-min-component-depth must be in [0,30]");
+        volumeOptions.componentMinDepth = static_cast<unsigned>(value);
+      }
+      if (volumeOptions.componentMinDepth > volumeOptions.componentMaxDepth)
+        throw std::invalid_argument(
+            "--nra-min-component-depth exceeds --nra-component-depth");
+      if (vm.count("nra-max-cells"))
+      {
+        volumeOptions.maxCells = vm["nra-max-cells"].as<std::size_t>();
+        if (volumeOptions.maxCells == 0)
+          throw std::invalid_argument("--nra-max-cells must be positive");
+      }
+      if (vm.count("nra-enclosure-relative"))
+      {
+        volumeOptions.relativeEnclosureWidth =
+            vm["nra-enclosure-relative"].as<double>();
+        if (!(volumeOptions.relativeEnclosureWidth > 0.0
+              && std::isfinite(volumeOptions.relativeEnclosureWidth)))
+          throw std::invalid_argument(
+              "--nra-enclosure-relative must be finite and positive");
+      }
+      if (vm.count("nra-volume-samples"))
+      {
+        volumeOptions.volumeSamples =
+            vm["nra-volume-samples"].as<std::size_t>();
+        if (volumeOptions.volumeSamples == 0)
+          throw std::invalid_argument("--nra-volume-samples must be positive");
+      }
+      if (vm.count("nra-billiard-samples"))
+      {
+        volumeOptions.billiardSamplesPerComponent =
+            vm["nra-billiard-samples"].as<std::size_t>();
+      }
+      if (vm.count("nra-burn-in"))
+      {
+        const int value = vm["nra-burn-in"].as<int>();
+        if (value < 0)
+          throw std::invalid_argument("--nra-burn-in must be non-negative");
+        volumeOptions.burnIn = static_cast<unsigned>(value);
+      }
+      if (vm.count("nra-tau"))
+      {
+        volumeOptions.trajectoryMean = vm["nra-tau"].as<double>();
+        if (!(volumeOptions.trajectoryMean > 0.0
+              && std::isfinite(volumeOptions.trajectoryMean)))
+          throw std::invalid_argument("--nra-tau must be finite and positive");
+      }
+      if (vm.count("nra-max-reflections"))
+      {
+        const int value = vm["nra-max-reflections"].as<int>();
+        if (value < 1)
+          throw std::invalid_argument(
+              "--nra-max-reflections must be at least 1");
+        volumeOptions.maxReflections = static_cast<unsigned>(value);
+      }
+
+      print_banner();
+      print_section("parsing input");
+      std::cout << "c reading SMT2 file from '" << filename << "'" << std::endl;
+      std::cout << "c parsed formula in " << std::fixed << std::setprecision(2)
+                << (parseEnd - parseStart) << " seconds\n" << "c" << std::endl;
+
+      const auto realVars = parser.volumeRealVariables();
+      print_section("options");
+      std::cout << "c counting: nra volume\n";
+      std::cout << "c detected pure NRA: yes\n";
+      std::cout << "c real variables: " << realVars.size() << "\n";
+      std::cout << "c component depth: " << volumeOptions.componentMinDepth
+                << ".." << volumeOptions.componentMaxDepth << "\n";
+      std::cout << "c component max cells: " << volumeOptions.maxCells << "\n";
+      std::cout << "c volume boundary samples: " << volumeOptions.volumeSamples
+                << "\n";
+      std::cout << "c billiard samples per component: "
+                << volumeOptions.billiardSamplesPerComponent << "\n";
+      std::cout << "c billiard walk length: " << volumeOptions.walkLength << "\n";
+      std::cout << "c" << std::endl;
+
+      print_section("NRA component and volume computation");
+      std::cout << "c component        volume       enclosure       cells "
+                   "unknown  billiard  self_loops  reflections\n";
+      auto rowPrinter = [](const ttc::nravol::NraComponentRow& row) {
+        std::cout << "c " << std::setw(9) << row.index << "  " << std::setw(12)
+                  << std::fixed << std::setprecision(6) << row.volumeEstimate
+                  << "  [" << row.lowerVolume << ", " << row.upperVolume
+                  << "]  " << row.insideCells << "  " << row.uncertainCells
+                  << "  " << row.billiardSamples << "  "
+                  << row.billiardSelfLoops << "  " << row.billiardReflections
+                  << std::endl;
+      };
+      const double volumeStart = Log.elapsed();
+      auto result = ttc::nravol::computeNraVolume(
+          parser.volumeFormula(), realVars, volumeOptions, rowPrinter);
+      const double volumeEnd = Log.elapsed();
+      Profile.addSearch(volumeEnd - volumeStart);
+      Profile.addPolytopeVolume(result.volumeComputationTime);
+      Profile.addSampling(result.samplingTime);
+
+      std::cout.unsetf(std::ios::floatfield);
+      std::cout << std::setprecision(12);
+      std::cout << "c connected components: " << result.connectedComponents
+                << "\n";
+      std::cout << "c connected component count grid-certified: "
+                << (result.componentCountCertified ? "yes" : "no") << "\n";
+      std::cout << "c full-dimensional components: "
+                << result.fullDimensionalComponents << "\n";
+      std::cout << "c component grid depth: " << result.componentDepth << "\n";
+      std::cout << "c confidence interval (95%): " << result.confidenceLower
+                << " " << result.confidenceUpper << "\n";
+      if (result.volumeEnclosureCertified)
+      {
+        std::cout << "c certified enclosure: " << result.certifiedLower << " "
+                  << result.certifiedUpper << "\n";
+      }
+      else
+      {
+        std::cout << "c volume enclosure (resolution-limited): "
+                  << result.certifiedLower << " " << result.certifiedUpper
+                  << "\n";
+      }
+      std::cout << "c" << std::endl;
+      print_section("result");
+      std::cout << "s volume " << result.volumeEstimate << "\n";
+      std::cout << "c" << std::endl;
+
+      const double totalTime = Log.elapsed();
+      Profile.print(totalTime);
+      print_resources(totalTime);
+      print_section("shutting down");
+      std::cout << "c exit 0" << std::endl;
+      return 0;
+    }
+    catch (const std::exception& ex)
+    {
+      std::cerr << "Error: NRA volume computation failed: " << ex.what()
+                << std::endl;
+      return 1;
+    }
   }
   if (isLraInput)
   {
@@ -2443,6 +2648,7 @@ int main(int argc, char *argv[]) {
       auto realVars = parser.realVariables();
 
       ttc::VolumeOptions volumeOptions;
+      volumeOptions.seed = approxSeed;
       if (vm.count("walklen-vol"))
       {
         int wl = vm["walklen-vol"].as<int>();
