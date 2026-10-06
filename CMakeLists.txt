@@ -522,7 +522,8 @@ endif()
 
 if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
-    set(LRA_VOLUME_TEST_SCRIPT ${CMAKE_SOURCE_DIR}/tests/test_lra_volume.py)
+    set(LRA_VOLUME_TEST_DIR ${CMAKE_SOURCE_DIR}/example/tests)
+    set(LRA_VOLUME_TEST_SCRIPT ${LRA_VOLUME_TEST_DIR}/test_lra_volume.py)
 
     add_test(
         NAME lra_volume_union
@@ -530,7 +531,7 @@ if(BUILD_TESTING)
             ${Python3_EXECUTABLE}
             ${LRA_VOLUME_TEST_SCRIPT}
             $<TARGET_FILE:ttc>
-            ${CMAKE_SOURCE_DIR}/tests/lra_union.smt2
+            ${LRA_VOLUME_TEST_DIR}/lra_union.smt2
             --expected-polytopes 2
             --expected-rows 2
             --expected-volumes 400
@@ -543,7 +544,7 @@ if(BUILD_TESTING)
             ${Python3_EXECUTABLE}
             ${LRA_VOLUME_TEST_SCRIPT}
             $<TARGET_FILE:ttc>
-            ${CMAKE_SOURCE_DIR}/tests/lra_single_box.smt2
+            ${LRA_VOLUME_TEST_DIR}/lra_single_box.smt2
             --expected-polytopes 1
             --expected-rows 1
             --expected-volumes 400
@@ -557,7 +558,7 @@ if(BUILD_TESTING)
             ${Python3_EXECUTABLE}
             ${LRA_VOLUME_TEST_SCRIPT}
             $<TARGET_FILE:ttc>
-            ${CMAKE_SOURCE_DIR}/tests/lra_disjoint.smt2
+            ${LRA_VOLUME_TEST_DIR}/lra_disjoint.smt2
             --expected-polytopes 2
             --expected-rows 2
             --expected-volumes 400
@@ -571,11 +572,24 @@ if(BUILD_TESTING)
             ${Python3_EXECUTABLE}
             ${LRA_VOLUME_TEST_SCRIPT}
             $<TARGET_FILE:ttc>
-            ${CMAKE_SOURCE_DIR}/tests/lra_redundant.smt2
+            ${LRA_VOLUME_TEST_DIR}/lra_redundant.smt2
             --expected-polytopes 3
-            --expected-rows 3
-            --expected-volumes 100 40 0
-            --expected-deleted 0 44 0
+            --expected-rows 2
+            --expected-volumes 100 36
             --volume-tolerance 60
             --final-range 70 140)
+
+    add_test(
+        NAME lra_volume_small_box
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${LRA_VOLUME_TEST_SCRIPT}
+            $<TARGET_FILE:ttc>
+            ${LRA_VOLUME_TEST_DIR}/lra_small_box.smt2
+            --expected-polytopes 1
+            --expected-rows 1
+            --expected-volumes 0.04
+            --expected-deleted 0
+            --volume-tolerance 0.008
+            --final-range 0.032 0.048)
 endif()

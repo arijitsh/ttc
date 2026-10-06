@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <limits>
 #include <list>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -15,13 +16,14 @@
 #include <vector>
 
 #include <Eigen/Dense>
+#include <lp_lib.h>
 
 #include <random>
 
 // GMP arbitrary-precision floats for the sampling / union bookkeeping. The
 // default (--gmp) path stores points and evaluates membership tests in mpf at a
-// precision derived from get_precision_from_cubes(); --fullgmp additionally runs
-// the walk itself (billiard or ball) in this type (see gmp_walks.hpp).
+// arithmetic precision derived from lattice precision b; --fullgmp additionally runs
+// the selected walk itself in this type (see gmp_walks.hpp).
 #include <boost/multiprecision/gmp.hpp>
 #include <boost/multiprecision/eigen.hpp>
 
@@ -642,26 +644,118 @@ class SampleStore
   std::vector<Vec> d_samples;
 };
 
-// Precision (decimal digits) for GMP sampling, following the Python prototype's
-// get_precision_from_cubes (src/cube_processor_nondis.py) scaled by the number
-// of polytopes in the union:
-//   precision = ceil(8 * dim * cubes * sqrt(log(facet)))
-// where `facet` is the polytope's facet count, `dim` the real dimension and
-// `cubes` the number of polytopes whose union is being measured.
-// (The Python caller passes a hard-coded dim=2; we use the true dimension, which
-// is the mathematically intended value.)  Clamped to >= 1.
-int precisionFromCubes(std::size_t dimension, long facetCount,
-                       std::size_t numCubes)
+// GetPrecision in the revised manuscript: eta = epsilon/96. Work in logs
+// so gamma/minRadius need not be representable as a double.
+int precisionFromCubes(std::size_t dimension, std::size_t facetCount,
+                       std::size_t numCubes, double minRadius, double epsilon)
 {
-  double facet = std::max<double>(facetCount, 2.0);
-  double cubes = std::max<double>(static_cast<double>(numCubes), 1.0);
-  double prec = std::ceil(8.0 * static_cast<double>(dimension) * cubes
-                          * std::sqrt(std::log(facet)));
-  if (!std::isfinite(prec) || prec < 1.0)
+  const double eta = epsilon / 96.0;
+  const double logGamma = std::log(64.0) + std::log(double(numCubes))
+      + std::log(double(dimension)) - std::log(eta)
+      + 0.5 * std::log(std::log(4.0) + std::log(double(facetCount)) - std::log(eta));
+  const double prec = std::max(0.0, std::ceil((logGamma - std::log(minRadius))
+                                           / std::log(10.0)));
+  if (!std::isfinite(prec) || prec > std::numeric_limits<int>::max() - 32)
   {
-    return 1;
+    throw std::runtime_error("lattice precision exceeds supported range");
   }
   return static_cast<int>(prec);
+}
+
+// Coordinate extrema bound P by a box, hence by a ball about center.
+// Like the existing inner-ball LP, these bounds use practical double arithmetic.
+double outerRadius(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
+                   const Eigen::VectorXd& center)
+{
+  const int dim = static_cast<int>(A.cols());
+  std::unique_ptr<lprec, decltype(&delete_lp)> lp(make_lp(0, dim), delete_lp);
+  if (!lp) throw std::runtime_error("outer-radius LP allocation failed");
+  set_verbose(lp.get(), CRITICAL);
+  for (int j = 1; j <= dim; ++j) set_unbounded(lp.get(), j);
+  std::vector<double> row(dim + 1, 0.0);
+  for (Eigen::Index i = 0; i < A.rows(); ++i)
+  {
+    for (int j = 0; j < dim; ++j) row[j + 1] = A(i, j);
+    if (!add_constraint(lp.get(), row.data(), LE, b(i)))
+      throw std::runtime_error("outer-radius LP constraint failed");
+  }
+  double radius = 0.0;
+  for (int j = 0; j < dim; ++j)
+  {
+    std::fill(row.begin(), row.end(), 0.0); row[j + 1] = 1.0;
+    if (!set_obj_fn(lp.get(), row.data()))
+      throw std::runtime_error("outer-radius LP objective failed");
+    set_maxim(lp.get());
+    if (solve(lp.get()) != OPTIMAL)
+      throw std::runtime_error("polytope is unbounded or outer-radius LP failed");
+    const double hi = get_objective(lp.get());
+    set_minim(lp.get());
+    if (solve(lp.get()) != OPTIMAL)
+      throw std::runtime_error("polytope is unbounded or outer-radius LP failed");
+    const double lo = get_objective(lp.get());
+    radius = std::hypot(radius, std::max(std::abs(lo - center(j)),
+                                        std::abs(hi - center(j))));
+  }
+  if (!std::isfinite(radius) || radius <= 0.0)
+    throw std::runtime_error("invalid polytope outer radius");
+  return radius;
+}
+
+// GenerateSamples: inflate facets, independently restart the selected walk,
+// stochastically round to 10^-b Z^n, and reject against the original body.
+// Walk length and Volesti convergence remain practical, uncertified oracles.
+template <typename Coord, typename GenFn>
+std::vector<Eigen::Matrix<Coord, Eigen::Dynamic, 1>> sampleLattice(
+    const Eigen::MatrixXd& A, const Eigen::VectorXd& b, long long n,
+    int precision, double epsilon, double delta, unsigned seed,
+    GenFn&& generate, double& samplingTime)
+{
+  using Vec = Eigen::Matrix<Coord, Eigen::Dynamic, 1>;
+  using std::floor;
+  using std::pow;
+  const Coord scale = pow(Coord(10), precision);
+  const double spacing = std::pow(10.0, -precision);
+  if (spacing == 0.0)
+    throw std::runtime_error("lattice spacing is below double geometry resolution");
+  const double kappa = std::sqrt(2.0 * std::log(16.0 / epsilon))
+                       + std::sqrt(2.0 * std::log(double(A.rows())));
+  Eigen::VectorXd inflated = b;
+  for (Eigen::Index i = 0; i < A.rows(); ++i)
+    inflated(i) += spacing * kappa * A.row(i).norm();
+  const auto Am = A.template cast<Coord>().eval();
+  const Vec bm = b.template cast<Coord>();
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<double> unit(0.0, 1.0);
+  std::vector<Vec> out;
+  out.reserve(static_cast<std::size_t>(n));
+  // Under the paper's oracle assumptions, rejection probability <= epsilon/3.
+  // Budget a failed sampling batch within delta; report failure, never fewer points.
+  const int maxBatches = std::max(1, static_cast<int>(std::ceil(
+      (std::log(delta) - std::log(double(std::max(1LL, n)))) / std::log(epsilon / 3.0))));
+  const double begun = Log.elapsed();
+  for (int batch = 0; out.size() < static_cast<std::size_t>(n); ++batch)
+  {
+    if (batch >= maxBatches)
+      throw std::runtime_error("lattice rejection sampler exceeded its retry budget");
+    double ignoredTime = 0.0;
+    auto points = generate(A, inflated, n - static_cast<long long>(out.size()), ignoredTime);
+    for (const auto& point : points)
+    {
+      Vec rounded(point.size());
+      for (Eigen::Index j = 0; j < point.size(); ++j)
+      {
+        const Coord raw = Coord(point(j)) * scale;
+        Coord base = floor(raw);
+        const Coord fraction = raw - base;
+        if (unit(rng) < static_cast<double>(fraction)) base += 1;
+        rounded(j) = base / scale;
+      }
+      if (((Am * rounded - bm).array() <= Coord(0)).all())
+        out.push_back(std::move(rounded));
+    }
+  }
+  samplingTime = Log.elapsed() - begun;
+  return out;
 }
 
 // A polytope kept after phase 1, with its (double) half-space matrices and the
@@ -675,19 +769,20 @@ struct PolytopeVolume
 
 // Phase 2: streaming union-volume (Karp-Luby style) estimation, templated on the
 // coordinate type used to store the surviving sample set `X`.  `p` is the
-// running sampling probability; the union volume is estimated as |X| / p.
+// running sampling probability; the union volume is |X| / (p*C), C=T*10^(b*n).
 // `generate(A, b, n, samplingTime)` draws `n` fresh points inside {x : A x <= b}
 // (the only step that differs between the double and GMP walk backends).
 template <typename Coord, typename GenFn>
 void runUnionAlgorithm(const std::vector<PolytopeVolume>& kept, double thresh,
-                       unsigned seed, GenFn&& generate,
+                       unsigned seed, double log2Scale, GenFn&& generate,
                        VolumeComputationResult& result,
                        const std::function<void(const VolumeComputationRow&)>& onRow)
 {
   std::mt19937 auxRng(seed);  // drives Poisson draws and down-sampling
-  SampleStore<Coord> store(1e-6);
+  SampleStore<Coord> store(0.0);
 
-  double p = 1.0;
+  // Track log2(p*C), avoiding overflow of C and underflow of p.
+  double log2Density = log2Scale;
   std::size_t rowIndex = 0;
   std::size_t totalGenerated = 0;
   std::size_t totalDeleted = 0;
@@ -700,22 +795,21 @@ void runUnionAlgorithm(const std::vector<PolytopeVolume>& kept, double thresh,
     // Drop stored points that lie inside the current polytope.
     std::size_t deleted = store.removeInside(entry.A, entry.b);
 
-    // Shrink the sampling probability so that p*volume stays within thresh.
-    while (p * volume > thresh)
+    // Shrink the sampling probability until p*C*volume < thresh.
+    while (log2Density + std::log2(volume) >= std::log2(thresh))
     {
       store.downsampleHalf(auxRng);
-      p /= 2.0;
+      log2Density -= 1.0;
     }
 
     // Draw the number of fresh samples; keep |X| + N within the threshold.
-    std::poisson_distribution<long long> poisson(p * volume);
+    std::poisson_distribution<long long> poisson(std::exp2(log2Density + std::log2(volume)));
     long long n = poisson(auxRng);
     while (static_cast<double>(n) + static_cast<double>(store.size()) > thresh)
     {
       store.downsampleHalf(auxRng);
-      p /= 2.0;
-      poisson = std::poisson_distribution<long long>(p * volume);
-      n = poisson(auxRng);
+      log2Density -= 1.0;
+      n = std::binomial_distribution<long long>(n, 0.5)(auxRng);
     }
 
     std::size_t sampleCount = 0;
@@ -748,7 +842,7 @@ void runUnionAlgorithm(const std::vector<PolytopeVolume>& kept, double thresh,
 
   result.finalSampleCount = store.size();
   result.volumeEstimate =
-      (p > 0.0) ? static_cast<double>(store.size()) / p : 0.0;
+      store.size() ? std::exp2(std::log2(double(store.size())) - log2Density) : 0.0;
   result.totalSamplesGenerated = totalGenerated;
   result.totalSamplesDeleted = totalDeleted;
   result.samplingTime = totalSamplingTime;
@@ -783,6 +877,11 @@ VolumeComputationResult computeLraVolume(
     const std::function<void(const VolumeComputationRow&)>& onRow)
 {
   VolumeComputationResult result;
+  if (!std::isfinite(options.epsilon) || options.epsilon <= 0.0 || options.epsilon > 1.0
+      || !std::isfinite(options.delta) || options.delta <= 0.0 || options.delta >= 1.0)
+    throw std::invalid_argument("LRA volume requires 0 < epsilon <= 1 and 0 < delta < 1");
+  if (options.sampleWalkLength == 0 || options.volumeWalkLength == 0 || options.precision < 0)
+    throw std::invalid_argument("volume walk lengths and arithmetic precision must be positive or automatic");
   auto uniqueVars = deduplicateRealVariables(realVariables);
   if (uniqueVars.empty())
   {
@@ -813,10 +912,9 @@ VolumeComputationResult computeLraVolume(
   using RdhrW = RDHRWalk::template Walk<HPolytope, SampleRNG>;
   using CdhrW = CDHRWalk::template Walk<HPolytope, SampleRNG>;
 
-  // Algorithm parameters; defaults taken from the reference Python prototype
-  // (src/cube_processor_nondis.py + src/global_storage.py).
-  constexpr double kEpsilon = 0.8;
-  constexpr double kDelta = 0.2;
+  // Algorithm 1 in the revised manuscript.
+  const double kEpsilon = options.epsilon;
+  const double kDelta = options.delta;
   const unsigned kSeed = options.seed;
   // Per-polytope sampling streams.  `generate` is invoked once per polytope by
   // runUnionAlgorithm, and each invocation seeds its walk from scratch, so a
@@ -831,11 +929,15 @@ VolumeComputationResult computeLraVolume(
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
     return static_cast<unsigned>(z ^ (z >> 31));
   };
-  const double mvcEps = kEpsilon / 2.0;
+  const double mvcEps = kEpsilon / 12.0;
   const double numCubes = static_cast<double>(polytopes.size());
+  const double oracleDelta = kDelta / (4.0 * std::max(1.0, numCubes));
   const double thresh = std::max(
-      12.0 * std::log(24.0 / kDelta) / (mvcEps * mvcEps),
-      6.0 * (std::log(6.0 / kDelta) + std::log(std::max(1.0, numCubes))));
+      24.0 * (std::log(24.0) - std::log(kDelta)) / ((1.0 - mvcEps) * mvcEps * mvcEps),
+      15.0 * (std::log(6.0) - std::log(kDelta) + std::log(std::max(1.0, numCubes))));
+  if (!std::isfinite(thresh) || thresh >= double(std::numeric_limits<long long>::max() / 2)
+      || oracleDelta <= 0.0)
+    throw std::invalid_argument("epsilon/delta require an unsupported sample threshold");
 
   // The volesti `volume` tool uses walk length 10 + dim/10; the `sample` tool
   // uses a fixed walk length of 10. Both are overridable via --walklen-vol /
@@ -850,6 +952,9 @@ VolumeComputationResult computeLraVolume(
           : 10;
 
   Log(2) << "Starting union algorithm, threshold: " << thresh << std::endl;
+  // Volesti's practical cooling API accepts epsilon but no confidence delta.
+  Log(2) << "Per-polytope oracle targets: epsilon=" << mvcEps
+         << ", delta=" << oracleDelta << " (practical Volesti oracle)" << std::endl;
 
   // Phase 1: build the half-space matrices and compute every volume up front,
   // dropping polytopes whose (full-dimensional) volume is zero.
@@ -858,7 +963,8 @@ VolumeComputationResult computeLraVolume(
 
   std::size_t numZeroVolume = 0;
   double totalVolumeTime = 0.0;
-  long maxRawFacets = 0;  // for the GMP sampling precision (get_precision_from_cubes)
+  std::size_t facetTotal = 0;
+  double minRadius = std::numeric_limits<double>::infinity();
   std::size_t dumpIndex = 0;  // running counter for --dump-ine file names
   for (const auto& poly : polytopes)
   {
@@ -868,11 +974,12 @@ VolumeComputationResult computeLraVolume(
       ++numZeroVolume;
       continue;
     }
+    if (!matrices.A.allFinite() || !matrices.b.allFinite())
+      throw std::runtime_error("polytope coefficients exceed double geometry range");
     // Canonicalize (remove redundant constraints, detect equalities) with
     // cddlib, exactly as the Python prototype does before volume/sampling.
     // --no-cdd-simp skips this and feeds volesti the raw half-spaces.
     long rawFacets = matrices.A.rows();
-    maxRawFacets = std::max(maxRawFacets, rawFacets);
     if (options.cddSimplify && !canonicalizePolytope(matrices.A, matrices.b))
     {
       ++numZeroVolume;
@@ -886,24 +993,34 @@ VolumeComputationResult computeLraVolume(
       Log(1) << "wrote polytope to " << path << std::endl;
     }
     HPolytope hpoly(static_cast<unsigned>(dimension), matrices.A, matrices.b);
-    if (hpoly.ComputeInnerBall().second <= 0.0)
+    const auto innerBall = hpoly.ComputeInnerBall();
+    if (innerBall.second <= 0.0)
     {
       ++numZeroVolume;
       continue;
     }
+    if (!std::isfinite(innerBall.second))
+      throw std::runtime_error("polytope has no finite inner radius");
+    const double radius = outerRadius(matrices.A, matrices.b, innerBall.first.getCoefficients());
     double volumeComputeStart = Log.elapsed();
     double volume = volume_cooling_gaussians<GaussianBallWalk, VolumeRNG>(
-        hpoly, 0.1, volumeWalkLength);
+        hpoly, mvcEps, volumeWalkLength);
     double volumeComputeElapsed = Log.elapsed() - volumeComputeStart;
     totalVolumeTime += volumeComputeElapsed;
     Log(2) << "polytope volume " << volume << " (" << matrices.A.rows()
            << " facets, was " << rawFacets << ", dim " << dimension << ") in "
            << volumeComputeElapsed << "s" << std::endl;
     if (!std::isfinite(volume) || volume <= 0.0)
-    {
-      ++numZeroVolume;
-      continue;
-    }
+      throw std::runtime_error("volume oracle failed on a positive-dimensional polytope");
+    const double lower = (1.0 - mvcEps) * std::pow(2.0 * innerBall.second / std::sqrt(double(dimension)), double(dimension));
+    const double upper = (1.0 + mvcEps) * std::pow(2.0 * radius, double(dimension));
+    if (std::isnan(lower) || std::isnan(upper) || lower > upper)
+      throw std::runtime_error("invalid polytope volume clipping bounds");
+    volume = std::clamp(volume, lower, upper);
+    if (!std::isfinite(volume) || volume <= 0.0)
+      throw std::runtime_error("clipped polytope volume exceeds double range");
+    minRadius = std::min(minRadius, innerBall.second);
+    facetTotal += static_cast<std::size_t>(matrices.A.rows());
     kept.push_back({std::move(matrices.A), std::move(matrices.b), volume});
   }
 
@@ -913,57 +1030,58 @@ VolumeComputationResult computeLraVolume(
            << polytopes.size() << " where volume is zero" << std::endl;
   }
 
-  // Phase 2: streaming union-volume (Karp-Luby style) estimation.  The sample
-  // bookkeeping uses double (--nogmp) or GMP (default / --fullgmp); the GMP
-  // precision follows get_precision_from_cubes (overridable via --precision).
-  int precision = options.precision > 0
-                      ? options.precision
-                      : precisionFromCubes(dimension, maxRawFacets,
-                                           polytopes.size());
-  result.samplingPrecision = precision;
+  result.volumeComputationTime = totalVolumeTime;
+  if (kept.empty()) return result;
+  // Lattice spacing and GMP arithmetic precision are distinct quantities.
+  const int precision = precisionFromCubes(dimension, facetTotal, polytopes.size(),
+                                          minRadius, kEpsilon);
+  result.latticePrecision = precision;
+  const double log2Scale = std::log2(thresh) + double(precision) * double(dimension) * std::log2(10.0);
   if (options.gmpMode != GmpMode::None)
   {
-    MpFloat::default_precision(static_cast<unsigned>(precision));
+    result.samplingPrecision = std::max(options.precision, precision + 32);
+    MpFloat::default_precision(static_cast<unsigned>(result.samplingPrecision));
   }
 
   SampleRNG sampleRng(static_cast<int>(dimension));
 
-  // Generator: run volesti's billiard walk in double inside {x : A x <= b} and
-  // return the raw double points.  Shared by --nogmp and the default GMP path
-  // (which only differ in how the points are *stored*).
+  // Restart the selected walk at one fixed center before every proposal.
   auto generateDouble =
       [&](const Eigen::MatrixXd& A, const Eigen::VectorXd& b, long long n,
           double& samplingTime) -> std::vector<Eigen::VectorXd> {
     HPolytope hpoly(static_cast<unsigned>(dimension), A, b);
-    Point start = hpoly.ComputeInnerBall().first;
+    const Point center = hpoly.ComputeInnerBall().first;
     PushBackWalkPolicy policy;
     std::list<Point> samples;
     sampleRng.set_seed(streamSeed());
     double samplingStart = Log.elapsed();
-    const unsigned nPts = static_cast<unsigned>(n);
-    switch (options.samplerWalk)
+    for (long long i = 0; i < n; ++i)
     {
-      case SamplerWalk::AcceleratedBilliard:
-        RandomPointGenerator<AccelBilliardW>::apply(
-            hpoly, start, nPts, sampleWalkLength, samples, policy, sampleRng);
-        break;
-      case SamplerWalk::Ball:
-        RandomPointGenerator<BallW>::apply(
-            hpoly, start, nPts, sampleWalkLength, samples, policy, sampleRng);
-        break;
-      case SamplerWalk::RDHR:
-        RandomPointGenerator<RdhrW>::apply(
-            hpoly, start, nPts, sampleWalkLength, samples, policy, sampleRng);
-        break;
-      case SamplerWalk::CDHR:
-        RandomPointGenerator<CdhrW>::apply(
-            hpoly, start, nPts, sampleWalkLength, samples, policy, sampleRng);
-        break;
-      case SamplerWalk::Billiard:
-      default:
-        RandomPointGenerator<BilliardW>::apply(
-            hpoly, start, nPts, sampleWalkLength, samples, policy, sampleRng);
-        break;
+      Point start = center;
+      switch (options.samplerWalk)
+      {
+        case SamplerWalk::AcceleratedBilliard:
+          RandomPointGenerator<AccelBilliardW>::apply(
+              hpoly, start, 1, sampleWalkLength, samples, policy, sampleRng);
+          break;
+        case SamplerWalk::Ball:
+          RandomPointGenerator<BallW>::apply(
+              hpoly, start, 1, sampleWalkLength, samples, policy, sampleRng);
+          break;
+        case SamplerWalk::RDHR:
+          RandomPointGenerator<RdhrW>::apply(
+              hpoly, start, 1, sampleWalkLength, samples, policy, sampleRng);
+          break;
+        case SamplerWalk::CDHR:
+          RandomPointGenerator<CdhrW>::apply(
+              hpoly, start, 1, sampleWalkLength, samples, policy, sampleRng);
+          break;
+        case SamplerWalk::Billiard:
+        default:
+          RandomPointGenerator<BilliardW>::apply(
+              hpoly, start, 1, sampleWalkLength, samples, policy, sampleRng);
+          break;
+      }
     }
     samplingTime = Log.elapsed() - samplingStart;
     std::vector<Eigen::VectorXd> out;
@@ -986,25 +1104,26 @@ VolumeComputationResult computeLraVolume(
   switch (options.gmpMode)
   {
     case GmpMode::None:
-      runUnionAlgorithm<double>(kept, thresh, kSeed, generateDouble, result,
+    {
+      auto generate = [&](const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
+                          long long n, double& time) {
+        return sampleLattice<double>(A, b, n, precision, mvcEps, oracleDelta,
+                                     streamSeed(), generateDouble, time);
+      };
+      runUnionAlgorithm<double>(kept, thresh, kSeed, log2Scale, generate, result,
                                 onRow);
       break;
+    }
     case GmpMode::PointRepr:
     {
-      // Double walk, but store / test the points in GMP at `precision` digits.
+      // Double proposals, with lattice rounding and membership in GMP.
       auto generate =
           [&](const Eigen::MatrixXd& A, const Eigen::VectorXd& b, long long n,
               double& samplingTime) {
-            auto dpts = generateDouble(A, b, n, samplingTime);
-            std::vector<Eigen::Matrix<MpFloat, Eigen::Dynamic, 1>> out;
-            out.reserve(dpts.size());
-            for (const auto& v : dpts)
-            {
-              out.push_back(v.cast<MpFloat>());
-            }
-            return out;
+            return sampleLattice<MpFloat>(A, b, n, precision, mvcEps, oracleDelta,
+                                          streamSeed(), generateDouble, samplingTime);
           };
-      runUnionAlgorithm<MpFloat>(kept, thresh, kSeed, generate, result, onRow);
+      runUnionAlgorithm<MpFloat>(kept, thresh, kSeed, log2Scale, generate, result, onRow);
       break;
     }
     case GmpMode::Full:
@@ -1030,27 +1149,32 @@ VolumeComputationResult computeLraVolume(
             {
               case SamplerWalk::Ball:
                 pts = sampleGmpBallWalk(A, b, center, radius, n,
-                                        sampleWalkLength, walkSeed);
+                                        sampleWalkLength, walkSeed, true);
                 break;
               case SamplerWalk::RDHR:
                 pts = sampleGmpRDHR(A, b, center, radius, n, sampleWalkLength,
-                                    walkSeed);
+                                    walkSeed, true);
                 break;
               case SamplerWalk::CDHR:
                 pts = sampleGmpCDHR(A, b, center, radius, n, sampleWalkLength,
-                                    walkSeed);
+                                    walkSeed, true);
                 break;
               case SamplerWalk::AcceleratedBilliard:
               case SamplerWalk::Billiard:
               default:
                 pts = sampleGmpBilliard(A, b, center, radius, n,
-                                        sampleWalkLength, walkSeed);
+                                        sampleWalkLength, walkSeed, true);
                 break;
             }
             samplingTime = Log.elapsed() - samplingStart;
             return pts;
           };
-      runUnionAlgorithm<MpFloat>(kept, thresh, kSeed, generate, result, onRow);
+      auto latticeGenerate = [&](const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
+                                 long long n, double& time) {
+        return sampleLattice<MpFloat>(A, b, n, precision, mvcEps, oracleDelta,
+                                      streamSeed(), generate, time);
+      };
+      runUnionAlgorithm<MpFloat>(kept, thresh, kSeed, log2Scale, latticeGenerate, result, onRow);
       break;
     }
   }

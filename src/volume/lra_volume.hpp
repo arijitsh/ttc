@@ -31,15 +31,16 @@ struct VolumeComputationResult
   double volumeComputationTime = 0.0;
   double samplingTime = 0.0;
   int samplingPrecision = 0;  // GMP decimal digits used for sample bookkeeping
+  int latticePrecision = 0;   // b: lattice spacing is 10^-b
 };
 
 // Arithmetic backend for the sampling / union-volume bookkeeping.
-//   PointRepr (default): the billiard walk runs in double, but sampled points
+//   PointRepr (default): the selected walk runs in double, but sampled points
 //     are stored and the membership tests (A x <= b) are evaluated in GMP
 //     (boost mpf_float) at `samplingPrecision` decimal digits.
-//   None (--nogmp):      the original all-double path (no GMP, no truncation).
-//   Full (--fullgmp):    the billiard walk itself runs in GMP at the target
-//     precision (patched volesti), then points are stored in GMP.
+//   None (--nogmp):      walk, lattice points and membership tests in double.
+//   Full (--fullgmp):    the selected walk runs in GMP at the target precision,
+//     then lattice points are stored in GMP.
 enum class GmpMode
 {
   PointRepr,
@@ -54,8 +55,7 @@ enum class GmpMode
 //   AcceleratedBilliard:   uniform_accelerated_billiard_walk.hpp.
 //   Ball:                  uniform_ball_walk.hpp -- classic ball walk.
 //   RDHR / CDHR:           random- / coordinate-directions hit-and-run.
-// Note: --fullgmp only implements the billiard walk; other choices fall back to
-// the billiard walk (with a warning) under --fullgmp.
+// Under --fullgmp, accelerated billiard falls back to GMP billiard.
 enum class SamplerWalk
 {
   Billiard,
@@ -81,13 +81,15 @@ struct VolumeOptions
   unsigned seed = 123;  // --seed N
   SamplerWalk samplerWalk = SamplerWalk::Billiard;  // --sampler
   GmpMode gmpMode = GmpMode::PointRepr;
-  // GMP precision (decimal digits) for sampling. 0 => auto, derived from the
-  // polytopes via get_precision_from_cubes (src/cube_processor_nondis.py).
+  // Minimum GMP arithmetic precision, separate from lattice precision b.
+  // 0 => auto (b + 32 decimal digits).
   int precision = 0;  // --precision N
   // If non-empty, write each canonicalized polytope to
   // <dumpInePrefix>_cubeN.ine in the cdd/Avis-Fukuda H-representation format
   // (readable by external volume tools such as vinci / lrs). --dump-ine PREFIX.
   std::string dumpInePrefix;
+  double epsilon = 0.8;  // --epsilon, 0 < epsilon <= 1
+  double delta = 0.2;    // --delta, 0 < delta < 1
 };
 
 VolumeComputationResult computeLraVolume(
@@ -97,4 +99,3 @@ VolumeComputationResult computeLraVolume(
     const std::function<void(const VolumeComputationRow&)>& onRow = {});
 
 }  // namespace ttc
-

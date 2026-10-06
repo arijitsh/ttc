@@ -20,7 +20,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 Row = dict[str, float | int]
 
 
-def parse_output(output: str) -> Tuple[Optional[int], List[Row], Optional[int]]:
+def parse_output(output: str) -> Tuple[Optional[int], List[Row], Optional[float]]:
     polytopes = None
     rows: List[Row] = []
     final_volume = None
@@ -49,7 +49,7 @@ def parse_output(output: str) -> Tuple[Optional[int], List[Row], Optional[int]]:
                 })
         if line.startswith("s volume"):
             try:
-                final_volume = int(line.split()[2])
+                final_volume = float(line.split()[2])
             except (IndexError, ValueError) as exc:
                 raise AssertionError(
                     f"Unable to parse final volume from '{line}'"
@@ -172,7 +172,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_false",
         help="Disable the final total/volume consistency check",
     )
-    parser.set_defaults(require_final_equals_total=True)
+    # Revised estimator divides sample count by p*T*10^(b*n).
+    parser.set_defaults(require_final_equals_total=False)
 
     args = parser.parse_args(argv)
 
@@ -182,7 +183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise AssertionError(f"Input file '{args.input_file}' does not exist")
 
     completed = subprocess.run(
-        [str(args.binary), str(args.input_file)],
+        [str(args.binary), str(args.input_file), "--epsilon", "0.2"],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

@@ -1258,20 +1258,19 @@ int main(int argc, char *argv[]) {
        "Random walk used to sample uniform points from each polytope: "
        "'billiard' (default), 'accel-billiard', 'ball', 'rdhr' "
        "(random-directions hit-and-run), or 'cdhr' (coordinate-directions "
-       "hit-and-run). Note: --fullgmp only supports 'billiard'")
+       "hit-and-run). With --fullgmp, accel-billiard falls back to billiard")
       ("no-cdd-simp",
        "Skip cddlib polytope canonicalization (redundant-constraint removal / "
        "implicit-equality detection) before volume and sampling")
       ("nogmp",
        "Disable GMP: store sample points and run the union membership tests in "
-       "double (the original behaviour). Default: store/test in GMP at a "
-       "precision derived from the polytopes (get_precision_from_cubes)")
+       "double. Default: store/test lattice points in GMP")
       ("fullgmp",
-       "Run the billiard walk itself in GMP at the sampling precision (not just "
+       "Run the selected walk itself in GMP at the sampling precision (not just "
        "the point bookkeeping). Slower; mutually exclusive with --nogmp")
       ("precision", po::value<int>(),
-       "Override the GMP sampling precision (decimal digits). Default: auto, "
-       "ceil(8*dim*sqrt(log(facets)))")
+       "Minimum GMP arithmetic precision (decimal digits). Default: lattice "
+       "precision b + 32; independent of lattice spacing")
       ("dump-ine", po::value<std::string>(),
        "Write each canonicalized polytope to <PREFIX>_cubeN.ine in the cdd / "
        "Avis-Fukuda H-representation format (readable by external volume tools "
@@ -2452,6 +2451,8 @@ int main(int argc, char *argv[]) {
       auto realVars = parser.realVariables();
 
       ttc::VolumeOptions volumeOptions;
+      volumeOptions.epsilon = approxEpsilon;
+      volumeOptions.delta = approxDelta;
       // --seed also drives the volume engine's sampling walks, but only when
       // given explicitly: `defaulted()` keeps seedless runs on the historical
       // base seed (123) rather than silently switching them to the CLI default.
@@ -2597,6 +2598,8 @@ int main(int argc, char *argv[]) {
                              volumeResult.totalSamplesDeleted);
       std::cout.unsetf(std::ios::floatfield);
       std::cout.precision(6);
+      std::cout << "c lattice precision (b): "
+                << volumeResult.latticePrecision << std::endl;
       if (volumeOptions.gmpMode != ttc::GmpMode::None)
       {
         std::cout << "c gmp sampling precision (digits): "

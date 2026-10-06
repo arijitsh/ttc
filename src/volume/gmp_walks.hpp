@@ -36,7 +36,8 @@ inline std::vector<MpVector> sampleGmpBilliard(const Eigen::MatrixXd& Ad,
                                                const Eigen::VectorXd& bd,
                                                const Eigen::VectorXd& startCenter,
                                                double innerRadius, long long n,
-                                               unsigned walkLength, unsigned seed)
+                                               unsigned walkLength, unsigned seed,
+                                               bool restartEachSample = false)
 {
   const Eigen::Index m = Ad.rows();
   const Eigen::Index dim = Ad.cols();
@@ -94,6 +95,7 @@ inline std::vector<MpVector> sampleGmpBilliard(const Eigen::MatrixXd& Ad,
   const long maxReflections = 50 * static_cast<long>(dim);
   for (long long pt = 0; pt < n; ++pt)
   {
+    if (restartEachSample) p = startCenter.cast<MpFloat>();
     for (unsigned step = 0; step < walkLength; ++step)
     {
       MpFloat budget = MpFloat(udist(rng)) * len;
@@ -157,7 +159,8 @@ inline std::vector<MpVector> sampleGmpBallWalk(const Eigen::MatrixXd& Ad,
                                                const Eigen::VectorXd& bd,
                                                const Eigen::VectorXd& startCenter,
                                                double innerRadius, long long n,
-                                               unsigned walkLength, unsigned seed)
+                                               unsigned walkLength, unsigned seed,
+                                               bool restartEachSample = false)
 {
   const Eigen::Index m = Ad.rows();
   const Eigen::Index dim = Ad.cols();
@@ -209,6 +212,7 @@ inline std::vector<MpVector> sampleGmpBallWalk(const Eigen::MatrixXd& Ad,
 
   for (long long pt = 0; pt < n; ++pt)
   {
+    if (restartEachSample) p = startCenter.cast<MpFloat>();
     for (unsigned step = 0; step < walkLength; ++step)
     {
       sampleDirection();
@@ -272,7 +276,8 @@ inline std::vector<MpVector> sampleGmpRDHR(const Eigen::MatrixXd& Ad,
                                            const Eigen::VectorXd& bd,
                                            const Eigen::VectorXd& startCenter,
                                            double /*innerRadius*/, long long n,
-                                           unsigned walkLength, unsigned seed)
+                                           unsigned walkLength, unsigned seed,
+                                           bool restartEachSample = false)
 {
   const Eigen::Index m = Ad.rows();
   const Eigen::Index dim = Ad.cols();
@@ -314,6 +319,7 @@ inline std::vector<MpVector> sampleGmpRDHR(const Eigen::MatrixXd& Ad,
 
   for (long long pt = 0; pt < n; ++pt)
   {
+    if (restartEachSample) p = startCenter.cast<MpFloat>();
     for (unsigned step = 0; step < walkLength; ++step)
     {
       sampleDirection();
@@ -340,7 +346,8 @@ inline std::vector<MpVector> sampleGmpCDHR(const Eigen::MatrixXd& Ad,
                                            const Eigen::VectorXd& bd,
                                            const Eigen::VectorXd& startCenter,
                                            double /*innerRadius*/, long long n,
-                                           unsigned walkLength, unsigned seed)
+                                           unsigned walkLength, unsigned seed,
+                                           bool restartEachSample = false)
 {
   const Eigen::Index m = Ad.rows();
   const Eigen::Index dim = Ad.cols();
@@ -365,6 +372,11 @@ inline std::vector<MpVector> sampleGmpCDHR(const Eigen::MatrixXd& Ad,
 
   for (long long pt = 0; pt < n; ++pt)
   {
+    if (restartEachSample)
+    {
+      p = startCenter.cast<MpFloat>();
+      ap = Am * p;
+    }
     for (unsigned step = 0; step < walkLength; ++step)
     {
       const Eigen::Index c = static_cast<Eigen::Index>(cdist(rng));
