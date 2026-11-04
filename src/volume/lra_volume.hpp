@@ -29,7 +29,13 @@ struct VolumeComputationResult
   std::size_t totalSamplesGenerated = 0;
   std::size_t totalSamplesDeleted = 0;
   double volumeComputationTime = 0.0;
+  // Inner ball (volesti IPM + Chebyshev LP) and outer-radius LPs, phase 1 and
+  // the per-polytope sampler restarts; excluded from samplingTime.
+  double ballTime = 0.0;
   double samplingTime = 0.0;
+  // Union bookkeeping: membership of stored samples in each new polytope,
+  // down-sampling and storing new samples (GMP unless --nogmp).
+  double filterTime = 0.0;
   int samplingPrecision = 0;  // GMP decimal digits used for sample bookkeeping
   int latticePrecision = 0;   // b: lattice spacing is 10^-b
 };
@@ -91,6 +97,11 @@ struct VolumeOptions
   double epsilon = 0.8;  // --epsilon, 0 < epsilon <= 1
   double delta = 0.2;    // --delta, 0 < delta < 1
 };
+
+// Sample threshold of the union algorithm (Alg. 1) for epsilon/delta and the
+// number of polytopes m: max(24 ln(24/delta) / ((1-e') e'^2), 15 (ln(6/delta) + ln m)),
+// with e' = epsilon/12.
+double lraSampleThreshold(double epsilon, double delta, std::size_t numPolytopes);
 
 VolumeComputationResult computeLraVolume(
     const std::vector<Polytope>& polytopes,

@@ -960,12 +960,14 @@ void runUnionAlgorithm(const std::vector<PolytopeVolume>& kept, double thresh,
   std::size_t totalGenerated = 0;
   std::size_t totalDeleted = 0;
   double totalSamplingTime = 0.0;
+  double totalFilterTime = 0.0;
 
   for (const auto& entry : kept)
   {
     const double volume = entry.volume;
 
     // Drop stored points that lie inside the current polytope.
+    const double filterStart = Log.elapsed();
     std::size_t deleted = store.removeInside(entry.A, entry.b);
 
     // Shrink the sampling probability until p*C*volume < thresh.
@@ -985,15 +987,19 @@ void runUnionAlgorithm(const std::vector<PolytopeVolume>& kept, double thresh,
       n = std::binomial_distribution<long long>(n, 0.5)(auxRng);
     }
 
+    totalFilterTime += Log.elapsed() - filterStart;
+
     std::size_t sampleCount = 0;
     double samplingTime = 0.0;
     if (n > 0)
     {
       auto samples = generate(entry.A, entry.b, n, samplingTime);
+      const double storeStart = Log.elapsed();
       for (auto& sample : samples)
       {
         store.addSample(sample);
       }
+      totalFilterTime += Log.elapsed() - storeStart;
       sampleCount = samples.size();
     }
 
@@ -1019,6 +1025,7 @@ void runUnionAlgorithm(const std::vector<PolytopeVolume>& kept, double thresh,
   result.totalSamplesGenerated = totalGenerated;
   result.totalSamplesDeleted = totalDeleted;
   result.samplingTime = totalSamplingTime;
+  result.filterTime = totalFilterTime;
 }
 
 std::vector<cvc5::Term> deduplicateRealVariables(
@@ -1042,6 +1049,15 @@ std::vector<cvc5::Term> deduplicateRealVariables(
 }
 
 }  // namespace
+
+double lraSampleThreshold(double epsilon, double delta, std::size_t numPolytopes)
+{
+  const double mvcEps = epsilon / 12.0;
+  const double m = std::max(1.0, static_cast<double>(numPolytopes));
+  return std::max(
+      24.0 * (std::log(24.0) - std::log(delta)) / ((1.0 - mvcEps) * mvcEps * mvcEps),
+      15.0 * (std::log(6.0) - std::log(delta) + std::log(m)));
+}
 
 VolumeComputationResult computeLraVolume(
     const std::vector<Polytope>& polytopes,
@@ -1105,9 +1121,7 @@ VolumeComputationResult computeLraVolume(
   const double mvcEps = kEpsilon / 12.0;
   const double numCubes = static_cast<double>(polytopes.size());
   const double oracleDelta = kDelta / (4.0 * std::max(1.0, numCubes));
-  const double thresh = std::max(
-      24.0 * (std::log(24.0) - std::log(kDelta)) / ((1.0 - mvcEps) * mvcEps * mvcEps),
-      15.0 * (std::log(6.0) - std::log(kDelta) + std::log(std::max(1.0, numCubes))));
+  const double thresh = lraSampleThreshold(kEpsilon, kDelta, polytopes.size());
   if (!std::isfinite(thresh) || thresh >= double(std::numeric_limits<long long>::max() / 2)
       || oracleDelta <= 0.0)
     throw std::invalid_argument("epsilon/delta require an unsupported sample threshold");
@@ -1136,6 +1150,8 @@ VolumeComputationResult computeLraVolume(
 
   std::size_t numZeroVolume = 0;
   double totalVolumeTime = 0.0;
+  double ballTime = 0.0;         // phase 1: inner ball + outer-radius LPs
+  double samplerBallTime = 0.0;  // phase 2: inner ball per sampler restart
   std::size_t facetTotal = 0;
   double minRadius = std::numeric_limits<double>::infinity();
   std::size_t dumpIndex = 0;  // running counter for --dump-ine file names
@@ -1166,7 +1182,9 @@ VolumeComputationResult computeLraVolume(
       Log(1) << "wrote polytope to " << path << std::endl;
     }
     HPolytope hpoly(static_cast<unsigned>(dimension), matrices.A, matrices.b);
+    const double ballStart = Log.elapsed();
     const auto innerBall = reliableInnerBall(hpoly);
+    ballTime += Log.elapsed() - ballStart;
     if (innerBall.second <= 0.0)
     {
       ++numZeroVolume;
@@ -1174,7 +1192,9 @@ VolumeComputationResult computeLraVolume(
     }
     if (!std::isfinite(innerBall.second))
       throw std::runtime_error("polytope has no finite inner radius");
+    const double radiusStart = Log.elapsed();
     const double radius = outerRadius(matrices.A, matrices.b, innerBall.first.getCoefficients());
+    ballTime += Log.elapsed() - radiusStart;
     double volumeComputeStart = Log.elapsed();
     double volume = volume_cooling_gaussians<GaussianBallWalk, VolumeRNG>(
         hpoly, mvcEps, volumeWalkLength);
@@ -1219,6 +1239,7 @@ VolumeComputationResult computeLraVolume(
   }
 
   result.volumeComputationTime = totalVolumeTime;
+  result.ballTime = ballTime;
   if (kept.empty()) return result;
   // Lattice spacing and GMP arithmetic precision are distinct quantities.
   const int precision = precisionFromCubes(dimension, facetTotal, polytopes.size(),
@@ -1238,7 +1259,9 @@ VolumeComputationResult computeLraVolume(
       [&](const Eigen::MatrixXd& A, const Eigen::VectorXd& b, long long n,
           double& samplingTime) -> std::vector<Eigen::VectorXd> {
     HPolytope hpoly(static_cast<unsigned>(dimension), A, b);
+    const double ballStart = Log.elapsed();
     const Point center = reliableInnerBall(hpoly).first;
+    samplerBallTime += Log.elapsed() - ballStart;
     PushBackWalkPolicy policy;
     std::list<Point> samples;
     sampleRng.set_seed(streamSeed());
@@ -1325,7 +1348,9 @@ VolumeComputationResult computeLraVolume(
           [&](const Eigen::MatrixXd& A, const Eigen::VectorXd& b, long long n,
               double& samplingTime) {
             HPolytope hpoly(static_cast<unsigned>(dimension), A, b);
+            const double ballStart = Log.elapsed();
             auto ball = reliableInnerBall(hpoly);
+            samplerBallTime += Log.elapsed() - ballStart;
             Eigen::VectorXd center = ball.first.getCoefficients();
             double radius = ball.second;
             double samplingStart = Log.elapsed();
@@ -1367,6 +1392,10 @@ VolumeComputationResult computeLraVolume(
     }
   }
 
+  // sampleLattice times its whole call, including the sampler's inner-ball
+  // computation; report that part under ball time only.
+  result.samplingTime = std::max(0.0, result.samplingTime - samplerBallTime);
+  result.ballTime = ballTime + samplerBallTime;
   result.volumeComputationTime = totalVolumeTime;
   return result;
 }

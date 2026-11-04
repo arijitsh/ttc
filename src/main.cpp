@@ -2534,6 +2534,11 @@ int main(int argc, char *argv[]) {
       std::cout << "c detected pure LRA: yes" << std::endl;
       std::cout << "c real variables: " << realVars.size() << std::endl;
       std::cout << "c polytopes: " << polytopes.size() << std::endl;
+      std::cout << "c sample threshold: "
+                << ttc::lraSampleThreshold(volumeOptions.epsilon,
+                                           volumeOptions.delta, polytopes.size())
+                << " (epsilon " << volumeOptions.epsilon << ", delta "
+                << volumeOptions.delta << ")" << std::endl;
       std::cout << "c sampling arithmetic: "
                 << (volumeOptions.gmpMode == ttc::GmpMode::None ? "double"
                     : volumeOptions.gmpMode == ttc::GmpMode::Full
@@ -2592,8 +2597,10 @@ int main(int argc, char *argv[]) {
           ttc::computeLraVolume(polytopes, realVars, volumeOptions, rowPrinter);
       double volumeEnd = Log.elapsed();
       Profile.addSearch(volumeEnd - volumeStart);
+      Profile.addBall(volumeResult.ballTime);
       Profile.addPolytopeVolume(volumeResult.volumeComputationTime);
       Profile.addSampling(volumeResult.samplingTime);
+      Profile.addFilter(volumeResult.filterTime);
       Profile.setSampleStats(volumeResult.totalSamplesGenerated,
                              volumeResult.totalSamplesDeleted);
       std::cout.unsetf(std::ios::floatfield);

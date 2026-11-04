@@ -69,8 +69,10 @@ class Profiler {
   double residual_substitute_time = 0.0;
   double residual_simplify_time = 0.0;
   double dnfization_time = 0.0;
+  double ball_time = 0.0;
   double polytope_volume_time = 0.0;
   double sampling_time = 0.0;
+  double filter_time = 0.0;
   std::uint64_t cache_hits = 0;
   std::uint64_t cache_lookups = 0;
   double cache_time = 0.0;
@@ -95,8 +97,10 @@ public:
   void addComponent(double t) { component_time += t; }
   void addDecompose(double t) { decompose_time += t; }
   void addDnfization(double t) { dnfization_time += t; }
+  void addBall(double t) { ball_time += t; }
   void addPolytopeVolume(double t) { polytope_volume_time += t; }
   void addSampling(double t) { sampling_time += t; }
+  void addFilter(double t) { filter_time += t; }
   void addCacheHit() { ++cache_hits; }
   void addCacheLookup() { ++cache_lookups; }
   void addCacheTime(double t) { cache_time += t; }
@@ -146,8 +150,10 @@ public:
     residual_substitute_time = 0.0;
     residual_simplify_time = 0.0;
     dnfization_time = 0.0;
+    ball_time = 0.0;
     polytope_volume_time = 0.0;
     sampling_time = 0.0;
+    filter_time = 0.0;
     samples_generated = 0;
     samples_deleted = 0;
   }
@@ -162,6 +168,7 @@ public:
   double getResidualSubstitute() const { return residual_substitute_time; }
   double getResidualSimplify() const { return residual_simplify_time; }
   double getDnfization() const { return dnfization_time; }
+  double getBall() const { return ball_time; }
   double getPolytopeVolume() const { return polytope_volume_time; }
   double getSampling() const { return sampling_time; }
   std::uint64_t getCacheHits() const { return cache_hits; }
@@ -174,8 +181,8 @@ public:
   void print(double total_process) const
   {
     (void)total_process;
-    double solve_time =
-        parse_time + dnfization_time + polytope_volume_time + sampling_time;
+    double solve_time = parse_time + dnfization_time + ball_time +
+                        polytope_volume_time + sampling_time + filter_time;
     if (solve_time <= 0) solve_time = 1e-9; // avoid division by zero
 
     print_section("run-time profiling");
@@ -191,10 +198,14 @@ public:
 
     printLine(parse_time, (parse_time / solve_time) * 100.0, "parse");
     printLine(dnfization_time, (dnfization_time / solve_time) * 100.0, "DNFization");
+    if (ball_time > 0.0)
+      printLine(ball_time, (ball_time / solve_time) * 100.0, "finding ball (LP)");
     printLine(polytope_volume_time,
               (polytope_volume_time / solve_time) * 100.0,
               "polytope volume");
     printLine(sampling_time, (sampling_time / solve_time) * 100.0, "sampling");
+    if (filter_time > 0.0)
+      printLine(filter_time, (filter_time / solve_time) * 100.0, "sample filtering");
     std::cout << "c =================================" << std::endl;
     printLine(solve_time, (solve_time / total_process) * 100.0, "solve");
     std::cout << "c" << std::endl;
