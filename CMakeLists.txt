@@ -326,6 +326,22 @@ if(HAVE_SKOLEMFC)
     list(APPEND SOURCES src/skolemfc/skolemfc_engine.cpp)
 endif()
 
+# Git commit hash shown in the banner ("c Version 0.1.0 (<hash>)"). Generated
+# once at configure time and refreshed on every build by the ttc_git_version
+# target; GitVersion.cmake only rewrites the file when the hash changes.
+set(TTC_GIT_VERSION_CPP "${CMAKE_BINARY_DIR}/ttc_git_version.cpp")
+execute_process(COMMAND ${CMAKE_COMMAND} -DSRC_DIR=${CMAKE_SOURCE_DIR}
+                        -DOUT=${TTC_GIT_VERSION_CPP}
+                        -P ${CMAKE_SOURCE_DIR}/cmake/GitVersion.cmake)
+add_custom_target(ttc_git_version
+    COMMAND ${CMAKE_COMMAND} -DSRC_DIR=${CMAKE_SOURCE_DIR}
+            -DOUT=${TTC_GIT_VERSION_CPP}
+            -P ${CMAKE_SOURCE_DIR}/cmake/GitVersion.cmake
+    BYPRODUCTS ${TTC_GIT_VERSION_CPP}
+    COMMENT "Updating git hash"
+    VERBATIM)
+list(APPEND SOURCES ${TTC_GIT_VERSION_CPP})
+
 if(ENABLE_DDNNF)
     include_directories(${PROJECT_SOURCE_DIR}/src/ddnnf/flowcutter/src)
     include_directories(${PROJECT_SOURCE_DIR}/src/d4)
@@ -414,6 +430,7 @@ else()
 endif()
 
 add_executable(ttc ${SOURCES})
+add_dependencies(ttc ttc_git_version)
 
 if(NOT BUILD_STATIC AND UNIX AND NOT APPLE)
     execute_process(

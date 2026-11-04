@@ -14,6 +14,9 @@
 
 #define TTC_SECTION_WIDTH 70
 
+// Defined in the build-generated ttc_git_version.cpp (cmake/GitVersion.cmake).
+const char* ttc_git_hash();
+
 inline std::string& banner_solver_info()
 {
   static std::string info;
@@ -39,7 +42,7 @@ inline void print_banner()
   print_section("banner");
   std::cout << "c ttc: Toolbox for Theory Counting" << std::endl;
   std::cout << "c" << std::endl;
-  std::cout << "c Version 0.1.0" << std::endl;
+  std::cout << "c Version 0.1.0 (" << ttc_git_hash() << ")" << std::endl;
   std::cout << "c g++ " << __VERSION__ << std::endl;
   std::time_t now = std::time(nullptr);
   char timebuf[64];
