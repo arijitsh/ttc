@@ -166,8 +166,23 @@ build_cvc5() {
   # SkolemFC determinism check drives cvc5's BV SAT through it). cvc5's bundled
   # CMS .a is dropped at ttc link time; only its CMSat::SATSolver facade is used,
   # resolved against the single SkolemFC CMS (see CMakeLists).
-  ( cd "$dir" && ./configure.sh --static --auto-download --cryptominisat --name=build )
-  cmake --build "$dir/build" -j"$JOBS"
+  (
+    # macOS: cvc5's auto-downloaded LibPoly compiles with -Werror, and Homebrew's
+    # gmpxx.h (`operator"" _mpz`) trips clang>=20's default-on
+    # -Wdeprecated-literal-operator. LibPoly seeds CMAKE_CXX_FLAGS from the
+    # environment, so silence that one warning for the whole cvc5 build (the
+    # Poly-EP sub-configure runs during `cmake --build`, hence both commands).
+    # Probe first: under LibPoly's -Werror an older clang would reject the
+    # unknown warning flag itself.
+    local wflag="-Wno-deprecated-literal-operator"
+    if [ "$OS" = "Darwin" ] &&
+       echo "int main(){}" | "${CXX:-c++}" -x c++ -Werror "$wflag" -fsyntax-only - 2>/dev/null; then
+      export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }$wflag"
+    fi
+    cd "$dir"
+    ./configure.sh --static --auto-download --cryptominisat --name=build
+    cmake --build build -j"$JOBS"
+  )
   dep_stamp "$dir"
 }
 
