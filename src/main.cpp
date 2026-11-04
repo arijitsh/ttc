@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <boost/program_options.hpp>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <future>
 #include <iomanip>
@@ -1250,10 +1251,10 @@ int main(int argc, char *argv[]) {
   classLra.add_options()
       ("walklen-vol", po::value<int>(),
        "Random-walk length for the volesti volume estimator "
-       "(volume_cooling_gaussians); default 10 + dim/10")
+       "(volume_cooling_gaussians); default 10 + dim^2")
       ("walklen-samp", po::value<int>(),
        "Random-walk length for volesti point sampling (billiard walk); "
-       "default 10")
+       "default 10 + dim^2")
       ("sampler", po::value<std::string>(),
        "Random walk used to sample uniform points from each polytope: "
        "'billiard' (default), 'accel-billiard', 'ball', 'rdhr' "
@@ -2534,29 +2535,17 @@ int main(int argc, char *argv[]) {
       std::cout << "c detected pure LRA: yes" << std::endl;
       std::cout << "c real variables: " << realVars.size() << std::endl;
       std::cout << "c polytopes: " << polytopes.size() << std::endl;
+      // The union algorithm keeps at most floor(threshold) samples.
       std::cout << "c sample threshold: "
-                << ttc::lraSampleThreshold(volumeOptions.epsilon,
-                                           volumeOptions.delta, polytopes.size())
-                << " (epsilon " << volumeOptions.epsilon << ", delta "
-                << volumeOptions.delta << ")" << std::endl;
+                << static_cast<long long>(std::floor(ttc::lraSampleThreshold(
+                       volumeOptions.epsilon, volumeOptions.delta, polytopes.size())))
+                << std::endl;
       std::cout << "c sampling arithmetic: "
                 << (volumeOptions.gmpMode == ttc::GmpMode::None ? "double"
                     : volumeOptions.gmpMode == ttc::GmpMode::Full
                         ? "gmp (full walk)"
                         : "gmp (point repr)")
                 << std::endl;
-      std::cout << "c volume walk length: ";
-      if (volumeOptions.volumeWalkLength >= 0)
-        std::cout << volumeOptions.volumeWalkLength;
-      else
-        std::cout << "auto (10 + dim/10)";
-      std::cout << std::endl;
-      std::cout << "c sample walk length: ";
-      if (volumeOptions.sampleWalkLength >= 0)
-        std::cout << volumeOptions.sampleWalkLength;
-      else
-        std::cout << "10";
-      std::cout << std::endl;
       std::cout << "c sampler walk: ";
       switch (volumeOptions.samplerWalk)
       {
@@ -2580,21 +2569,60 @@ int main(int argc, char *argv[]) {
       std::cout << std::endl;
       std::cout << "c cdd simplification: "
                 << (volumeOptions.cddSimplify ? "yes" : "no") << std::endl;
-      std::cout << "c" << std::endl;
 
-      print_section("volume computation");
-      std::cout << "c polytope        volume   samples_deleted   total_samples"
-                << std::endl;
-      auto rowPrinter = [](const ttc::VolumeComputationRow& row) {
-        std::cout << "c " << std::setw(8) << row.index << "  " << std::setw(14)
-                  << std::fixed << std::setprecision(6) << row.volume << "  "
-                  << std::setw(15) << row.samplesDeleted << "  "
-                  << std::setw(14) << row.totalSamples << std::endl;
+      // The rest of the options section needs the engine's setup pass (cdd +
+      // inner balls), which fixes the walk lengths and lattice precision.
+      auto setupPrinter = [&](const ttc::VolumeSetup& setup) {
+        auto walkLength = [](int option, unsigned used) {
+          return std::to_string(used) + (option >= 0 ? "" : " (10 + dim^2)");
+        };
+        std::cout << "c volume walk length: "
+                  << walkLength(volumeOptions.volumeWalkLength,
+                                setup.volumeWalkLength)
+                  << std::endl;
+        std::cout << "c sample walk length: "
+                  << walkLength(volumeOptions.sampleWalkLength,
+                                setup.sampleWalkLength)
+                  << std::endl;
+        std::cout << "c lattice precision (b): " << setup.latticePrecision
+                  << std::endl;
+        if (volumeOptions.gmpMode != ttc::GmpMode::None)
+        {
+          std::cout << "c gmp sampling precision (digits): "
+                    << setup.samplingPrecision << std::endl;
+        }
+        std::cout << "c" << std::endl;
+
+        print_section("volume computation");
+        std::ostringstream hdr;
+        hdr << "c " << std::setw(8) << "time" << "  " << std::setw(8)
+            << "polytope" << "  " << std::setw(10) << "volume" << "  "
+            << std::setw(15) << "samples_deleted" << "  " << std::setw(13)
+            << "total_samples";
+        std::cout << hdr.str() << std::endl;
+      };
+      // Volume as XXXX.XX up to 9999, else X.XXeYY.
+      auto formatVolume = [](double volume) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, volume > 9999.0 ? "%.2e" : "%.2f", volume);
+        std::string text(buf);
+        if (auto plus = text.find("e+"); plus != std::string::npos)
+          text.erase(plus + 1, 1);
+        return text;
+      };
+      auto rowPrinter = [&](const ttc::VolumeComputationRow& row) {
+        std::ostringstream line;
+        line << "c " << std::setw(8) << std::fixed << std::setprecision(2)
+             << Log.elapsed() << "  " << std::setw(8) << row.index << "  "
+             << std::setw(10) << formatVolume(row.volume) << "  "
+             << std::setw(15) << row.samplesDeleted << "  " << std::setw(13)
+             << row.totalSamples;
+        std::cout << line.str() << std::endl;
       };
 
       double volumeStart = Log.elapsed();
-      auto volumeResult =
-          ttc::computeLraVolume(polytopes, realVars, volumeOptions, rowPrinter);
+      auto volumeResult = ttc::computeLraVolume(
+          polytopes, realVars, volumeOptions, rowPrinter, setupPrinter);
       double volumeEnd = Log.elapsed();
       Profile.addSearch(volumeEnd - volumeStart);
       Profile.addBall(volumeResult.ballTime);
@@ -2605,13 +2633,6 @@ int main(int argc, char *argv[]) {
                              volumeResult.totalSamplesDeleted);
       std::cout.unsetf(std::ios::floatfield);
       std::cout.precision(6);
-      std::cout << "c lattice precision (b): "
-                << volumeResult.latticePrecision << std::endl;
-      if (volumeOptions.gmpMode != ttc::GmpMode::None)
-      {
-        std::cout << "c gmp sampling precision (digits): "
-                  << volumeResult.samplingPrecision << std::endl;
-      }
       std::cout << "c" << std::endl;
 
       print_section("result");

@@ -1,4 +1,9 @@
 build
+.cache
+example/pact_easy_benchmark
+src/nravol
+.vscode
+.claude
 
 # Vendored dependencies fetched + built by configure.sh
 deps/

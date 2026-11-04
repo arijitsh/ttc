@@ -1059,11 +1059,17 @@ double lraSampleThreshold(double epsilon, double delta, std::size_t numPolytopes
       15.0 * (std::log(6.0) - std::log(delta) + std::log(m)));
 }
 
+unsigned lraDefaultWalkLength(std::size_t dimension)
+{
+  return static_cast<unsigned>(10 + dimension * dimension);
+}
+
 VolumeComputationResult computeLraVolume(
     const std::vector<Polytope>& polytopes,
     const std::vector<cvc5::Term>& realVariables,
     const VolumeOptions& options,
-    const std::function<void(const VolumeComputationRow&)>& onRow)
+    const std::function<void(const VolumeComputationRow&)>& onRow,
+    const std::function<void(const VolumeSetup&)>& onSetup)
 {
   VolumeComputationResult result;
   if (!std::isfinite(options.epsilon) || options.epsilon <= 0.0 || options.epsilon > 1.0
@@ -1126,31 +1132,41 @@ VolumeComputationResult computeLraVolume(
       || oracleDelta <= 0.0)
     throw std::invalid_argument("epsilon/delta require an unsupported sample threshold");
 
-  // The volesti `volume` tool uses walk length 10 + dim/10; the `sample` tool
-  // uses a fixed walk length of 10. Both are overridable via --walklen-vol /
-  // --walklen-samp (a negative option value keeps the volesti default).
+  // Both walks default to 10 + dim^2 (lraDefaultWalkLength), overridable via
+  // --walklen-vol / --walklen-samp (a negative option value keeps the default).
   const unsigned volumeWalkLength =
       options.volumeWalkLength >= 0
           ? static_cast<unsigned>(options.volumeWalkLength)
-          : static_cast<unsigned>(10 + dimension / 10);
+          : lraDefaultWalkLength(dimension);
   const unsigned sampleWalkLength =
       options.sampleWalkLength >= 0
           ? static_cast<unsigned>(options.sampleWalkLength)
-          : 10;
+          : lraDefaultWalkLength(dimension);
 
   Log(2) << "Starting union algorithm, threshold: " << thresh << std::endl;
   // Volesti's practical cooling API accepts epsilon but no confidence delta.
   Log(2) << "Per-polytope oracle targets: epsilon=" << mvcEps
          << ", delta=" << oracleDelta << " (practical Volesti oracle)" << std::endl;
 
-  // Phase 1: build the half-space matrices and compute every volume up front,
-  // dropping polytopes whose (full-dimensional) volume is zero.
-  std::vector<PolytopeVolume> kept;
-  kept.reserve(polytopes.size());
+  // Phase 1a: build and canonicalize the half-space matrices and find every
+  // inner ball and outer radius, dropping polytopes whose (full-dimensional)
+  // volume is zero.  This fixes the lattice precision before the volume
+  // oracles run (phase 1b), so the caller can report it up front.
+  struct PreparedPolytope
+  {
+    Eigen::MatrixXd A;
+    Eigen::VectorXd b;
+    HPolytope hpoly;  // row-normalized by reliableInnerBall, holds its ball
+    double innerRadius;
+    double outerRadius;
+    long rawFacets;
+  };
+  std::vector<PreparedPolytope> prepared;
+  prepared.reserve(polytopes.size());
 
   std::size_t numZeroVolume = 0;
   double totalVolumeTime = 0.0;
-  double ballTime = 0.0;         // phase 1: inner ball + outer-radius LPs
+  double ballTime = 0.0;         // phase 1a: inner ball + outer-radius LPs
   double samplerBallTime = 0.0;  // phase 2: inner ball per sampler restart
   std::size_t facetTotal = 0;
   double minRadius = std::numeric_limits<double>::infinity();
@@ -1195,41 +1211,10 @@ VolumeComputationResult computeLraVolume(
     const double radiusStart = Log.elapsed();
     const double radius = outerRadius(matrices.A, matrices.b, innerBall.first.getCoefficients());
     ballTime += Log.elapsed() - radiusStart;
-    double volumeComputeStart = Log.elapsed();
-    double volume = volume_cooling_gaussians<GaussianBallWalk, VolumeRNG>(
-        hpoly, mvcEps, volumeWalkLength);
-    // A practical oracle run can still end non-finite or non-positive, which is
-    // a detected failure.  Rerun it on fresh independent streams before giving up.
-    constexpr unsigned kOracleAttempts = 3;
-    for (unsigned attempt = 1;
-         attempt < kOracleAttempts && !(std::isfinite(volume) && volume > 0.0);
-         ++attempt)
-    {
-      Log(1) << "WARNING: volume oracle returned " << volume
-             << " (inner radius " << innerBall.second << ", outer radius "
-             << radius << "); retrying on a fresh random stream" << std::endl;
-      SampleRNG oracleRng(static_cast<unsigned>(dimension));
-      oracleRng.set_seed(kSeed + 0x51ED2701U * attempt);
-      volume = volume_cooling_gaussians<GaussianBallWalk>(hpoly, oracleRng, mvcEps,
-                                                          volumeWalkLength);
-    }
-    double volumeComputeElapsed = Log.elapsed() - volumeComputeStart;
-    totalVolumeTime += volumeComputeElapsed;
-    Log(2) << "polytope volume " << volume << " (" << matrices.A.rows()
-           << " facets, was " << rawFacets << ", dim " << dimension << ") in "
-           << volumeComputeElapsed << "s" << std::endl;
-    if (!std::isfinite(volume) || volume <= 0.0)
-      throw std::runtime_error("volume oracle failed on a positive-dimensional polytope");
-    const double lower = (1.0 - mvcEps) * std::pow(2.0 * innerBall.second / std::sqrt(double(dimension)), double(dimension));
-    const double upper = (1.0 + mvcEps) * std::pow(2.0 * radius, double(dimension));
-    if (std::isnan(lower) || std::isnan(upper) || lower > upper)
-      throw std::runtime_error("invalid polytope volume clipping bounds");
-    volume = std::clamp(volume, lower, upper);
-    if (!std::isfinite(volume) || volume <= 0.0)
-      throw std::runtime_error("clipped polytope volume exceeds double range");
     minRadius = std::min(minRadius, innerBall.second);
     facetTotal += static_cast<std::size_t>(matrices.A.rows());
-    kept.push_back({std::move(matrices.A), std::move(matrices.b), volume});
+    prepared.push_back({std::move(matrices.A), std::move(matrices.b), std::move(hpoly),
+                        innerBall.second, radius, rawFacets});
   }
 
   if (numZeroVolume > 0)
@@ -1238,19 +1223,74 @@ VolumeComputationResult computeLraVolume(
            << polytopes.size() << " where volume is zero" << std::endl;
   }
 
-  result.volumeComputationTime = totalVolumeTime;
-  result.ballTime = ballTime;
-  if (kept.empty()) return result;
   // Lattice spacing and GMP arithmetic precision are distinct quantities.
-  const int precision = precisionFromCubes(dimension, facetTotal, polytopes.size(),
-                                          minRadius, kEpsilon);
+  const int precision =
+      prepared.empty() ? 0
+                       : precisionFromCubes(dimension, facetTotal, polytopes.size(),
+                                            minRadius, kEpsilon);
   result.latticePrecision = precision;
-  const double log2Scale = std::log2(thresh) + double(precision) * double(dimension) * std::log2(10.0);
-  if (options.gmpMode != GmpMode::None)
+  if (options.gmpMode != GmpMode::None && !prepared.empty())
   {
     result.samplingPrecision = std::max(options.precision, precision + 32);
     MpFloat::default_precision(static_cast<unsigned>(result.samplingPrecision));
   }
+  if (onSetup)
+  {
+    VolumeSetup setup;
+    setup.dimension = dimension;
+    setup.keptPolytopes = prepared.size();
+    setup.volumeWalkLength = volumeWalkLength;
+    setup.sampleWalkLength = sampleWalkLength;
+    setup.latticePrecision = result.latticePrecision;
+    setup.samplingPrecision = result.samplingPrecision;
+    onSetup(setup);
+  }
+
+  // Phase 1b: run the volume oracle on every polytope kept by phase 1a.
+  std::vector<PolytopeVolume> kept;
+  kept.reserve(prepared.size());
+  for (auto& entry : prepared)
+  {
+    double volumeComputeStart = Log.elapsed();
+    double volume = volume_cooling_gaussians<GaussianBallWalk, VolumeRNG>(
+        entry.hpoly, mvcEps, volumeWalkLength);
+    // A practical oracle run can still end non-finite or non-positive, which is
+    // a detected failure.  Rerun it on fresh independent streams before giving up.
+    constexpr unsigned kOracleAttempts = 3;
+    for (unsigned attempt = 1;
+         attempt < kOracleAttempts && !(std::isfinite(volume) && volume > 0.0);
+         ++attempt)
+    {
+      Log(1) << "WARNING: volume oracle returned " << volume
+             << " (inner radius " << entry.innerRadius << ", outer radius "
+             << entry.outerRadius << "); retrying on a fresh random stream" << std::endl;
+      SampleRNG oracleRng(static_cast<unsigned>(dimension));
+      oracleRng.set_seed(kSeed + 0x51ED2701U * attempt);
+      volume = volume_cooling_gaussians<GaussianBallWalk>(entry.hpoly, oracleRng, mvcEps,
+                                                          volumeWalkLength);
+    }
+    double volumeComputeElapsed = Log.elapsed() - volumeComputeStart;
+    totalVolumeTime += volumeComputeElapsed;
+    Log(2) << "polytope volume " << volume << " (" << entry.A.rows()
+           << " facets, was " << entry.rawFacets << ", dim " << dimension << ") in "
+           << volumeComputeElapsed << "s" << std::endl;
+    if (!std::isfinite(volume) || volume <= 0.0)
+      throw std::runtime_error("volume oracle failed on a positive-dimensional polytope");
+    const double lower = (1.0 - mvcEps) * std::pow(2.0 * entry.innerRadius / std::sqrt(double(dimension)), double(dimension));
+    const double upper = (1.0 + mvcEps) * std::pow(2.0 * entry.outerRadius, double(dimension));
+    if (std::isnan(lower) || std::isnan(upper) || lower > upper)
+      throw std::runtime_error("invalid polytope volume clipping bounds");
+    volume = std::clamp(volume, lower, upper);
+    if (!std::isfinite(volume) || volume <= 0.0)
+      throw std::runtime_error("clipped polytope volume exceeds double range");
+    kept.push_back({std::move(entry.A), std::move(entry.b), volume});
+  }
+  prepared.clear();
+
+  result.volumeComputationTime = totalVolumeTime;
+  result.ballTime = ballTime;
+  if (kept.empty()) return result;
+  const double log2Scale = std::log2(thresh) + double(precision) * double(dimension) * std::log2(10.0);
 
   SampleRNG sampleRng(static_cast<int>(dimension));
 

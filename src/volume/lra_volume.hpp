@@ -72,7 +72,7 @@ enum class SamplerWalk
 };
 
 // Tunable knobs for the LRA volume engine. A negative walk length means "use
-// the volesti default" (volume: 10 + dim/10, sampling: 10).
+// the default" (lraDefaultWalkLength: 10 + dim^2, for both walks).
 struct VolumeOptions
 {
   int volumeWalkLength = -1;  // --walklen-vol N
@@ -103,10 +103,26 @@ struct VolumeOptions
 // with e' = epsilon/12.
 double lraSampleThreshold(double epsilon, double delta, std::size_t numPolytopes);
 
+// Default walk length of both the volume oracle and the sampling walk: 10 + dim^2.
+unsigned lraDefaultWalkLength(std::size_t dimension);
+
+// Engine parameters resolved once every polytope is canonicalized and has its
+// inner ball, i.e. before the (expensive) per-polytope volume oracles run.
+struct VolumeSetup
+{
+  std::size_t dimension = 0;
+  std::size_t keptPolytopes = 0;  // positive-volume polytopes after cdd
+  unsigned volumeWalkLength = 0;
+  unsigned sampleWalkLength = 0;
+  int latticePrecision = 0;   // b: lattice spacing is 10^-b
+  int samplingPrecision = 0;  // GMP decimal digits (0 under --nogmp)
+};
+
 VolumeComputationResult computeLraVolume(
     const std::vector<Polytope>& polytopes,
     const std::vector<cvc5::Term>& realVariables,
     const VolumeOptions& options = {},
-    const std::function<void(const VolumeComputationRow&)>& onRow = {});
+    const std::function<void(const VolumeComputationRow&)>& onRow = {},
+    const std::function<void(const VolumeSetup&)>& onSetup = {});
 
 }  // namespace ttc
