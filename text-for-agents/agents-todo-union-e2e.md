@@ -18,8 +18,17 @@ Single-polytope volume and sampling work: `agent-todo.md`.
     `tests/volesti/union_decomp/`, `run_union_decomp.py`
   - [ ] u-e2e: T7 SMT formulas with exactly known union volumes, 20 seeds, all modes, current vs
     start binary → `tests/volesti/union_smt2/`, `run_union_e2e.py`
-- [ ] U5. Consolidate the diagnosis; fix what is wrong (with the user's go-ahead on cost-affecting
-  changes)
+- [~] U5. Consolidate the diagnosis; fix what is wrong. Changes the user approved on 2026-11-14:
+  - [x] U5b. GetPrecision 4r/η → 8r/η in code (`01ac059`) and in the paper (kr25-ssm algo/analysis/
+    proof-appendix: edited, **not committed**, because the paper repo has the user's own uncommitted
+    edits)
+  - [x] U5c. Volume-oracle seed derived from `--seed` and the polytope index (`92395cf`)
+  - [x] U5d. Variable names in the `--dump-ine` header (`3fe72b1`)
+  - [ ] U5e. Lift a Real-valued `ite` inside arithmetic atoms
+- [~] U8. New requests: tiny-formula syntax fuzzing (agent u-fuzz), general speed-ups (agent
+  u-perf, own git worktree)
+- [~] U9. Overnight campaign (≤ 10 jobs), started 23:42; read it in the morning with
+  `python3 tests/volesti/night_summary.py --root <night dir>`
 - [ ] U6. Validate (all suites, e2e single + union, benchmark), report in
   `ttc-union-vs-theory.md`
 - [ ] U7. Commit after every step
@@ -156,4 +165,37 @@ niced processes.
   Volume errors are therefore fully correlated across polytopes and across ttc `--seed`s, so they
   never average out. Within budget here. **Decision for the user:** derive the oracle seed from
   `--seed`.
+
+## U5b–d. Approved changes
+- **U5b** (`01ac059`): `precisionFromCubes` now uses √ln(8r/η).
+  - `test_union_lattice` is 7/7 and e2e 67/67.
+  - Paper: algo.tex l.73/88, analysis.tex l.127/186/251, proof-appendix l.162/172 (cor:linf → 64r/ε).
+    Edited, not committed.
+- **U5c** (`92395cf`): per-polytope oracle streams, splitmix64(seed, index). Retries are
+  attempt-salted. e2e at 3 seeds: 201/201.
+- **U5d** (`3fe72b1`): `.ine` files carry `* variables: x y ...`. `run_union_decomp.py` reads the
+  header.
+
+## U9. Overnight campaign (started 2026-11-14 23:42, stops launching at 08:00)
+**Where:**
+- Runner: `tests/volesti/night_runner.py`, detached with setsid/nohup.
+- Root: `<scratchpad>/night` (= `/tmp/claude-1000/-home-arijit-solvers-ttc-cpp/c5fd8853-63a5-4cce-a852-c234836b8395/scratchpad/night`).
+- Frozen binary `night/bin/ttc` at `3fe72b1` (before Real-`ite` lifting). Frozen test binaries in
+  `night/bin/tests/`.
+
+**Workers:** 6 until 00:30, then 10 (`night/workers.txt` overrides). All jobs run at nice 19.
+
+**126 jobs, round-robin interleaved:**
+
+| Family | Jobs | Contents |
+|---|---|---|
+| `bu_*` | 48 | `fuzz_union/run_batch.py`: 25 random Boolean unions × 3 seeds each, with exact volume (grid cells, half sheared). Variants: dims 2–6; `--nogmp`, `--fullgmp`, `--sampler cdhr`, `--epsilon 0.3 --delta 0.1`. 3600 formula runs in total |
+| `syn_*` | 60 | random syntheticLRA instances, current binary, `-v 2`, 1500 s limit; compared with the archived `ttc_correct` volume and time |
+| `slow_*` | 17 | every `slow`-tagged unit sweep (`test_union_core` excluded: still being written) |
+| `e2e_single_20seeds` | 1 | `run_smt2.py --seeds 20` |
+
+Syntax-fuzz and union-e2e jobs are to be added when the u-fuzz and u-e2e agents deliver their
+runners.
+
+**Morning:** `python3 tests/volesti/night_summary.py --root <night dir>`.
 
