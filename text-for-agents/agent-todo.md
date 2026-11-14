@@ -11,7 +11,7 @@
 - [x] 8. Validate the fix: e2e 67/67; unit suite updated to ttc's pipeline (`6857cad`); syntheticLRA dim10 spot check
 - [x] 9. Extra fixes chosen by the user: annealing step cap, batch-means stopping, `cg-cdhr` default (`233b9c2`, step 9)
 - [x] 10. Move our layer from headers to `.cpp` (`polytope_volume.{hpp,cpp}`, `polytope_sampler.{hpp,cpp}`); bit-identical (step 10, committed below)
-- [ ] 11. Benchmark: 10 random syntheticLRA instances, now vs start (`update` @ `75e05e0`): time + volume (in progress, step 11)
+- [x] 11. Benchmark: 10 random syntheticLRA instances, now vs start (`update` @ `75e05e0`): **now is about 2× faster**, 3 more solved (step 11)
 - [ ] 12. **Sampling phase**: test ttc's single-polytope sampler for uniformity, the same way as volume (step 12; reproducer `e8a8b0a`, 8 agents running)
 - [x] 13. Commit after every step (steps 9, 10 committed after the user pointed out the lapse)
 
@@ -336,14 +336,46 @@ cwd/exe in the repo or scratchpad. Told all agents to run one process at a time.
   - **`build/` itself still needs a reconfigure**:
     `CMAKE_GENERATOR="Unix Makefiles" ./configure.sh --skip-deps --ddnnf` after `rm -rf build`.
 
-## Step 11: Benchmark, now vs start (in progress)
+## Step 11: Benchmark, now vs start
 **Did:**
 - Built the start commit (`update` @ `75e05e0`) in a git worktree with the identical static GCC
-  configuration (`scratchpad/ttc-start/build-gcc/ttc`).
-- `scratchpad/bench/bench.py` draws 10 random syntheticLRA1131 instances (seed 20261114) and runs
-  both binaries concurrently on each one (default options, nice 19, 900 s timeout).
+  configuration (`-O3 -DNDEBUG -fopenmp`).
+- `tests/volesti/bench_synthetic.py` draws 10 random syntheticLRA1131 instances (seed 20261114)
+  and runs both binaries **concurrently** on each one, so both see the same machine load.
+- Default options, nice 19, 900 s timeout.
+- "Now" means HEAD `d70d13b`: rounding, scale fix, step cap, batch-means stopping, `cg-cdhr` default.
 
-**Found:** pending.
+**Found:**
+
+| Instance | Dim | Polytopes | Start (s) | Now (s) | Now/start | Start volume | Now volume | Archived `ttc_correct` |
+|---|---|---|---|---|---|---|---|---|
+| dim13_numpol23_seed860 | 13 | 23 | 181.1 | 86.5 | 0.48 | 6.474e29 | 6.359e29 | 5.924e29 |
+| dim22_numpol34_seed427 | 22 | 34 | timeout | 327.7 | <0.36 | — | 2.285e51 | 2.218e51 |
+| dim6_numpol26_seed622 | 6 | 26 | 27.0 | 19.3 | 0.71 | 5.803e13 | 5.670e13 | 5.628e13 |
+| dim7_numpol31_seed693 | 7 | 31 | 47.9 | 29.1 | 0.61 | 1.059e16 | 1.065e16 | 1.057e16 |
+| dim16_numpol39_seed404 | 16 | 39 | 728.6 | 202.6 | 0.28 | 3.064e37 | 3.074e37 | 3.314e37 |
+| dim7_numpol14_seed900 | 7 | 14 | 23.6 | 14.8 | 0.63 | 6.872e15 | 6.962e15 | 6.458e15 |
+| dim11_numpol20_seed94 | 11 | 20 | 113.4 | 46.6 | 0.41 | 7.187e24 | 7.250e24 | 7.222e24 |
+| dim33_numpol10_seed84 | 33 | 10 | timeout | 596.1 | <0.66 | — | 5.359e83 | 4.883e83 |
+| dim22_numpol25_seed699 | 22 | 25 | timeout | 435.5 | <0.48 | — | 1.413e53 | 1.403e53 |
+| dim32_numpol33_seed853 | 32 | 33 | timeout | timeout | — | — | — | 7.611e81 |
+
+- **Speed:**
+  - On the 6 instances both versions solved, the geometric mean of now/start is **0.50**
+    (median 0.54, range 0.28–0.71).
+  - Total wall time over all 10 is 4722 s → 2658 s, counting each timeout as 900 s.
+- **Solved within 900 s:** 6/10 → 9/10. Three instances the start version could not finish are
+  now solved; dim32_numpol33 times out in both.
+- **Where the gain comes from:** the volume oracle sums to 5–14× less time (dim16: 606 s → 44 s;
+  dim13: 124 s → 14 s). Rounding plus CDHR mixes much faster than the unrounded ball walk, and
+  this outweighs the extra phases from the step cap and the batch-means stopping rule.
+- **Volumes:**
+  - Where both solved, now/start is 0.977–1.013.
+  - Against the archived `ttc_correct` values (an older ttc, not ground truth) the new volumes
+    differ by −7% to +8%; the start version shows a similar spread.
+  - syntheticLRA instances have no exact volumes, so this checks consistency, not accuracy.
+- **Caveat:** a single run per binary on a loaded, shared machine. The ratios are robust because
+  both binaries ran side by side, but absolute times are inflated.
 
 ## Step 12: Sampling phase
 **Did:**
