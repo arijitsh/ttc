@@ -131,14 +131,21 @@ std::tuple<MT_dense, VT, bool> max_inscribed_ellipsoid(MT A, VT b, VT const& x0,
             // Spectra needs nev=2 <= n-1: use the dense solver for n <= 2.
             bool spectra_ok = false;
             if (n >= 3) {
-                auto op = get_mat_prod_op<NT>(E2);
-                auto eigs = get_eigs_solver<NT>(op, n);
-                eigs->init();
-                int nconv = eigs->compute();
-                if (eigs->info() == Spectra::COMPUTATION_INFO::SUCCESSFUL) {
-                    Rel = 1.0 / eigs->eigenvalues().coeff(1);
-                    rel = 1.0 / eigs->eigenvalues().coeff(0);
-                    spectra_ok = true;
+                // Spectra throws (e.g. "TridiagEigen: eigen decomposition failed")
+                // when the eigenvalues coincide, as for an already round body;
+                // fall back to the dense solver below.
+                try {
+                    auto op = get_mat_prod_op<NT>(E2);
+                    auto eigs = get_eigs_solver<NT>(op, n);
+                    eigs->init();
+                    int nconv = eigs->compute();
+                    if (eigs->info() == Spectra::COMPUTATION_INFO::SUCCESSFUL) {
+                        Rel = 1.0 / eigs->eigenvalues().coeff(1);
+                        rel = 1.0 / eigs->eigenvalues().coeff(0);
+                        spectra_ok = true;
+                    }
+                } catch (const std::exception&) {
+                    spectra_ok = false;
                 }
             }
             if (!spectra_ok) {
@@ -147,7 +154,7 @@ std::tuple<MT_dense, VT, bool> max_inscribed_ellipsoid(MT A, VT b, VT const& x0,
                     Rel = 1.0 / eigensolver.eigenvalues().coeff(0);
                     rel = 1.0 / eigensolver.eigenvalues().template tail<1>().value();
                 } else {
-                    std::runtime_error("Computations failed.");
+                    throw std::runtime_error("Computations failed.");
                 }
             }
 

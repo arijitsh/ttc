@@ -31,7 +31,7 @@ compute_inscribed_ellipsoid(Custom_MT A, VT b, VT const& x0,
         return barrier_center_ellipsoid_linear_ineq<MT, ellipsoid_type, NT>(A, b, x0, params.barrier_params);
     } else
     {
-        std::runtime_error("Unknown rounding method.");
+        throw std::runtime_error("Unknown rounding method.");
     }
     return {};
 }
@@ -51,7 +51,7 @@ std::tuple<MT, VT, NT> inscribed_ellipsoid_rounding(Polytope &P,
 {
     typedef typename Polytope::PointType Point;
     VT x = compute_feasible_point(P.get_mat(), P.get_vec());
-    return inscribed_ellipsoid_rounding<MT, VT, NT>(P, Point(x), max_eig_ratio, max_iterations, params);
+    return inscribed_ellipsoid_rounding<MT, VT, NT>(P, Point(x), max_iterations, max_eig_ratio, params);
 }
 
 template 
@@ -91,16 +91,23 @@ std::tuple<MT, VT, NT> inscribed_ellipsoid_rounding(Polytope &P,
         // Spectra needs nev=2 <= d-1: use the dense solver for d <= 2.
         bool spectra_ok = false;
         if (d >= 3) {
-            Spectra::DenseSymMatProd<NT> op(E);
-            // The value of ncv is chosen empirically
-            Spectra::SymEigsSolver<NT, Spectra::SELECT_EIGENVALUE::BOTH_ENDS, 
-                                   Spectra::DenseSymMatProd<NT>> eigs(&op, 2, std::min(std::max(10, int(d)/5), int(d)));
-            eigs.init();
-            int nconv = eigs.compute();
-            if (eigs.info() == Spectra::COMPUTATION_INFO::SUCCESSFUL) {
-                R = 1.0 / eigs.eigenvalues().coeff(1);
-                r = 1.0 / eigs.eigenvalues().coeff(0);
-                spectra_ok = true;
+            // Spectra throws (e.g. "TridiagEigen: eigen decomposition failed")
+            // when the eigenvalues coincide, as for an already round body;
+            // fall back to the dense solver below.
+            try {
+                Spectra::DenseSymMatProd<NT> op(E);
+                // The value of ncv is chosen empirically
+                Spectra::SymEigsSolver<NT, Spectra::SELECT_EIGENVALUE::BOTH_ENDS, 
+                                       Spectra::DenseSymMatProd<NT>> eigs(&op, 2, std::min(std::max(10, int(d)/5), int(d)));
+                eigs.init();
+                int nconv = eigs.compute();
+                if (eigs.info() == Spectra::COMPUTATION_INFO::SUCCESSFUL) {
+                    R = 1.0 / eigs.eigenvalues().coeff(1);
+                    r = 1.0 / eigs.eigenvalues().coeff(0);
+                    spectra_ok = true;
+                }
+            } catch (const std::exception&) {
+                spectra_ok = false;
             }
         }
         if (!spectra_ok) {
@@ -109,7 +116,7 @@ std::tuple<MT, VT, NT> inscribed_ellipsoid_rounding(Polytope &P,
                 R = 1.0 / eigensolver.eigenvalues().coeff(0);
                 r = 1.0 / eigensolver.eigenvalues().template tail<1>().value();
             } else {
-                std::runtime_error("Computations failed.");
+                throw std::runtime_error("Computations failed.");
             }
         }
         // Shift polytope and apply the linear transformation on P

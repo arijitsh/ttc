@@ -42,6 +42,7 @@
 #include "volume/sampling_policies.hpp"
 #include "volume/volume_cooling_gaussians.hpp"
 #include "volume/gmp_walks.hpp"
+#include "volume/polytope_volume_oracle.hpp"
 
 // cddlib (double precision) for polytope canonicalization, mirroring the
 // Python prototype's use of pycddlib (src/polytope_operations.py::canonicalize).
@@ -1132,12 +1133,14 @@ VolumeComputationResult computeLraVolume(
       || oracleDelta <= 0.0)
     throw std::invalid_argument("epsilon/delta require an unsupported sample threshold");
 
-  // Both walks default to 10 + dim^2 (lraDefaultWalkLength), overridable via
-  // --walklen-vol / --walklen-samp (a negative option value keeps the default).
+  // The oracle walk defaults per oracle (defaultOracleWalkLength: 10 + dim^2
+  // for the Gaussian ball walk) and the sampling walk to 10 + dim^2
+  // (lraDefaultWalkLength); --walklen-vol / --walklen-samp override them (a
+  // negative option value keeps the default).
   const unsigned volumeWalkLength =
       options.volumeWalkLength >= 0
           ? static_cast<unsigned>(options.volumeWalkLength)
-          : lraDefaultWalkLength(dimension);
+          : defaultOracleWalkLength(options.volumeOracle, dimension);
   const unsigned sampleWalkLength =
       options.sampleWalkLength >= 0
           ? static_cast<unsigned>(options.sampleWalkLength)
@@ -1252,8 +1255,36 @@ VolumeComputationResult computeLraVolume(
   for (auto& entry : prepared)
   {
     double volumeComputeStart = Log.elapsed();
-    double volume = volume_cooling_gaussians<GaussianBallWalk, VolumeRNG>(
-        entry.hpoly, mvcEps, volumeWalkLength);
+    // Round a copy first (Cousins-Vempala, Fig. 2 step 1): every volesti walk
+    // steps in units of the inner radius, so on a skinny body it never crosses
+    // the body and the estimate collapses.  vol(P) = det * vol(rounded P).
+    // The original body keeps its ball/radii for clipping, GetPrecision and
+    // sampling.
+    HPolytope body = entry.hpoly;
+    double roundDet = 1.0;
+    if (options.roundPolytopes)
+    {
+      const RoundingResult rounding = roundForVolume(body, entry.hpoly.InnerBall().first);
+      const auto roundedBall =
+          rounding.applied ? reliableInnerBall(body) : std::pair<Point, double>{Point(1), -1.0};
+      if (rounding.applied && roundedBall.second > 0.0 && std::isfinite(roundedBall.second))
+      {
+        roundDet = rounding.det;
+        Log(2) << "rounded polytope: |det T| = " << roundDet << ", inner radius "
+               << entry.innerRadius << " -> " << roundedBall.second << std::endl;
+      }
+      else
+      {
+        Log(1) << "WARNING: polytope rounding skipped ("
+               << (rounding.applied ? std::string("no inner ball after rounding")
+                                    : rounding.failure)
+               << "); the volume estimate may be poor if the polytope is skinny" << std::endl;
+        body = entry.hpoly;
+      }
+    }
+    VolumeRNG volumeRng(static_cast<int>(dimension));
+    double volume = roundDet * runVolumeOracle(body, options.volumeOracle, mvcEps,
+                                               volumeWalkLength, volumeRng);
     // A practical oracle run can still end non-finite or non-positive, which is
     // a detected failure.  Rerun it on fresh independent streams before giving up.
     constexpr unsigned kOracleAttempts = 3;
@@ -1266,8 +1297,8 @@ VolumeComputationResult computeLraVolume(
              << entry.outerRadius << "); retrying on a fresh random stream" << std::endl;
       SampleRNG oracleRng(static_cast<unsigned>(dimension));
       oracleRng.set_seed(kSeed + 0x51ED2701U * attempt);
-      volume = volume_cooling_gaussians<GaussianBallWalk>(entry.hpoly, oracleRng, mvcEps,
-                                                          volumeWalkLength);
+      volume = roundDet * runVolumeOracle(body, options.volumeOracle, mvcEps,
+                                          volumeWalkLength, oracleRng);
     }
     double volumeComputeElapsed = Log.elapsed() - volumeComputeStart;
     totalVolumeTime += volumeComputeElapsed;

@@ -1250,8 +1250,16 @@ int main(int argc, char *argv[]) {
       "Engine 3 -- LRA volume computation (auto: QF_LRA, no projection vars)");
   classLra.add_options()
       ("walklen-vol", po::value<int>(),
-       "Random-walk length for the volesti volume estimator "
-       "(volume_cooling_gaussians); default 10 + dim^2")
+       "Random-walk length for the per-polytope volume oracle; default 10 + "
+       "dim^2 for cg-ball, 10 + dim/10 for cg-cdhr, 1 for cb-billiard")
+      ("vol-oracle", po::value<std::string>(),
+       "Per-polytope volume oracle: 'cg-ball' (default; Cousins-Vempala "
+       "Gaussian cooling with the Gaussian ball walk), 'cg-cdhr' (Gaussian "
+       "cooling with coordinate hit-and-run) or 'cb-billiard' (volesti cooling "
+       "balls with the billiard walk; much faster, noisier)")
+      ("no-round",
+       "Do not round polytopes (max inscribed ellipsoid -> unit ball) before "
+       "the volume oracle. Unrounded skinny polytopes are badly underestimated")
       ("walklen-samp", po::value<int>(),
        "Random-walk length for volesti point sampling (billiard walk); "
        "default 10 + dim^2")
@@ -2502,6 +2510,24 @@ int main(int argc, char *argv[]) {
           return 1;
         }
       }
+      if (vm.count("vol-oracle"))
+      {
+        std::string s = vm["vol-oracle"].as<std::string>();
+        if (s == "cg-ball")
+          volumeOptions.volumeOracle = ttc::VolumeOracle::CoolingGaussiansBall;
+        else if (s == "cg-cdhr")
+          volumeOptions.volumeOracle = ttc::VolumeOracle::CoolingGaussiansCdhr;
+        else if (s == "cb-billiard")
+          volumeOptions.volumeOracle = ttc::VolumeOracle::CoolingBallsBilliard;
+        else
+        {
+          std::cerr << "Error: --vol-oracle must be one of cg-ball, cg-cdhr, "
+                       "cb-billiard"
+                    << std::endl;
+          return 1;
+        }
+      }
+      volumeOptions.roundPolytopes = vm.count("no-round") == 0;
       volumeOptions.cddSimplify = vm.count("no-cdd-simp") == 0;
       if (vm.count("nogmp") && vm.count("fullgmp"))
       {
@@ -2567,22 +2593,30 @@ int main(int argc, char *argv[]) {
           break;
       }
       std::cout << std::endl;
+      std::cout << "c volume oracle: " << ttc::volumeOracleName(volumeOptions.volumeOracle)
+                << std::endl;
+      std::cout << "c polytope rounding: "
+                << (volumeOptions.roundPolytopes ? "yes" : "no") << std::endl;
       std::cout << "c cdd simplification: "
                 << (volumeOptions.cddSimplify ? "yes" : "no") << std::endl;
 
       // The rest of the options section needs the engine's setup pass (cdd +
       // inner balls), which fixes the walk lengths and lattice precision.
       auto setupPrinter = [&](const ttc::VolumeSetup& setup) {
-        auto walkLength = [](int option, unsigned used) {
-          return std::to_string(used) + (option >= 0 ? "" : " (10 + dim^2)");
+        auto walkLength = [](int option, unsigned used, const char* rule) {
+          return std::to_string(used) + (option >= 0 ? "" : std::string(" (") + rule + ")");
         };
+        const char* volumeRule =
+            volumeOptions.volumeOracle == ttc::VolumeOracle::CoolingGaussiansCdhr ? "10 + dim/10"
+            : volumeOptions.volumeOracle == ttc::VolumeOracle::CoolingBallsBilliard ? "default"
+                                                                                    : "10 + dim^2";
         std::cout << "c volume walk length: "
                   << walkLength(volumeOptions.volumeWalkLength,
-                                setup.volumeWalkLength)
+                                setup.volumeWalkLength, volumeRule)
                   << std::endl;
         std::cout << "c sample walk length: "
                   << walkLength(volumeOptions.sampleWalkLength,
-                                setup.sampleWalkLength)
+                                setup.sampleWalkLength, "10 + dim^2")
                   << std::endl;
         std::cout << "c lattice precision (b): " << setup.latticePrecision
                   << std::endl;

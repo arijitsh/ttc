@@ -8,6 +8,7 @@
 #include <cvc5/cvc5.h>
 
 #include "volume/allsat_volume.hpp"
+#include "volume/volume_oracle_kind.hpp"
 
 namespace ttc
 {
@@ -72,7 +73,8 @@ enum class SamplerWalk
 };
 
 // Tunable knobs for the LRA volume engine. A negative walk length means "use
-// the default" (lraDefaultWalkLength: 10 + dim^2, for both walks).
+// the default": defaultOracleWalkLength for the volume oracle, 10 + dim^2 for
+// the sampling walk.
 struct VolumeOptions
 {
   int volumeWalkLength = -1;  // --walklen-vol N
@@ -86,6 +88,11 @@ struct VolumeOptions
   // which does mean estimates differ from pre-decorrelation runs at any seed.
   unsigned seed = 123;  // --seed N
   SamplerWalk samplerWalk = SamplerWalk::Billiard;  // --sampler
+  // Per-polytope volume oracle (--vol-oracle), run on the rounded polytope.
+  VolumeOracle volumeOracle = VolumeOracle::CoolingGaussiansBall;
+  // Round each polytope (max inscribed ellipsoid -> unit ball) before the
+  // volume oracle, as in Cousins-Vempala; cleared by --no-round.
+  bool roundPolytopes = true;
   GmpMode gmpMode = GmpMode::PointRepr;
   // Minimum GMP arithmetic precision, separate from lattice precision b.
   // 0 => auto (b + 32 decimal digits).
