@@ -89,7 +89,7 @@ struct VolumeOptions
   unsigned seed = 123;  // --seed N
   SamplerWalk samplerWalk = SamplerWalk::Billiard;  // --sampler
   // Per-polytope volume oracle (--vol-oracle), run on the rounded polytope.
-  VolumeOracle volumeOracle = VolumeOracle::CoolingGaussiansBall;
+  VolumeOracle volumeOracle = kDefaultVolumeOracle;
   // Round each polytope (max inscribed ellipsoid -> unit ball) before the
   // volume oracle, as in Cousins-Vempala; cleared by --no-round.
   bool roundPolytopes = true;

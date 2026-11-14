@@ -10,10 +10,13 @@ namespace ttc
 {
 
 // Volume oracle run on each (rounded) polytope.  Selected with --vol-oracle.
-//   CoolingGaussiansBall (default, 'cg-ball'): Gaussian cooling with the
-//     Gaussian ball walk -- the Cousins-Vempala annealing schedule.
-//   CoolingGaussiansCdhr ('cg-cdhr'): same schedule, coordinate hit-and-run
-//     (the walk of Cousins-Vempala's reference implementation).
+//   CoolingGaussiansCdhr (default, 'cg-cdhr'): Cousins-Vempala Gaussian
+//     cooling with coordinate hit-and-run, the walk of their reference
+//     implementation.  On simplices (R/r ~ n even after rounding) it is far
+//     less correlated than the ball walk: sd 0.064 vs 0.176 on the 15-simplex,
+//     and 2.5-8x faster (tests/volesti/test_standard_shapes.cpp).
+//   CoolingGaussiansBall ('cg-ball'): same schedule, Gaussian ball walk
+//     (ttc's oracle before 2026-11).
 //   CoolingBallsBilliard ('cb-billiard'): volesti's cooling balls with the
 //     billiard walk; much faster, somewhat noisier.
 enum class VolumeOracle
@@ -22,6 +25,8 @@ enum class VolumeOracle
   CoolingGaussiansCdhr,
   CoolingBallsBilliard
 };
+
+constexpr VolumeOracle kDefaultVolumeOracle = VolumeOracle::CoolingGaussiansCdhr;
 
 inline const char* volumeOracleName(VolumeOracle oracle)
 {

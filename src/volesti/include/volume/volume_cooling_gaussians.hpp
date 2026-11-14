@@ -140,6 +140,13 @@ NT get_next_gaussian(Polytope& P,
 
     NT last_a = a;
     NT last_ratio = 0.1;
+    // Worst-case cap (valid for every convex body): a^n Z(a) is log-concave
+    // (Kalai-Vempala), so for a' = a(1-alpha)
+    //   E[Y^2]/E[Y]^2 = Z(2a'-a)Z(a)/Z(a')^2 <= ((1-alpha)^2/(1-2alpha))^n.
+    // Keep this <= 1+C; the sample variance below cannot see far tails.
+    const NT q = std::pow(NT(1) + C, NT(1) / NT(P.dimension()));
+    const NT alpha_max = std::sqrt((q - NT(1)) * q) - (q - NT(1));
+    const NT min_shrink = NT(1) - alpha_max;
     //k is needed for the computation of the next variance a_{i+1} = a_i * (1-1/d)^k
     NT k = 1.0;
     const NT tol = 0.00001;
@@ -155,7 +162,7 @@ NT get_next_gaussian(Polytope& P,
 
     while (!done)
     {
-        NT new_a = last_a * std::pow(ratio,k);
+        NT new_a = last_a * std::max(std::pow(ratio,k), min_shrink);
 
         auto fnit = fn.begin();
         for (auto pit=randPoints.begin(); pit!=randPoints.end(); ++pit, fnit++)
@@ -165,7 +172,8 @@ NT get_next_gaussian(Polytope& P,
         std::pair<NT, NT> mv = get_mean_variance(fn);
 
         // Compute a_{i+1}
-        if (mv.second/(mv.first * mv.first)>=C || mv.first/last_ratio<1.0+tol)
+        if (mv.second/(mv.first * mv.first)>=C || mv.first/last_ratio<1.0+tol
+            || std::pow(ratio,k) <= min_shrink)
         {
             if (k != 1.0)
             {
@@ -177,7 +185,7 @@ NT get_next_gaussian(Polytope& P,
         }
         last_ratio = mv.first;
     }
-    return last_a * std::pow(ratio, k);
+    return last_a * std::max(std::pow(ratio, k), min_shrink);
 }
 
 // Compute the sequence of spherical gaussians
@@ -265,6 +273,28 @@ void compute_annealing_schedule(Polytope& P,
             break;
         }
     }
+}
+
+// Relative standard error of the mean of a (possibly autocorrelated) stream,
+// by non-overlapping batch means with ~sqrt(N) batches.
+template <typename NT>
+NT batch_means_relative_se(std::vector<NT> const& ys, NT const& mean)
+{
+    const std::size_t N = ys.size();
+    const std::size_t nb = std::max<std::size_t>(2, (std::size_t) std::sqrt((double) N));
+    const std::size_t bs = N / nb;
+    if (bs == 0 || mean <= NT(0)) return std::numeric_limits<NT>::max();
+    NT bm_mean = 0;
+    std::vector<NT> bm(nb, NT(0));
+    for (std::size_t b = 0; b < nb; ++b) {
+        for (std::size_t i = 0; i < bs; ++i) bm[b] += ys[b * bs + i];
+        bm[b] /= NT(bs);
+        bm_mean += bm[b] / NT(nb);
+    }
+    NT var_bm = 0;
+    for (std::size_t b = 0; b < nb; ++b) var_bm += (bm[b] - bm_mean) * (bm[b] - bm_mean);
+    var_bm /= NT(nb - 1);
+    return std::sqrt(var_bm / NT(nb)) / mean;
 }
 
 template <typename NT>
@@ -402,6 +432,8 @@ double volume_cooling_gaussians(Polytope& Pin,
         unsigned int index = 0;
         unsigned int min_steps = 0;
         std::vector<NT> last_W = last_W2;
+        std::vector<NT> ys;          // the ratio stream of this phase
+        NT next_check = 0;
 
         // Set the radius for the ball walk
         WalkType walk(P, p, *avalsIt, rng);
@@ -415,7 +447,9 @@ double volume_cooling_gaussians(Polytope& Pin,
             walk.apply(P, p, *avalsIt, walk_length, rng);
 
             *itsIt = *itsIt + 1.0;
-            *fnIt = *fnIt + eval_exp(p,*(avalsIt+1)) / eval_exp(p,*avalsIt);
+            NT y = eval_exp(p,*(avalsIt+1)) / eval_exp(p,*avalsIt);
+            ys.push_back(y);
+            *fnIt = *fnIt + y;
             NT val = (*fnIt) / (*itsIt);
 
             last_W[index] = val;
@@ -441,9 +475,17 @@ double volume_cooling_gaussians(Polytope& Pin,
                 max_index = std::distance(last_W.begin(), minmaxIt);
             }
 
-            if ( (max_val-min_val)/max_val <= curr_eps/2.0 )
+            // The window test alone only bounds the drift of the running mean
+            // over the last W steps; its delivered error scales like
+            // sqrt(curr_eps), not curr_eps.  Additionally require the
+            // batch-means relative standard error of this ratio to be
+            // <= curr_eps/2, so the product of mm ratios has sd <= error/2.
+            if ( (max_val-min_val)/max_val <= curr_eps/2.0 && *itsIt >= next_check )
             {
-                done=true;
+                if (batch_means_relative_se(ys, (*fnIt) / (*itsIt)) <= curr_eps/2.0)
+                    done=true;
+                else
+                    next_check = NT(1.2) * (*itsIt);
             }
 
             index = index%W + 1;

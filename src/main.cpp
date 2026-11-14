@@ -1251,12 +1251,13 @@ int main(int argc, char *argv[]) {
   classLra.add_options()
       ("walklen-vol", po::value<int>(),
        "Random-walk length for the per-polytope volume oracle; default 10 + "
-       "dim^2 for cg-ball, 10 + dim/10 for cg-cdhr, 1 for cb-billiard")
+       "dim/10 for cg-cdhr, 10 + dim^2 for cg-ball, 1 for cb-billiard")
       ("vol-oracle", po::value<std::string>(),
-       "Per-polytope volume oracle: 'cg-ball' (default; Cousins-Vempala "
-       "Gaussian cooling with the Gaussian ball walk), 'cg-cdhr' (Gaussian "
-       "cooling with coordinate hit-and-run) or 'cb-billiard' (volesti cooling "
-       "balls with the billiard walk; much faster, noisier)")
+       "Per-polytope volume oracle: 'cg-cdhr' (default; Cousins-Vempala "
+       "Gaussian cooling with coordinate hit-and-run), 'cg-ball' (Gaussian "
+       "cooling with the Gaussian ball walk, the pre-2026-11 oracle) or "
+       "'cb-billiard' (volesti cooling balls with the billiard walk; much "
+       "faster, noisier)")
       ("no-round",
        "Do not round polytopes (max inscribed ellipsoid -> unit ball) before "
        "the volume oracle. Unrounded skinny polytopes are badly underestimated")

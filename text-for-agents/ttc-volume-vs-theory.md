@@ -71,7 +71,22 @@ Even where it matches the theory, the oracle is a heuristic. The `(1±ε')` with
   `(π/a₀)^{n/2} ∏ Rᵢ` (`:362`). There is no |T| factor because there is no rounding.
 - The sliding-window rule `(max−min)/max ≤ ε'/2` (`:430`, `Volume.m:296`).
 
-## Implications for the fix (to be confirmed by the test agents)
+## What was changed (2026-11-14)
+| Deviation | Fix | Commit |
+|---|---|---|
+| 1. No rounding | ttc rounds every polytope before the oracle with volesti's max-inscribed-ellipsoid rounding (the port of [MATLAB] `preprocess.m`), then multiplies by \|det T\|. It falls back to the unrounded body if rounding fails. Code: `src/volume/polytope_volume_oracle.hpp`; `--no-round` turns it off | `882cf3f` |
+| 2, 3. Absolute constants | `volume_cooling_gaussians` rescales the body to unit inner radius and multiplies the result by rⁿ. The a₀ bisection uses a relative tolerance, as [MATLAB] does | `6494cf2` |
+| 3b. Unsafe annealing step | `get_next_gaussian` never shrinks a by more than a factor 1−α_max(n,C), where ((1−α)²/(1−2α))ⁿ ≤ 1+C follows from the log-concavity of aⁿZ(a). This guarantees Var/E² ≤ C for every convex body, which [CV-PVA] Lemma 3 gives only for n ≥ 4 | see below |
+| 5. Walk | Default oracle is now `cg-cdhr`: Gaussian cooling with coordinate hit-and-run, the [MATLAB] default walk. `--vol-oracle {cg-cdhr, cg-ball, cb-billiard}` selects the oracle | see below |
+| 7 (partly). Stopping rule | Each phase must also reach a batch-means relative standard error ≤ ε'/2, so the delivered error tracks the requested one: at ε'=0.03, 95–100% of runs fall within target, up from 53–68% | see below |
+| — | volesti rounding bugs: Spectra throws in d ≤ 2 and on round bodies (fixed with a dense eigensolver fallback), errors were constructed but never thrown, and an overload had swapped arguments | `6494cf2`, `882cf3f` |
+
+Still open:
+- The fixed oracle seed, and δ' is never used (row 7).
+- W = 6n²+800 (row 6, benign).
+- The full-error per-phase target (row 8, minor).
+
+## Implications for the fix (written before the fix)
 1. **Normalise scale** so that the inner radius is 1: x ↦ x/r, then multiply the volume by
    rⁿ, accumulated in log space. This makes rows 2 and 3 harmless, and is what [CV-GC] assumes
    (`B_n ⊆ K`). Patching volesti so it is scale-free (`upper*1e-7` and δ = 4·min(r, 1/√a)/√n) is
