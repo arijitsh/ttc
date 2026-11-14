@@ -195,6 +195,41 @@ inline double ttcVolumeSeeded(const HPoly& P, unsigned seed, double epsilon = 0.
       .volumeWithSeed(oracle, epsilon / 12.0, ttc::defaultOracleWalkLength(oracle, n), seed);
 }
 
+// ------------------------------------------------------------------ sampling
+// ttc's single-polytope sampler (src/volume/polytope_sampler.cpp), exactly as
+// lra_volume.cpp calls it.
+//   ttcProposals: n points, each the endpoint of a fresh walk of walkLength
+//                 steps started at the certified Chebyshev centre (default
+//                 walk length 10 + n^2, ttc's lraDefaultWalkLength).
+//   ttcLatticeSamples: GenerateSamples -- proposals from the facet-inflated
+//                 body, stochastic rounding to 10^-b Z^n, rejection against P.
+inline std::vector<VT> ttcProposals(const MT& A, const VT& b, long long n, unsigned seed,
+                                    ttc::SamplerWalk walk = ttc::SamplerWalk::Billiard,
+                                    int walkLength = -1)
+{
+  const unsigned wl = walkLength >= 0 ? unsigned(walkLength) : ttcWalkLength(int(A.cols()));
+  double ballSeconds = 0;
+  return ttc::sampleRestartWalk(A, b, n, walk, wl, seed, ballSeconds);
+}
+
+inline std::vector<VT> ttcLatticeSamples(const MT& A, const VT& b, long long n, int precision,
+                                         unsigned seed,
+                                         ttc::SamplerWalk walk = ttc::SamplerWalk::Billiard,
+                                         double epsilon = 0.8, double delta = 0.2,
+                                         int walkLength = -1)
+{
+  const unsigned wl = walkLength >= 0 ? unsigned(walkLength) : ttcWalkLength(int(A.cols()));
+  unsigned walkSeed = seed * 2654435761u + 1u;
+  auto generate = [&](const MT& Ai, const VT& bi, long long k, double& t) {
+    double ballSeconds = 0;
+    t = 0;
+    return ttc::sampleRestartWalk(Ai, bi, k, walk, wl, walkSeed++, ballSeconds);
+  };
+  double samplingTime = 0;
+  return ttc::sampleLattice<double>(A, b, n, precision, epsilon / 12.0, delta, seed, generate,
+                                    samplingTime);
+}
+
 // Same oracle on an explicitly seeded RNG (for statistics across seeds).
 inline double gaussianOracle(HPoly P, unsigned seed, double error, unsigned walkLength)
 {
