@@ -14,10 +14,10 @@
 - [x] 11. Benchmark: 10 random syntheticLRA instances, now vs start (`update` @ `75e05e0`): **now is about 2× faster**, 3 more solved (step 11)
 - [ ] 12. **Sampling phase**: test ttc's single-polytope sampler for uniformity, the same way as volume (step 12; reproducer `e8a8b0a`; 5 agents running, 3 on hold)
   - [x] 12a. Harness helpers (`ttcProposals`, `ttcLatticeSamples`) + long-box reproducer (`e8a8b0a`)
-  - [~] 12b. Agent tests: skinny, lattice, mixing, theory done (`58d51ac`); shapes (+boxes) running; boxes, walks, gmp on hold
+  - [x] 12b. Agent tests: skinny, lattice, mixing, theory (`58d51ac`), shapes (+boxes) (`ca301a2`); boxes, walks, gmp on hold
   - [x] 12c. Read the sampling theory → `text-for-agents/ttc-sampling-vs-theory.md`
   - [x] 12d. Fix the sampler: round + map back, exact lattice membership, ball-walk length ≥ 30 (`08026a2`)
-  - [~] 12e. Validate: default-walk sampling tests pass, e2e 67/67; benchmark rerun in progress; non-default walks open
+  - [~] 12e. Validate: **all sampling suites pass for every walk** (`722ff7b`), e2e 67/67; benchmark rerun in progress
 - [x] 13. Commit after every step (steps 9, 10 committed after the user pointed out the lapse)
 - [ ] 14. Follow-ups:
   - [ ] 14a. `build/` is in a mixed state (Ninja/clang cache, stale GCC Makefiles). You need to
@@ -503,4 +503,45 @@ with KS in each body's own coordinates. Validated the rounding patch in an overl
     start point). The lattice test's ball cases fail (p ≈ 1e-86).
   - **CDHR on 6–8D simplices.** The near-vertex regions are under-covered (KS p ≈ 1e-7).
   - **Accelerated billiard.** One borderline gauge-KS result (D = 0.0292 vs critical 0.0276).
+
+### s-shapes (`tests/volesti/test_sampling_shapes.cpp`, ~45 s; slow sweeps `-ts=slow --no-skip`)
+**Did:**
+- Exact-null checks at α=1e-4, run for billiard, CDHR and RDHR:
+  - gauge KS about the centre and about a near-vertex point;
+  - vertex homothets, each with mass cⁿ;
+  - Beta marginals on the simplex;
+  - an orthant χ² on the cross-polytope;
+  - per-coordinate uniform tests on rotated cubes and boxes (dims 1–10);
+  - sector χ² on polygons;
+  - Δa×Δb products.
+- A sharp-corner rerun with N=40000.
+
+**Found:**
+- **Billiard is biased toward the centre at every walk length**, rounded or not: gauge
+  D+ ≈ 0.01. volesti stops every bounce at `dl = 0.995` of the distance to the facet
+  (`uniform_billiard_walk.hpp:98,149`), skipping a boundary layer.
+  - With `dl = 0.999999`: simplex6 D+ goes 0.0093 → 0.0030, and cross6 p goes 4.5e-5 → 0.56.
+- **Unrounded boxes with aspect ≥ 4** fail for billiard and RDHR (35 checks). Rounding fixes this.
+- **Rounding removes CDHR's axis alignment.** Rounded CDHR under-covers simplex vertices at
+  10+n² (25 failures on simplex10); a 4× walk length passes.
+- **RDHR** under-covers simplex vertices (observed/expected 0.30–0.65) at the default length.
+
+## Step 12e: Walk fixes and validation (`722ff7b`)
+**Did:**
+- Set `dl = 0.999999` in volesti's billiard and accelerated-billiard walks.
+- Per-walk default sample walk length (`sampler_kind.hpp`, shared with the tests):
+
+| Walk | Default length | Why |
+|---|---|---|
+| Billiard, accelerated billiard | 10+n² | Passes from 1–2 steps once rounded |
+| Ball | ≥ 100 | At 30 the lattice test fails: the step 4r/√n overshoots a rounded 2D body, leaving an atom at the start |
+| RDHR / CDHR | 8·(10+n²) | At 4× one cross6 vertex check still failed (ratio 1.7) |
+
+**Found:**
+- **Every default sampling suite passes:** smoke 2/2, skinny 4/4, mixing 7/7, lattice 9/9,
+  shapes 7/7.
+- **e2e:** 67/67 (22.2 s).
+- Every `--sampler` gives the long box 2074.55.
+- **Untested:** the slow sweeps with these final settings; the boxes, walks and gmp agents are
+  still on hold.
 
