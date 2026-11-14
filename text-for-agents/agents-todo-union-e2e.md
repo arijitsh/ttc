@@ -12,7 +12,7 @@ Single-polytope volume and sampling work: `agent-todo.md`.
 - [~] U4. Fan out 5 agents (CPU cap: 12 cores, nice 19, ≤ 2 processes each) — all 5 launched:
   - [ ] u-core: T1 estimator with exact components + T5 store mechanics → `test_union_core.cpp`
   - [ ] u-robust: T2 error injection (volume ±ε′, sampler TV η) → `test_union_robust.cpp`
-  - [ ] u-params: T3 lattice count vs volume + T4 Thresh/ε′/δ′/clipping →
+  - [x] u-params: T3 lattice count vs volume + T4 Thresh/ε′/δ′/clipping →
     `test_union_lattice.cpp`, `test_union_params.cpp`
   - [ ] u-decomp: T6 decomposition soundness/completeness via `--dump-ine` →
     `tests/volesti/union_decomp/`, `run_union_decomp.py`
@@ -59,3 +59,32 @@ code against both algorithms.
 **Did:** launched u-core (T1+T5), u-robust (T2), u-params (T3+T4), u-decomp (T6) and u-e2e (T7).
 Each owns its own test files, makes no edits under `src/`, makes no commits, and runs at most 2
 niced processes.
+
+### u-params (T3 + T4): `test_union_lattice.cpp` (7 cases, 4.6 s), `test_union_params.cpp` (6 cases, 6.7 s)
+**Did:**
+- Recomputed Alg. 2 by hand over 11760 grid points.
+- Checked the Azuma tail with natural log against log₁₀.
+- Ran the proof steps of `lem:nonconv` numerically.
+- Enumerated |Q∩L| exactly on 13 unions: L-shape, frame, staircase, triangles tiling a square or a
+  hexagon, 3D L, cube∪simplex, …
+- Checked Thresh against Alg. 1 line 5, and checked ttc's wiring of ε′, δ′ and b.
+- Checked clipping soundness on 160 bodies, and scale extremes (dims up to 40, sides 1e±9).
+
+**Found:**
+- **All correct in code:**
+  - `precisionFromCubes` matches Alg. 2 exactly. The natural log is the right one; with log₁₀ the
+    Azuma bound fails.
+  - Thresh matches the formula and satisfies both inequalities of the `numlattice` proof.
+  - The clip bounds are sound: γ ≤ true inradius, R ≥ max vertex distance.
+  - `lem:lattice` holds at ttc's b with |err| ≤ 2.3e-5 against η ≈ 3e-3.
+  - At extreme scales ttc throws rather than returning a wrong value.
+- **Proof-text gap in `lem:nonconv`** (analysis.tex ~l.193). The step (1+κ/γ)ⁿ ≤ (1+η/32mn)ⁿ cites
+  √u+√v ≤ √(2(u+v)), which only gives κ ≤ 2√ln(8r/η), but Alg. 2 uses ln(4r/η). The code-level
+  check fails at 2913 of 720k points.
+  - The lemma's conclusion still holds because of slack elsewhere, so there is **no accuracy impact**.
+  - **Fix:** use 8r/η in Alg. 2 and at `union_estimator.cpp:17`; validated in an overlay, with 0
+    failures. **Decision for the user (paper + code).**
+- **GetPrecision is conservative:** ttc's b is 2–4 digits above the smallest η-accurate b.
+  - It costs almost nothing: C is tracked in logs, and the extra halvings run on an empty store.
+  - Exception: with `--nogmp`, double coordinates resolve 10⁻ᵇ only while |x|·10ᵇ < 2⁵³.
+
