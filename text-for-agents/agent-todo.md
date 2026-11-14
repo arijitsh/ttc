@@ -96,6 +96,29 @@ cannot mix on the long box:
 
 **Conclusion:** the fix must be rounding and/or schedule repair, not a different walk.
 
+### elongated (`tests/volesti/test_elongated.cpp`, 10 cases, ~12 s; slow sweeps tagged `slow`)
+**Did:** aspect-ratio sweeps over boxes (one long axis, several long axes, a thin axis),
+stretched simplices and rotated long boxes, in n = 2..10, plus walk-length scaling.
+
+**Found — failure envelope:**
+- One long axis fails from aspect 5 at n=2,3, and from about 10 at n=5..10.
+- Stretched simplices fail from aspect 2–5.
+- At aspect ≥ 100 it **always underestimates** (−0.67 to −1.0).
+- In the 10–100 range, single runs can also overshoot (up to +9.1).
+
+**Found — walk length** (R=100, 2D): mean error −0.63 at walk length 14, −0.20 at 140, −0.08 at
+1400. That run took 513 s, and the required length grows like aspect².
+
+**Found — side bug:** `max_inscribed_ellipsoid.hpp:132` uses an eigen-solver that throws
+`std::invalid_argument` for n < 3.
+
+**Validated patch:** map the maximum inscribed ellipsoid to the unit ball before cooling.
+Iterate up to 5×, stopping once the axis ratio is ≤ 6, and multiply the result by |det|.
+Guard against a non-finite transform or a centre outside P.
+- All elongated cases: ≤ 0.06 mean error up to aspect 1e4 in n = 2..8.
+- Small cubes (side 1e-3): −0.93 → −0.017.
+- Runtime drops from 11.5 s to 3.6 s.
+
 ## Step 4: Theory
 **Did:** read [CV-PVA] (§2–4.2), [CV-GC] (Algorithm figure, assumptions), and the MATLAB
 `Volume.m`, `ConvexBody.m` and `preprocess.m`. Wrote `ttc-volume-vs-theory.md`.
