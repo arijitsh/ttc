@@ -12,7 +12,7 @@
 - [x] 9. Extra fixes chosen by the user: annealing step cap, batch-means stopping, `cg-cdhr` default (`233b9c2`, step 9)
 - [x] 10. Move our layer from headers to `.cpp` (`polytope_volume.{hpp,cpp}`, `polytope_sampler.{hpp,cpp}`); bit-identical (step 10, committed below)
 - [x] 11. Benchmark: 10 random syntheticLRA instances, now vs start (`update` @ `75e05e0`): **now is about 2× faster**, 3 more solved (step 11)
-- [ ] 12. **Sampling phase**: test ttc's single-polytope sampler for uniformity, the same way as volume (step 12; reproducer `e8a8b0a`, 8 agents running)
+- [ ] 12. **Sampling phase**: test ttc's single-polytope sampler for uniformity, the same way as volume (step 12; reproducer `e8a8b0a`; 5 agents running, 3 on hold)
 - [x] 13. Commit after every step (steps 9, 10 committed after the user pointed out the lapse)
 
 ---
@@ -390,4 +390,11 @@ cwd/exe in the repo or scratchpad. Told all agents to run one process at a time.
     length is 2√n·r ≈ 2.8.
   - Like the oracle, the sampler runs on the *unrounded* body.
 - Launched 8 sampling agents: boxes, skinny, shapes, lattice, mixing, gmp, walks, theory.
+- **Interrupted twice by API usage limits** (5-hour limit, then the weekly limit), before any agent
+  had written a test file.
+- After the 20:30 reset I resumed the 5 most important: skinny + fix, lattice, mixing,
+  shapes (now also covering boxes) and theory.
+- **On hold to save usage:** boxes (overlaps with smoke/shapes/mixing), walks (MCMC correctness of
+  volesti's walks) and gmp (the non-default `--fullgmp` mode). They can be resumed later.
+- The CPU guard was restarted for the new Claude process.
 
