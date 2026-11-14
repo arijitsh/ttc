@@ -43,6 +43,25 @@ InnerBall certifiedInnerBall(const Eigen::MatrixXd& A, const Eigen::VectorXd& b)
 double outerRadius(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                    const Eigen::VectorXd& center);
 
+// Affine rounding of P = {x : A x <= b}: the maximum inscribed ellipsoid of P
+// (iterated, volesti's inscribed_ellipsoid_rounding, 5 iterations, axis-ratio
+// stop 6) is mapped to the unit ball.  The rounded body {y : A y <= b} (fields
+// A, b) satisfies x = shift + T y for x in P, and vol(P) = det * vol(rounded).
+// `ball` must be certifiedInnerBall(A, b).  On failure applied == false.
+struct PolytopeRounding
+{
+  bool applied = false;
+  std::string failure;
+  Eigen::MatrixXd T;
+  Eigen::VectorXd shift;
+  double det = 1.0;
+  Eigen::MatrixXd A;  // rounded body, rows normalised
+  Eigen::VectorXd b;
+  InnerBall ball;     // certified ball of the rounded body
+};
+PolytopeRounding roundPolytope(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
+                               const InnerBall& ball);
+
 // A polytope prepared for the volume oracle: row-normalised, holding its
 // certified inner ball, and (unless rounding is off or fails) rounded so that
 // its maximum inscribed ellipsoid is the unit ball.  vol(P) = det() *

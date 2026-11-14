@@ -260,6 +260,8 @@ struct RoundingResult
   double det = 1.0;     // vol(P_original) = det * vol(P_rounded)
   bool applied = false;
   std::string failure;  // why rounding was skipped (empty if applied)
+  Eigen::MatrixXd T;    // x = shift + T y maps the rounded body onto P
+  Eigen::VectorXd shift;
 };
 
 // Rounds P in place so that its maximum inscribed ellipsoid becomes the unit
@@ -293,6 +295,8 @@ RoundingResult roundForVolume(HPoly& P, const typename HPoly::PointType& interio
     {
       result.det = det;
       result.applied = true;
+      result.T = std::get<0>(rounding);
+      result.shift = std::get<1>(rounding);
       return result;
     }
   }
@@ -343,6 +347,38 @@ InnerBall certifiedInnerBall(const Eigen::MatrixXd& A, const Eigen::VectorXd& b)
   HPoly P(static_cast<unsigned>(A.cols()), A, b);
   const auto ball = reliableInnerBall(P);
   return {ball.first.getCoefficients(), ball.second};
+}
+
+PolytopeRounding roundPolytope(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
+                               const InnerBall& ball)
+{
+  PolytopeRounding out;
+  if (ball.radius <= 0.0)
+  {
+    out.failure = "no inner ball";
+    return out;
+  }
+  HPoly body = makeBody(A, b, ball);
+  const RoundingResult rounding = roundForVolume(body, Point(ball.center));
+  if (!rounding.applied)
+  {
+    out.failure = rounding.failure;
+    return out;
+  }
+  const auto roundedBall = reliableInnerBall(body);
+  if (!(roundedBall.second > 0.0 && std::isfinite(roundedBall.second)))
+  {
+    out.failure = "no inner ball after rounding";
+    return out;
+  }
+  out.applied = true;
+  out.det = rounding.det;
+  out.T = rounding.T;
+  out.shift = rounding.shift;
+  out.A = body.get_mat();
+  out.b = body.get_vec();
+  out.ball = {roundedBall.first.getCoefficients(), roundedBall.second};
+  return out;
 }
 
 struct RoundedPolytope::Impl

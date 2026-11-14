@@ -80,18 +80,26 @@ std::vector<Eigen::VectorXd> runRestartWalk(HPoly& hpoly,
 std::vector<Eigen::VectorXd> sampleRestartWalk(const Eigen::MatrixXd& A,
                                                const Eigen::VectorXd& b, long long n,
                                                SamplerWalk walk, unsigned walkLength,
-                                               unsigned seed, double& ballSeconds)
+                                               unsigned seed, double& ballSeconds, bool round)
 {
   const auto ballStart = std::chrono::steady_clock::now();
   const InnerBall ball = certifiedInnerBall(A, b);
-  HPoly hpoly(static_cast<unsigned>(A.cols()), A, b);
+  PolytopeRounding rounding;
+  if (round) rounding = roundPolytope(A, b, ball);
+  const Eigen::MatrixXd& Aw = rounding.applied ? rounding.A : A;
+  const Eigen::VectorXd& bw = rounding.applied ? rounding.b : b;
+  const InnerBall& start = rounding.applied ? rounding.ball : ball;
+  HPoly hpoly(static_cast<unsigned>(A.cols()), Aw, bw);
   hpoly.normalize();
-  if (ball.radius > 0.0) hpoly.set_InnerBall({Point(ball.center), ball.radius});
+  if (start.radius > 0.0) hpoly.set_InnerBall({Point(start.center), start.radius});
   ballSeconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - ballStart).count();
   SampleRNG rng(static_cast<int>(A.cols()));
   rng.set_seed(seed);
-  return runRestartWalk(hpoly, Point(ball.center), n, walk, walkLength, rng);
+  auto out = runRestartWalk(hpoly, Point(start.center), n, walk, walkLength, rng);
+  if (rounding.applied)
+    for (auto& y : out) y = rounding.shift + rounding.T * y;
+  return out;
 }
 
 }  // namespace ttc

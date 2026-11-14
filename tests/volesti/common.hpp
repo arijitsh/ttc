@@ -207,7 +207,8 @@ inline std::vector<VT> ttcProposals(const MT& A, const VT& b, long long n, unsig
                                     ttc::SamplerWalk walk = ttc::SamplerWalk::Billiard,
                                     int walkLength = -1)
 {
-  const unsigned wl = walkLength >= 0 ? unsigned(walkLength) : ttcWalkLength(int(A.cols()));
+  const unsigned wl =
+      walkLength >= 0 ? unsigned(walkLength) : ttc::defaultSampleWalkLength(walk, A.cols());
   double ballSeconds = 0;
   return ttc::sampleRestartWalk(A, b, n, walk, wl, seed, ballSeconds);
 }
@@ -218,7 +219,8 @@ inline std::vector<VT> ttcLatticeSamples(const MT& A, const VT& b, long long n, 
                                          double epsilon = 0.8, double delta = 0.2,
                                          int walkLength = -1)
 {
-  const unsigned wl = walkLength >= 0 ? unsigned(walkLength) : ttcWalkLength(int(A.cols()));
+  const unsigned wl =
+      walkLength >= 0 ? unsigned(walkLength) : ttc::defaultSampleWalkLength(walk, A.cols());
   unsigned walkSeed = seed * 2654435761u + 1u;
   auto generate = [&](const MT& Ai, const VT& bi, long long k, double& t) {
     double ballSeconds = 0;

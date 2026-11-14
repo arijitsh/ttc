@@ -1262,8 +1262,8 @@ int main(int argc, char *argv[]) {
        "Do not round polytopes (max inscribed ellipsoid -> unit ball) before "
        "the volume oracle. Unrounded skinny polytopes are badly underestimated")
       ("walklen-samp", po::value<int>(),
-       "Random-walk length for volesti point sampling (billiard walk); "
-       "default 10 + dim^2")
+       "Random-walk length for volesti point sampling; default 10 + dim^2 "
+       "(at least 30 for the ball walk)")
       ("sampler", po::value<std::string>(),
        "Random walk used to sample uniform points from each polytope: "
        "'billiard' (default), 'accel-billiard', 'ball', 'rdhr' "
@@ -2617,7 +2617,10 @@ int main(int argc, char *argv[]) {
                   << std::endl;
         std::cout << "c sample walk length: "
                   << walkLength(volumeOptions.sampleWalkLength,
-                                setup.sampleWalkLength, "10 + dim^2")
+                                setup.sampleWalkLength,
+                                volumeOptions.samplerWalk == ttc::SamplerWalk::Ball
+                                    ? "max(30, 10 + dim^2)"
+                                    : "10 + dim^2")
                   << std::endl;
         std::cout << "c lattice precision (b): " << setup.latticePrecision
                   << std::endl;

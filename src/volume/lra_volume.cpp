@@ -846,7 +846,7 @@ VolumeComputationResult computeLraVolume(
   const unsigned sampleWalkLength =
       options.sampleWalkLength >= 0
           ? static_cast<unsigned>(options.sampleWalkLength)
-          : lraDefaultWalkLength(dimension);
+          : defaultSampleWalkLength(options.samplerWalk, dimension);
 
   Log(2) << "Starting union algorithm, threshold: " << thresh << std::endl;
   // Volesti's practical cooling API accepts epsilon but no confidence delta.
@@ -1013,7 +1013,7 @@ VolumeComputationResult computeLraVolume(
     double ballSeconds = 0.0;
     double samplingStart = Log.elapsed();
     auto out = sampleRestartWalk(A, b, n, options.samplerWalk, sampleWalkLength, streamSeed(),
-                                 ballSeconds);
+                                 ballSeconds, options.roundPolytopes);
     samplerBallTime += ballSeconds;
     samplingTime = Log.elapsed() - samplingStart - ballSeconds;
     return out;
@@ -1064,9 +1064,14 @@ VolumeComputationResult computeLraVolume(
               double& samplingTime) {
             const double ballStart = Log.elapsed();
             const InnerBall ball = certifiedInnerBall(A, b);
+            // As in sampleRestartWalk: walk in the rounded body and map back.
+            PolytopeRounding rounding;
+            if (options.roundPolytopes) rounding = roundPolytope(A, b, ball);
+            const Eigen::MatrixXd& Aw = rounding.applied ? rounding.A : A;
+            const Eigen::VectorXd& bw = rounding.applied ? rounding.b : b;
             samplerBallTime += Log.elapsed() - ballStart;
-            const Eigen::VectorXd& center = ball.center;
-            const double radius = ball.radius;
+            const Eigen::VectorXd& center = rounding.applied ? rounding.ball.center : ball.center;
+            const double radius = rounding.applied ? rounding.ball.radius : ball.radius;
             double samplingStart = Log.elapsed();
             // One stream advance per polytope, drawn before the switch so the
             // sequence of seeds does not depend on which walk is selected.
@@ -1075,23 +1080,29 @@ VolumeComputationResult computeLraVolume(
             switch (walk)
             {
               case SamplerWalk::Ball:
-                pts = sampleGmpBallWalk(A, b, center, radius, n,
+                pts = sampleGmpBallWalk(Aw, bw, center, radius, n,
                                         sampleWalkLength, walkSeed, true);
                 break;
               case SamplerWalk::RDHR:
-                pts = sampleGmpRDHR(A, b, center, radius, n, sampleWalkLength,
+                pts = sampleGmpRDHR(Aw, bw, center, radius, n, sampleWalkLength,
                                     walkSeed, true);
                 break;
               case SamplerWalk::CDHR:
-                pts = sampleGmpCDHR(A, b, center, radius, n, sampleWalkLength,
+                pts = sampleGmpCDHR(Aw, bw, center, radius, n, sampleWalkLength,
                                     walkSeed, true);
                 break;
               case SamplerWalk::AcceleratedBilliard:
               case SamplerWalk::Billiard:
               default:
-                pts = sampleGmpBilliard(A, b, center, radius, n,
+                pts = sampleGmpBilliard(Aw, bw, center, radius, n,
                                         sampleWalkLength, walkSeed, true);
                 break;
+            }
+            if (rounding.applied)
+            {
+              const MpVector shift = rounding.shift.cast<MpFloat>();
+              const auto T = rounding.T.cast<MpFloat>().eval();
+              for (auto& y : pts) y = shift + T * y;
             }
             samplingTime = Log.elapsed() - samplingStart;
             return pts;

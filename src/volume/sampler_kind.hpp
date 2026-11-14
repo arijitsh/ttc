@@ -4,6 +4,9 @@
 // so lra_volume.hpp / main.cpp stay light; the sampler itself lives in
 // polytope_sampler.hpp.
 
+#include <algorithm>
+#include <cstddef>
+
 namespace ttc
 {
 
@@ -23,5 +26,16 @@ enum class SamplerWalk
   RDHR,
   CDHR
 };
+
+
+// Default number of walk steps per sample (each sample restarts at the centre
+// of the rounded body): 10 + dim^2, but at least 30 for the ball walk, whose
+// step 4r/sqrt(n) is too short in low dimension (2-D cube needs ~28 steps;
+// tests/volesti/test_sampling_mixing.cpp).
+inline unsigned defaultSampleWalkLength(SamplerWalk walk, std::size_t dimension)
+{
+  const unsigned base = static_cast<unsigned>(10 + dimension * dimension);
+  return walk == SamplerWalk::Ball ? std::max(base, 30u) : base;
+}
 
 }  // namespace ttc
