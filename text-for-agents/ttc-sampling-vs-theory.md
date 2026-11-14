@@ -76,7 +76,22 @@ sampling agents' tests as they report (`agent-todo.md`, step 12).*
   exp(−2κ²).
 - **Retry budget.** The bound n·(ε′/3)ᵏ ≤ δ is a correct union bound, assuming uniform proposals.
 
-## Recommended fix (to be validated by the skinny/mixing agents)
+## What was changed (2026-11-14)
+| Deviation | Fix | Commit |
+|---|---|---|
+| 1, 2. Restart on the unrounded body | The walk runs in the rounded body, using `roundPolytope`, the same max-inscribed-ellipsoid map as the volume oracle, including in `--fullgmp`. Each point is mapped back with x = shift + T·y before the lattice step. The restart design stays: the mixing tests showed that one long chain keeps lag-1 correlation | `08026a2` |
+| 4. Walk length | Per-walk defaults (`sampler_kind.hpp`): billiard 10+n²; ball walk ≥ 100; RDHR/CDHR 8·(10+n²), all chosen from the uniformity tests | `08026a2`, `722ff7b` |
+| new | Billiard bias: volesti reflects at `dl = 0.995` of the distance to the facet, which under-samples a boundary layer at every walk length. Changed to 0.999999 | `722ff7b` |
+| new | Lattice membership: `A(k/10ᵇ) ≤ b` dropped lattice points lying exactly on a facet (floating-point noise). Now tested as `A·k ≤ 10ᵇ·b`, exact in GMP | `08026a2` |
+| new | A tiny body far from the origin gave samples *outside* P (slack cancellation). Fixed by rounding, which centres the body | `08026a2` |
+
+Still open:
+- Row 3: paper-side; the lattice lemma should be restated with a TV hypothesis.
+- Row 5: no double-precision guard yet.
+- Row 6: GMP walk tolerances.
+- Row 7: the 50n-reflection fallback.
+
+## Recommended fix (written before the fix)
 1. **Round before sampling.** Reuse the max-inscribed-ellipsoid rounding that the volume oracle
    already uses (`RoundedPolytope`): walk in y-space, then map back with x = T·y + shift *before*
    the lattice step. Inflation, stochastic rounding and rejection stay in x-space. Affine maps
