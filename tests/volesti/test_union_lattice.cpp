@@ -357,8 +357,9 @@ void toDouble(const IPoly& P, int n, Eigen::MatrixXd& A, Eigen::VectorXd& b)
 }
 
 // Alg. 2 by hand, natural log (long double).  kAlg2RFactor is the manuscript's
-// 4 in sqrt(ln(4r/eta)); the [proof] tests show lem:nonconv needs 8.
-constexpr long double kAlg2RFactor = 4.0L;
+// factor in sqrt(ln(8r/eta)).  It was 4, but the [proof] tests showed
+// lem:nonconv needs 8; the paper and union_estimator.cpp were changed to 8.
+constexpr long double kAlg2RFactor = 8.0L;
 long double alg2Gamma(long double n, long double r, long double m, long double eps)
 {
   const long double eta = eps / 96.0L;
@@ -460,7 +461,7 @@ TEST_CASE("[T3][proof] lem:nonconv step kappa/gamma <= eta/(32 m n) with Alg. 2'
     {
       const long double eta = eps / 96.0L;
       const long double kappa = std::sqrt(2 * std::log(8 / eta)) + std::sqrt(2 * std::log((long double)r));
-      const long double need = 2 * std::sqrt(std::log(4 * r / eta));
+      const long double need = 2 * std::sqrt(std::log(kAlg2RFactor * r / eta));  // Alg. 2 (8r/eta since 2026-11-14)
       const long double need8 = 2 * std::sqrt(std::log(8 * r / eta));
       ++points;
       if (kappa > need)
@@ -481,8 +482,8 @@ TEST_CASE("[T3][proof] lem:nonconv step kappa/gamma <= eta/(32 m n) with Alg. 2'
         bChanges += b4 != b8;
       }
     }
-  MESSAGE("kappa > 2 sqrt(ln(4r/eta)) at " << failAlg2 << "/" << points
-          << " (r, eps) points, worst kappa/(2 sqrt(ln(4r/eta))) = " << double(worst) << " at "
+  MESSAGE("kappa > 2 sqrt(ln(F r/eta)) (F = Alg. 2 factor) at " << failAlg2 << "/" << points
+          << " (r, eps) points, worst ratio = " << double(worst) << " at "
           << worstAt << "; with ln(8r/eta): " << fail8r << " failures; b would change at "
           << bChanges << "/" << 4 * points << " (r, eps, gamma_min) points");
   CHECK(fail8r == 0);

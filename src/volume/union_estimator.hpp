@@ -26,7 +26,9 @@ namespace ttc
 double lraSampleThreshold(double epsilon, double delta, std::size_t numPolytopes);
 
 // GetPrecision (Alg. 2): lattice precision b such that every polytope's inner
-// radius is >= 10^-b * 64 m n / eta * sqrt(ln(4 r / eta)), eta = epsilon/96;
+// radius is >= 10^-b * 64 m n / eta * sqrt(ln(8 r / eta)), eta = epsilon/96
+// (8 r, not the original 4 r: the proof of lem:nonconv needs
+// kappa <= 2 sqrt(ln(8 r / eta)));
 // facetCount is r (total facets), minRadius the smallest inner radius.
 int precisionFromCubes(std::size_t dimension, std::size_t facetCount,
                        std::size_t numCubes, double minRadius, double epsilon);

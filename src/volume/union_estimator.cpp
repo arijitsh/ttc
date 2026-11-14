@@ -14,7 +14,7 @@ int precisionFromCubes(std::size_t dimension, std::size_t facetCount,
   const double eta = epsilon / 96.0;
   const double logGamma = std::log(64.0) + std::log(double(numCubes))
       + std::log(double(dimension)) - std::log(eta)
-      + 0.5 * std::log(std::log(4.0) + std::log(double(facetCount)) - std::log(eta));
+      + 0.5 * std::log(std::log(8.0) + std::log(double(facetCount)) - std::log(eta));
   const double prec = std::max(0.0, std::ceil((logGamma - std::log(minRadius))
                                            / std::log(10.0)));
   if (!std::isfinite(prec) || prec > std::numeric_limits<int>::max() - 32)
