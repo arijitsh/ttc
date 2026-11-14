@@ -14,8 +14,8 @@
 - [x] 11. Benchmark: 10 random syntheticLRA instances, now vs start (`update` @ `75e05e0`): **now is about 2× faster**, 3 more solved (step 11)
 - [ ] 12. **Sampling phase**: test ttc's single-polytope sampler for uniformity, the same way as volume (step 12; reproducer `e8a8b0a`; 5 agents running, 3 on hold)
   - [x] 12a. Harness helpers (`ttcProposals`, `ttcLatticeSamples`) + long-box reproducer (`e8a8b0a`)
-  - [ ] 12b. Agent tests: skinny, lattice, mixing, shapes (+boxes), theory running; boxes, walks, gmp on hold
-  - [ ] 12c. Read the sampling theory → `text-for-agents/ttc-sampling-vs-theory.md`
+  - [ ] 12b. Agent tests: skinny, lattice, mixing, shapes (+boxes) running; theory done; boxes, walks, gmp on hold
+  - [x] 12c. Read the sampling theory → `text-for-agents/ttc-sampling-vs-theory.md`
   - [ ] 12d. Fix the sampler (likely: round first and map back; walk-length rule), with `--no-round` parity
   - [ ] 12e. Validate: sampling tests, e2e 67/67, bit-identical when sampling-fix is off, benchmark rerun
 - [x] 13. Commit after every step (steps 9, 10 committed after the user pointed out the lapse)
@@ -412,4 +412,29 @@ cwd/exe in the repo or scratchpad. Told all agents to run one process at a time.
 - **On hold to save usage:** boxes (overlaps with smoke/shapes/mixing), walks (MCMC correctness of
   volesti's walks) and gmp (the non-default `--fullgmp` mode). They can be resumed later.
 - The CPU guard was restarted for the new Claude process.
+
+### s-theory (notes: `scratchpad/s-theory/notes.md`) → `ttc-sampling-vs-theory.md`
+**Did:**
+- Read the camera-ready manuscript (`SAT25-SM_cam`; the `SAT25-SM` folder no longer exists),
+  [CV]'s `polySampler.m` / `Sample.m`, the billiard-walk paper (Polyak & Gryazina) and the
+  hit-and-run theory (Lovász & Vempala).
+- Audited `polytope_sampler.*` and `gmp_walks.hpp`.
+- Simulated volesti's billiard rule in numpy.
+
+**Found:**
+- **Restart-at-centre gives i.i.d. samples**, but from the short-walk law, not the uniform one.
+  Every billiard sample lies within (t+1)·2√n·r of c. Long box: y ∈ [982,1000] for all samples.
+  The KS distance from uniform is 0.41 (n=5) and 0.36 (n=10) at aspect ratio 100.
+- **The sampler is not rounded**, unlike the volume oracle.
+- **The manuscript's lattice lemma needs pointwise near-uniformity** with exactly uniform
+  proposals. MCMC gives at best total-variation closeness, so the lemma should be restated with a
+  TV hypothesis.
+- **Lattice constants are sound.** κ uses ln(16/ε′) rather than ln(4/η) but still suffices. The
+  retry budget cannot detect a biased walk.
+- **Possible double-precision issue:** once ulp(|x|) approaches 10⁻ᵇ, the double walk's proposals
+  sit on a grid as coarse as a lattice cell.
+- The GMP walks share the restart flaw. They also have an absolute `1e-12` facet tolerance on
+  unnormalised rows.
+- **Recommended fix:** round, map back before the lattice step, and switch to one burnt-in chain
+  per polytope with thinning.
 
