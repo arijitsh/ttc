@@ -815,8 +815,22 @@ VolumeComputationResult computeLraVolume(
   // Phase 1b: run the volume oracle on every polytope kept by phase 1a.
   std::vector<PolytopeVolume> kept;
   kept.reserve(prepared.size());
+  // Per-polytope oracle streams derived from --seed (splitmix64 of seed and
+  // polytope index; independent of the sampler streams).  The oracle used to
+  // run on volesti's fixed seed 3, so its errors were identical for congruent
+  // polytopes and across ttc seeds and could never average out.
+  auto oracleSeed = [&kSeed](std::size_t polytope, unsigned attempt) {
+    std::uint64_t z = (std::uint64_t(kSeed) << 32) ^ 0xD1B54A32D192ED03ULL
+                      ^ (0x9E3779B97F4A7C15ULL * (polytope + 1))
+                      ^ (0xBF58476D1CE4E5B9ULL * attempt);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return static_cast<unsigned>(z ^ (z >> 31));
+  };
+  std::size_t polytopeIndex = 0;
   for (auto& entry : prepared)
   {
+    ++polytopeIndex;
     double volumeComputeStart = Log.elapsed();
     // Round first (Cousins-Vempala, Fig. 2 step 1): every volesti walk steps in
     // units of the inner radius, so on a skinny body it never crosses the body
@@ -830,7 +844,8 @@ VolumeComputationResult computeLraVolume(
     else if (options.roundPolytopes)
       Log(1) << "WARNING: polytope rounding skipped (" << body.roundingFailure()
              << "); the volume estimate may be poor if the polytope is skinny" << std::endl;
-    double volume = body.volume(options.volumeOracle, mvcEps, volumeWalkLength);
+    double volume = body.volumeWithSeed(options.volumeOracle, mvcEps, volumeWalkLength,
+                                        oracleSeed(polytopeIndex, 0));
     // A practical oracle run can still end non-finite or non-positive, which is
     // a detected failure.  Rerun it on fresh independent streams before giving up.
     constexpr unsigned kOracleAttempts = 3;
@@ -842,7 +857,7 @@ VolumeComputationResult computeLraVolume(
              << " (inner radius " << entry.innerRadius << ", outer radius "
              << entry.outerRadius << "); retrying on a fresh random stream" << std::endl;
       volume = body.volumeWithSeed(options.volumeOracle, mvcEps, volumeWalkLength,
-                                   kSeed + 0x51ED2701U * attempt);
+                                   oracleSeed(polytopeIndex, attempt));
     }
     double volumeComputeElapsed = Log.elapsed() - volumeComputeStart;
     totalVolumeTime += volumeComputeElapsed;
