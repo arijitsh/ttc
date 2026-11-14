@@ -595,6 +595,17 @@ class Formula:
 # ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------
+def ine_variable_names(path):
+    """Column variable names from a '* variables:' header line, or None."""
+    with open(path) as f:
+        for line in f:
+            if line.startswith("* variables:"):
+                return line.split(":", 1)[1].split()
+            if line.strip() == "begin":
+                return None
+    return None
+
+
 def read_ine(path, n, perm=None):
     """A x <= b in our column order; perm[j] = our index of ttc's column j."""
     with open(path) as f:
@@ -826,7 +837,18 @@ def check(path, args, workdir):
                             % sorted(set(F.reals) - set(F.ttc_order)))
         return rep
     perm = np.array([F.index[v] for v in F.ttc_order])
-    rep["ttc_column_order"] = F.ttc_order
+    # Newer ttc writes the column variables into the .ine header
+    # ("* variables: x y ..."); prefer them over the reconstructed DFS order.
+    header = ine_variable_names(files[0]) if files else None
+    if header is not None:
+        if sorted(header) != sorted(F.reals):
+            raise ValueError("ine header variables %s != formula reals %s" % (header, F.reals))
+        if header != list(F.ttc_order):
+            rep["ttc_order_mismatch"] = {"header": header, "reconstructed": list(F.ttc_order)}
+        perm = np.array([F.index[v] for v in header])
+        rep["ttc_column_order"] = header
+    else:
+        rep["ttc_column_order"] = F.ttc_order
     polys = [read_ine(p, n, perm) for p in files]
     rep["dumped"] = len(polys)
 

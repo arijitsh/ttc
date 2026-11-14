@@ -58,7 +58,7 @@ constexpr double kZeroTolerance = 1e-9;
 // H-representation format (readable by vinci, lrs, cddlib). Each cdd row is
 // [b_i, -a_i0, -a_i1, ...], encoding b_i - a_i . x >= 0, i.e. a_i . x <= b_i.
 void writePolytopeIne(const std::string& path, const Eigen::MatrixXd& A,
-                      const Eigen::VectorXd& b)
+                      const Eigen::VectorXd& b, const std::vector<std::string>& names)
 {
   std::ofstream out(path);
   if (!out)
@@ -68,6 +68,10 @@ void writePolytopeIne(const std::string& path, const Eigen::MatrixXd& A,
   const Eigen::Index rows = A.rows();
   const Eigen::Index cols = A.cols();
   out << "ttc_polytope\n";
+  // Column j of A is the variable names[j] (cdd treats '*' lines as comments).
+  out << "* variables:";
+  for (const auto& name : names) out << " " << name;
+  out << "\n";
   out << "H-representation\n";
   out << "begin\n";
   out << " " << rows << " " << (cols + 1) << " real\n";
@@ -670,6 +674,10 @@ VolumeComputationResult computeLraVolume(
   {
     index.emplace(uniqueVars[i], i);
   }
+  std::vector<std::string> variableNames;
+  variableNames.reserve(uniqueVars.size());
+  for (const auto& var : uniqueVars)
+    variableNames.push_back(var.hasSymbol() ? var.getSymbol() : var.toString());
 
   // Algorithm 1 in the revised manuscript.
   const double kEpsilon = options.epsilon;
@@ -760,7 +768,7 @@ VolumeComputationResult computeLraVolume(
     {
       std::string path = options.dumpInePrefix + "_cube" +
                          std::to_string(++dumpIndex) + ".ine";
-      writePolytopeIne(path, matrices.A, matrices.b);
+      writePolytopeIne(path, matrices.A, matrices.b, variableNames);
       Log(1) << "wrote polytope to " << path << std::endl;
     }
     const double ballStart = Log.elapsed();
