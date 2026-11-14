@@ -1,0 +1,25 @@
+; Axis-aligned box [0,1] x [-3,-1] x [5,8] x [1/2,1] x [-10,-9] x [0,2] in R^6.
+; dim: 6
+; exact-volume: 6.0
+(set-logic QF_LRA)
+(declare-const x0 Real)
+(declare-const x1 Real)
+(declare-const x2 Real)
+(declare-const x3 Real)
+(declare-const x4 Real)
+(declare-const x5 Real)
+(assert (and
+  (>= x0 0)
+  (<= x0 1)
+  (>= x1 (- 3))
+  (<= x1 (- 1))
+  (>= x2 5)
+  (<= x2 8)
+  (>= x3 (/ 1 2))
+  (<= x3 1)
+  (>= x4 (- 10))
+  (<= x4 (- 9))
+  (>= x5 0)
+  (<= x5 2)
+))
+(check-sat)

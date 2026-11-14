@@ -1,0 +1,32 @@
+; Axis-aligned box [-1,1] x [-1,1] x [-1,1] x [-1,1] x [-1,1] x [-1,1] x [-1,1] x [-1,1] in R^8.
+; dim: 8
+; timeout: 120
+; exact-volume: 256.0
+(set-logic QF_LRA)
+(declare-const x0 Real)
+(declare-const x1 Real)
+(declare-const x2 Real)
+(declare-const x3 Real)
+(declare-const x4 Real)
+(declare-const x5 Real)
+(declare-const x6 Real)
+(declare-const x7 Real)
+(assert (and
+  (>= x0 (- 1))
+  (<= x0 1)
+  (>= x1 (- 1))
+  (<= x1 1)
+  (>= x2 (- 1))
+  (<= x2 1)
+  (>= x3 (- 1))
+  (<= x3 1)
+  (>= x4 (- 1))
+  (<= x4 1)
+  (>= x5 (- 1))
+  (<= x5 1)
+  (>= x6 (- 1))
+  (<= x6 1)
+  (>= x7 (- 1))
+  (<= x7 1)
+))
+(check-sat)

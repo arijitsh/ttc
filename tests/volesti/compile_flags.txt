@@ -1,0 +1,7 @@
+-std=gnu++17
+-I/home/arijit/solvers/ttc-cpp/src/volesti/include
+-I/home/arijit/solvers/ttc-cpp/src/volesti/external
+-I/home/arijit/solvers/ttc-cpp/src/volesti/include/generators
+-I/usr/include/eigen3
+-I/usr/include/lpsolve
+-I/home/arijit/solvers/ttc-cpp/src/volesti/test
