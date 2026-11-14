@@ -7,15 +7,15 @@ ROOT     := $(abspath ../..)
 CXX      ?= g++
 OVERLAY  ?=
 CXXFLAGS ?= -O2 -std=gnu++17 -DNDEBUG -w
-INCS     := $(if $(OVERLAY),-I$(OVERLAY)) -I$(ROOT)/src/volesti/include -I$(ROOT)/src \
+INCS     := $(if $(OVERLAY),-I$(OVERLAY)) -I$(ROOT)/src/volesti/include -I$(ROOT)/src -I$(ROOT)/src/ddnnf \
             -I$(ROOT)/src/volesti/external -I$(ROOT)/src/volesti/include/generators \
             -I/usr/include/eigen3 -I/usr/include/lpsolve -I$(ROOT)/src/volesti/test
-LIBS     := /usr/lib/liblpsolve55.a -lcolamd -ldl -lm -lpthread
+LIBS     := /usr/lib/liblpsolve55.a -lcolamd -lgmpxx -lgmp -ldl -lm -lpthread
 SRCS     := $(wildcard test_*.cpp)
 BINS     := $(patsubst %.cpp,bin/%,$(SRCS))
 
-TTC_SRCS := $(ROOT)/src/volume/polytope_volume.cpp $(ROOT)/src/volume/polytope_sampler.cpp
-TTC_OBJS := bin/polytope_volume.o bin/polytope_sampler.o
+TTC_SRCS := $(ROOT)/src/volume/polytope_volume.cpp $(ROOT)/src/volume/polytope_sampler.cpp $(ROOT)/src/volume/union_estimator.cpp
+TTC_OBJS := bin/polytope_volume.o bin/polytope_sampler.o bin/union_estimator.o
 TTC_INCS := -I$(ROOT)/src/ddnnf
 # Shared objects of ttc code: keep them (pattern-rule intermediates are
 # otherwise deleted after a build, breaking concurrent links).
@@ -25,6 +25,9 @@ all: $(BINS)
 bin/doctest_main.o: doctest_main.cpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) -I$(ROOT)/src/volesti/test -c $< -o $@
+bin/union_estimator.o: $(ROOT)/src/volume/union_estimator.cpp $(ROOT)/src/volume/*.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(INCS) $(TTC_INCS) -c $< -o $@
 bin/polytope_%.o: $(ROOT)/src/volume/polytope_%.cpp $(ROOT)/src/volume/*.hpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $(INCS) $(TTC_INCS) -c $< -o $@

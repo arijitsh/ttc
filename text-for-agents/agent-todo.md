@@ -20,8 +20,8 @@
   - [~] 12e. Validate: **all sampling suites pass for every walk** (`722ff7b`), e2e 67/67; benchmark rerun in progress
 - [ ] 15. **Union accuracy**: read KR25 manuscript (`text-for-agents/kr25-ssm`), test plan → `text-for-agents/ttc-union-test-plan.md`
   - [x] 15a. Read algo/analysis (Alg. 1, Alg. 2, lemmas decomposition/process/nonconv/lattice/numlattice); write the component test plan (C1–C8, T1–T7)
-  - [ ] 15b. Bit-identical refactor: union loop + SampleStore + precision/threshold → `src/volume/union_estimator.{hpp,cpp}`
-  - [ ] 15c. T1+T5 estimator with exact components; T7 e2e union suite (old vs new); T3/T4; T2; T6
+  - [x] 15b. Bit-identical refactor → `src/volume/union_estimator.{hpp,cpp}` (`200276c`)
+  - [ ] 15c. **Continued in `text-for-agents/agents-todo-union-e2e.md`** (5 agents: T1+T5, T2, T3+T4, T6, T7)
 - [x] 13. Commit after every step (steps 9, 10 committed after the user pointed out the lapse)
 - [ ] 14. Follow-ups:
   - [ ] 14a. `build/` is in a mixed state (Ninja/clang cache, stale GCC Makefiles). You need to
