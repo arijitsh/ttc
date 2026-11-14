@@ -11,7 +11,7 @@ Single-polytope volume and sampling work: `agent-todo.md`.
 - [x] U3. Test harness links `union_estimator.o` + GMP (`tests/volesti/Makefile`)
 - [~] U4. Fan out 5 agents (CPU cap: 12 cores, nice 19, ≤ 2 processes each) — all 5 launched:
   - [ ] u-core: T1 estimator with exact components + T5 store mechanics → `test_union_core.cpp`
-  - [ ] u-robust: T2 error injection (volume ±ε′, sampler TV η) → `test_union_robust.cpp`
+  - [x] u-robust: T2 error injection (volume ±ε′, sampler TV η) → `test_union_robust.cpp`
   - [x] u-params: T3 lattice count vs volume + T4 Thresh/ε′/δ′/clipping →
     `test_union_lattice.cpp`, `test_union_params.cpp`
   - [x] u-decomp: T6 decomposition soundness/completeness via `--dump-ine` →
@@ -130,4 +130,30 @@ niced processes.
 - **Open, for the user:**
   - lifting a Real-valued `ite` into Boolean structure;
   - writing the variable names into the `.ine` header.
+
+### u-robust (T2): `test_union_robust.cpp` (7 cases, 162 s; slow sweeps tagged)
+**Did:**
+- Test unions: 2D parallelotopes (pair90, chain8 with overlap ρ = 4.7, nested, rotated slabs3,
+  crossX), plus slabsThin, chain5d and skinny5d (rotated, aspect 100) for ttc's components.
+- Sampler: exactly uniform on the lattice points. All lattice counts enumerated exactly.
+- Predicted mean E[est] = Σ V̂_i·Q_i(D_i), where D_i = P_i minus all later polytopes.
+
+**Found:**
+- **No union bug.** Every exact-component prediction holds (|z| ≤ 4).
+  - Baseline bias ≤ 0.12%; sd 0.6–0.9% at ε=0.8.
+- **Volume errors:** the bias is linear, Σe_i·|D_i|/|Q|, whatever the overlap pattern. The union
+  tolerates e ≈ 5.9 ε′: e = 5ε′ gives 0/200 failures.
+- **Sampler bias** (TV = total-variation distance from uniform):
+  - |bias| ≤ ρ·TV. Runs pass at TV = ε′ and fail at 2ε′.
+  - So the tolerated TV is about (ε/2)/ρ, six times the plan's ε′/m estimate.
+  - The lemma's pointwise (1±ε′) assumption gives |b| ≤ ε′, as measured.
+- **ttc's current components are inside the tolerance:**
+  - oracle |e| ≤ 0.42 ε′ (ε=0.8);
+  - sampler mass on each D_i within ±5%, union bias ≤ 0.6%;
+  - full union: **0 failures** (100 seeds at ε=0.8, 20 at ε=0.3).
+- **`--no-round` fails:** crossX −9.4%, skinny5d −28.6% (beyond ε/2). This is the old restart bias.
+- **Design note:** the oracle's fixed seed 3 gives congruent polytopes identical errors (+0.0282).
+  Volume errors are therefore fully correlated across polytopes and across ttc `--seed`s, so they
+  never average out. Within budget here. **Decision for the user:** derive the oracle seed from
+  `--seed`.
 
