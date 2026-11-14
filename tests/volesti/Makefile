@@ -17,6 +17,9 @@ BINS     := $(patsubst %.cpp,bin/%,$(SRCS))
 TTC_SRCS := $(ROOT)/src/volume/polytope_volume.cpp $(ROOT)/src/volume/polytope_sampler.cpp
 TTC_OBJS := bin/polytope_volume.o bin/polytope_sampler.o
 TTC_INCS := -I$(ROOT)/src/ddnnf
+# Shared objects of ttc code: keep them (pattern-rule intermediates are
+# otherwise deleted after a build, breaking concurrent links).
+.SECONDARY: $(TTC_OBJS) bin/doctest_main.o
 
 all: $(BINS)
 bin/doctest_main.o: doctest_main.cpp
