@@ -96,8 +96,11 @@ void get_first_gaussian(Polytope& P,
         return;
     }
 
-    //get a_0 with binary search
-    while (upper - lower > tol)
+    //get a_0 with binary search.  The tolerance is relative to `upper`, as in
+    //Cousins-Vempala's reference code (ConvexBody.m, getStartingGaussian):
+    //an absolute 1e-7 never terminates once a_0 exceeds ~1e9 (the spacing of
+    //doubles near a_0 is then larger than 1e-7), i.e. for tiny bodies.
+    while (upper - lower > tol * upper)
     {
         NT mid = (upper + lower) / 2.0;
         NT sum = 0.0;
@@ -323,6 +326,17 @@ double volume_cooling_gaussians(Polytope& Pin,
     // Move the chebychev center to the origin and apply the same shifting to the polytope
     P.shift(c.getCoefficients());
 
+    // The schedule and walk use absolute constants (a_0 search starts at
+    // upper = 1 with absolute tol 1e-7; walk step 4r/sqrt(max(1,a) n)), so
+    // they are only scale-correct for an O(1) inner radius.  Rescale the
+    // (row-normalized, centred) body to unit inner radius, and undo the
+    // scaling on the result: vol(P) = r^n vol(P / r).
+    const NT scale = radius;
+    P.normalize();
+    P.set_vec(P.get_vec() / scale);
+    radius = NT(1);
+    P.set_InnerBall(std::pair<Point, NT>(Point(n), radius));
+
     // Computing the sequence of gaussians
 #ifdef VOLESTI_DEBUG
     std::cout<<"\n\nComputing annealing...\n"<<std::endl;
@@ -451,7 +465,7 @@ double volume_cooling_gaussians(Polytope& Pin,
         std::cout<<"\nTotal number of steps = "<<steps<<"\n"<<std::endl;
 #endif
 
-    return vol;
+    return vol * std::pow(scale, NT(n));
 }
 
 

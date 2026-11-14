@@ -128,14 +128,20 @@ std::tuple<MT_dense, VT, bool> max_inscribed_ellipsoid(MT A, VT b, VT const& x0,
             NT rel, Rel;
             
             // computing eigenvalues of E2
-            auto op = get_mat_prod_op<NT>(E2);
-            auto eigs = get_eigs_solver<NT>(op, n);
-            eigs->init();
-            int nconv = eigs->compute();
-            if (eigs->info() == Spectra::COMPUTATION_INFO::SUCCESSFUL) {
-                Rel = 1.0 / eigs->eigenvalues().coeff(1);
-                rel = 1.0 / eigs->eigenvalues().coeff(0);
-            } else {
+            // Spectra needs nev=2 <= n-1: use the dense solver for n <= 2.
+            bool spectra_ok = false;
+            if (n >= 3) {
+                auto op = get_mat_prod_op<NT>(E2);
+                auto eigs = get_eigs_solver<NT>(op, n);
+                eigs->init();
+                int nconv = eigs->compute();
+                if (eigs->info() == Spectra::COMPUTATION_INFO::SUCCESSFUL) {
+                    Rel = 1.0 / eigs->eigenvalues().coeff(1);
+                    rel = 1.0 / eigs->eigenvalues().coeff(0);
+                    spectra_ok = true;
+                }
+            }
+            if (!spectra_ok) {
                 Eigen::SelfAdjointEigenSolver<MT> eigensolver(E2); // E2 is positive definite matrix
                 if (eigensolver.info() == Eigen::ComputationInfo::Success) {
                     Rel = 1.0 / eigensolver.eigenvalues().coeff(0);

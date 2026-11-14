@@ -88,16 +88,22 @@ std::tuple<MT, VT, NT> inscribed_ellipsoid_rounding(Polytope &P,
         L = lltOfA.matrixL();
 
         // Computing eigenvalues of E
-        Spectra::DenseSymMatProd<NT> op(E);
-        // The value of ncv is chosen empirically
-        Spectra::SymEigsSolver<NT, Spectra::SELECT_EIGENVALUE::BOTH_ENDS, 
-                               Spectra::DenseSymMatProd<NT>> eigs(&op, 2, std::min(std::max(10, int(d)/5), int(d)));
-        eigs.init();
-        int nconv = eigs.compute();
-        if (eigs.info() == Spectra::COMPUTATION_INFO::SUCCESSFUL) {
-            R = 1.0 / eigs.eigenvalues().coeff(1);
-            r = 1.0 / eigs.eigenvalues().coeff(0);
-        } else {
+        // Spectra needs nev=2 <= d-1: use the dense solver for d <= 2.
+        bool spectra_ok = false;
+        if (d >= 3) {
+            Spectra::DenseSymMatProd<NT> op(E);
+            // The value of ncv is chosen empirically
+            Spectra::SymEigsSolver<NT, Spectra::SELECT_EIGENVALUE::BOTH_ENDS, 
+                                   Spectra::DenseSymMatProd<NT>> eigs(&op, 2, std::min(std::max(10, int(d)/5), int(d)));
+            eigs.init();
+            int nconv = eigs.compute();
+            if (eigs.info() == Spectra::COMPUTATION_INFO::SUCCESSFUL) {
+                R = 1.0 / eigs.eigenvalues().coeff(1);
+                r = 1.0 / eigs.eigenvalues().coeff(0);
+                spectra_ok = true;
+            }
+        }
+        if (!spectra_ok) {
             Eigen::SelfAdjointEigenSolver<MT> eigensolver(E);
             if (eigensolver.info() == Eigen::ComputationInfo::Success) {
                 R = 1.0 / eigensolver.eigenvalues().coeff(0);
