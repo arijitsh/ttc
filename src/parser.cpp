@@ -359,6 +359,104 @@ std::string termSymbol(const cvc5::Term& term)
 
 }  // namespace
 
+namespace
+{
+
+bool isArithmeticAtom(const cvc5::Term& t)
+{
+    switch (t.getKind())
+    {
+        case cvc5::Kind::LT:
+        case cvc5::Kind::LEQ:
+        case cvc5::Kind::GT:
+        case cvc5::Kind::GEQ:
+        case cvc5::Kind::EQUAL:
+        case cvc5::Kind::DISTINCT:
+            return t.getNumChildren() > 0 && !t[0].getSort().isBoolean();
+        default:
+            return false;
+    }
+}
+
+// First Real/Int-valued ite strictly inside an arithmetic atom, or null.
+cvc5::Term findArithmeticIte(const cvc5::Term& t)
+{
+    if (t.getKind() == cvc5::Kind::ITE && !t.getSort().isBoolean())
+    {
+        return t;
+    }
+    for (size_t i = 0, n = t.getNumChildren(); i < n; ++i)
+    {
+        if (t[i].getSort().isBoolean() && !isArithmeticAtom(t))
+        {
+            continue;
+        }
+        cvc5::Term found = findArithmeticIte(t[i]);
+        if (!found.isNull())
+        {
+            return found;
+        }
+    }
+    return cvc5::Term();
+}
+
+}  // namespace
+
+// The polytope decomposition maps every arithmetic atom to a linear
+// constraint, so an atom A[ite(c, a, b)] with a Real-valued ite (e.g.
+// (<= (ite c x y) 1)) was 'unsupported'.  Lift it into Boolean structure:
+// A[ite(c, a, b)]  ->  (c and A[a]) or (not c and A[b]), recursively (also
+// inside c), so every remaining atom is linear.  Formulas without such an ite
+// are returned unchanged.
+namespace
+{
+template <typename TermBuilder>
+cvc5::Term liftArithmeticIte(TermBuilder&& tm, const cvc5::Term& root)
+{
+    std::unordered_map<cvc5::Term, cvc5::Term> memo;
+    std::function<cvc5::Term(const cvc5::Term&)> lift = [&](const cvc5::Term& t) -> cvc5::Term {
+        auto it = memo.find(t);
+        if (it != memo.end())
+        {
+            return it->second;
+        }
+        cvc5::Term out = t;
+        if (isArithmeticAtom(t))
+        {
+            cvc5::Term ite = findArithmeticIte(t);
+            if (!ite.isNull())
+            {
+                cvc5::Term cond = lift(ite[0]);
+                cvc5::Term thenAtom = lift(t.substitute(ite, ite[1]));
+                cvc5::Term elseAtom = lift(t.substitute(ite, ite[2]));
+                out = tm.mkTerm(cvc5::Kind::OR,
+                                {tm.mkTerm(cvc5::Kind::AND, {cond, thenAtom}),
+                                 tm.mkTerm(cvc5::Kind::AND,
+                                           {tm.mkTerm(cvc5::Kind::NOT, {cond}), elseAtom})});
+            }
+        }
+        else if (t.getSort().isBoolean() && t.getNumChildren() > 0
+                 && t.getKind() != cvc5::Kind::APPLY_UF)
+        {
+            std::vector<cvc5::Term> children;
+            bool changed = false;
+            for (size_t i = 0, n = t.getNumChildren(); i < n; ++i)
+            {
+                children.push_back(t[i].getSort().isBoolean() ? lift(t[i]) : t[i]);
+                changed = changed || children.back() != t[i];
+            }
+            if (changed)
+            {
+                out = tm.mkTerm(t.getKind(), children);
+            }
+        }
+        memo.emplace(t, out);
+        return out;
+    };
+    return lift(root);
+}
+}  // namespace
+
 TTCParser::TTCParser()
     : d_tm(),
       d_solver(ttc::createSolverWithStorage<cvc5::Solver>(d_tm)),
@@ -504,7 +602,7 @@ void TTCParser::parseFormula(const std::string &smtFormula) {
         cvc5::Term rawFormula = assertions.size() == 1
                                     ? assertions[0]
                                     : tm.mkTerm(cvc5::Kind::AND, assertions);
-        d_formula = d_solver.simplify(rawFormula);
+        d_formula = liftArithmeticIte(tm, d_solver.simplify(rawFormula));
 
         // Count top-level constraints recursively.
         std::function<std::size_t(const cvc5::Term&)> countConstraints = [&](const cvc5::Term& t) {
