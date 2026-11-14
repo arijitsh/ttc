@@ -314,6 +314,7 @@ set(SOURCES
     src/volume/lra_volume.cpp
     src/volume/polytope_sampler.cpp
     src/volume/polytope_volume.cpp
+    src/volume/union_estimator.cpp
     src/allsat-circuits/src/AllSatAlgo/AllSatAlgoBase.cpp
     src/allsat-circuits/src/AllSatAlgo/Blocking/AllSatAlgoBlockingBase.cpp
     src/allsat-circuits/src/AllSatAlgo/Blocking/TseitinEnc/AllSatAlgoTseitinEnc.cpp
