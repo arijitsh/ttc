@@ -5,3 +5,4 @@
 -I/usr/include/eigen3
 -I/usr/include/lpsolve
 -I/home/arijit/solvers/ttc-cpp/src/volesti/test
+-I/home/arijit/solvers/ttc-cpp/src

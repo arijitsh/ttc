@@ -34,7 +34,7 @@ double runTtc(const Body& B)
 {
   HPoly P = toHPoly(B);
   volestiBall(P);
-  return ttcOracle(P);
+  return ttcVolume(P);
 }
 
 double relErr(double est, const Body& B) { return est / B.exactVolume - 1.0; }
@@ -100,6 +100,21 @@ Stats seeds(const Body& B, int k, unsigned wl, double tol = kTol)
   }
   Stats S = relStats(est, B.exactVolume, tol);
   std::printf("  %-34s wl=%-5u %s\n", B.name.c_str(), wl, fmt(S).c_str());
+  return S;
+}
+
+// Same statistics through ttc's full pipeline (rounding + oracle).
+Stats seedsPipeline(const Body& B, int k, double tol = kTol)
+{
+  std::vector<double> est;
+  for (int s = 0; s < k; ++s)
+  {
+    HPoly P = toHPoly(B);
+    volestiBall(P);
+    est.push_back(ttcVolumeSeeded(P, 1000u + s));
+  }
+  Stats S = relStats(est, B.exactVolume, tol);
+  std::printf("  %-34s pipeline %s\n", B.name.c_str(), fmt(S).c_str());
   return S;
 }
 
@@ -173,7 +188,7 @@ TEST_CASE("elongated: statistics across seeds, 3-D long box R=30")
   // Moderate aspect: the mean is biased low AND the spread is huge
   // (current: meanRel -0.57, sd 0.18, 0/10 within 0.0667).
   Body B = longBox(3, 30.0);
-  Stats S = seeds(B, 6, ttcWalkLength(3));
+  Stats S = seedsPipeline(B, 6);
   CHECK(std::abs(S.meanRel) < 0.1);
   CHECK(S.fracWithin >= 0.8);
 }

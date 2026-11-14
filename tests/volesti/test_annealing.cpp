@@ -41,7 +41,8 @@ struct Trace
 {
   VT center;                  // inner-ball center used by the oracle
   double radius = 0;          // inner-ball radius used by the oracle
-  MT A;                       // shifted, row-normalized polytope (center at 0)
+  double scale = 1;           // oracle rescales the body by 1/scale (unit inner radius)
+  MT A;                       // shifted, rescaled, row-normalized polytope (center at 0)
   VT b;
   std::vector<double> a;      // a_0 > a_1 > ... > a_k
   std::vector<double> ratio;  // per-phase estimate of Z(a_{i+1})/Z(a_i)
@@ -66,6 +67,13 @@ Trace traceOracle(HPoly Pin, RNG& rng, double error, unsigned walk_length)
   if (InnerBall.second < 0.0) { T.vol = -1; return T; }
   NT radius = InnerBall.second;
   P.shift(InnerBall.first.getCoefficients());
+  // Rescale to unit inner radius, as volume_cooling_gaussians does.
+  const NT scale = radius;
+  P.normalize();
+  P.set_vec(P.get_vec() / scale);
+  radius = NT(1);
+  P.set_InnerBall(std::pair<Point, NT>(Point(n), radius));
+  T.scale = scale;
   T.A = P.get_mat();
   T.b = P.get_vec();
 
@@ -120,7 +128,7 @@ Trace traceOracle(HPoly Pin, RNG& rng, double error, unsigned walk_length)
     T.steps.push_back(its[i]);
     vol *= fn[i] / its[i];
   }
-  T.vol = vol;
+  T.vol = vol * std::pow(scale, NT(n));
   return T;
 }
 
@@ -222,8 +230,12 @@ std::vector<SchedStep> traceSchedule(HPoly Pin, RNG& rng, double error, unsigned
   const unsigned n = P.dimension();
   gaussian_annealing_parameters<NT> par(n);
   auto IB = P.ComputeInnerBall();
-  const NT radius = IB.second;
   P.shift(IB.first.getCoefficients());
+  // Rescale to unit inner radius, as volume_cooling_gaussians does.
+  P.normalize();
+  P.set_vec(P.get_vec() / IB.second);
+  const NT radius = NT(1);
+  P.set_InnerBall(std::pair<Point, NT>(Point(n), radius));
   std::vector<SchedStep> out;
   a_vals.clear();
   get_first_gaussian(P, par.frac, radius, error, a_vals);
@@ -302,7 +314,8 @@ std::vector<std::array<double, 3>> kTrace(HPoly& P, Point p, double a, RNG& rng,
 }
 
 // ------------------------------------------------------- exact references
-// logZ(a) = log int_P exp(-a|x|^2) for the SHIFTED polytope (center at 0).
+// logZ(a) = log int_P exp(-a|x|^2) for the SHIFTED, RESCALED polytope the oracle
+// anneals over (center at 0, unit inner radius); vol is in original units.
 struct Exact
 {
   std::function<double(double)> logZ;
@@ -318,7 +331,7 @@ Exact exactBox(const Trace& T)
   REQUIRE(boxBounds(T, lo, hi));
   Exact E;
   E.logZ = [lo, hi](double a) { return logZbox(lo, hi, a); };
-  E.vol = std::exp(logZbox(lo, hi, 0.0));
+  E.vol = std::exp(logZbox(lo, hi, 0.0)) * std::pow(T.scale, double(T.A.cols()));
   E.massOutside = [lo, hi](double a) { return massOutsideBox(lo, hi, a); };
   return E;
 }
@@ -329,12 +342,14 @@ Exact exactBox(const Trace& T)
 struct SimplexMC
 {
   int n;
-  double vol;
-  MT U;  // uniform samples on P (shifted), n x M
+  double vol;       // original units
+  double logScale;  // oracle works on P / scale
+  MT U;  // uniform samples on the shifted, rescaled P, n x M
   MT G;  // standard normals, n x M
   MT A;
   VT b;
-  SimplexMC(int n_, double s, const Trace& T, int M, unsigned seed) : n(n_), A(T.A), b(T.b)
+  SimplexMC(int n_, double s, const Trace& T, int M, unsigned seed)
+      : n(n_), logScale(std::log(T.scale)), A(T.A), b(T.b)
   {
     vol = std::pow(s, n) / std::tgamma(n + 1.0);
     std::mt19937_64 g(seed);
@@ -347,7 +362,7 @@ struct SimplexMC
       double tot = 0;
       std::vector<double> e(n + 1);
       for (auto& x : e) tot += (x = Ex(g));
-      for (int i = 0; i < n; ++i) U(i, j) = s * e[i] / tot - T.center(i);
+      for (int i = 0; i < n; ++i) U(i, j) = (s * e[i] / tot - T.center(i)) / T.scale;
       for (int i = 0; i < n; ++i) G(i, j) = Nd(g);
     }
   }
@@ -360,7 +375,7 @@ struct SimplexMC
     VT w = (l.array() - mx).exp();
     const double mean = w.mean();
     const double var = (w.array() - mean).square().mean();
-    return {std::log(vol) + mx + std::log(mean), std::sqrt(var / M) / mean};
+    return {std::log(vol) - n * logScale + mx + std::log(mean), std::sqrt(var / M) / mean};
   }
   std::pair<double, double> gaussEst(double a) const
   {
@@ -507,8 +522,10 @@ TEST_CASE("a_0: Gaussian mass outside P <= frac * error")
     HPoly S(c.P);
     auto ib = S.ComputeInnerBall();
     S.shift(ib.first.getCoefficients());
+    S.normalize();
+    S.set_vec(S.get_vec() / ib.second);  // unit inner radius, as the oracle does
     std::vector<double> av;
-    get_first_gaussian(S, kFrac, ib.second, kTtcError, av);
+    get_first_gaussian(S, kFrac, 1.0, kTtcError, av);
     REQUIRE(av.size() == 1);
     CHECK(av[0] == doctest::Approx(a0).epsilon(1e-12));
     const double out = c.E.massOutside(a0);

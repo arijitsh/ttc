@@ -7,7 +7,7 @@ ROOT     := $(abspath ../..)
 CXX      ?= g++
 OVERLAY  ?=
 CXXFLAGS ?= -O2 -std=gnu++17 -DNDEBUG -w
-INCS     := $(if $(OVERLAY),-I$(OVERLAY)) -I$(ROOT)/src/volesti/include \
+INCS     := $(if $(OVERLAY),-I$(OVERLAY)) -I$(ROOT)/src/volesti/include -I$(ROOT)/src \
             -I$(ROOT)/src/volesti/external -I$(ROOT)/src/volesti/include/generators \
             -I/usr/include/eigen3 -I/usr/include/lpsolve -I$(ROOT)/src/volesti/test
 LIBS     := /usr/lib/liblpsolve55.a -lcolamd -ldl -lm -lpthread

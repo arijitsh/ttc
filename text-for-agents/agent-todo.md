@@ -3,12 +3,12 @@
 ## Plan
 - [x] 1. Understand the volesti oracle ttc uses for one polytope
 - [x] 2. Build a standalone test harness (`tests/volesti/`) and reproduce the long-box bug
-- [ ] 3. Fan out 10 test agents, one per area (done: e2e, annealing; 8 still running)
+- [x] 3. Fan out 10 test agents, one per area (all 10 reported)
 - [x] 4. Read the theory ([CV-PVA], [CV-GC], MATLAB) → `ttc-volume-vs-theory.md`
 - [x] 5. Keep all testing on ≤ 60% of the CPU (cores 0–11, nice 19; a watchdog enforces it)
-- [ ] 6. Consolidate a root-cause diagnosis from the agent reports
-- [ ] 7. Fix: scale normalisation, rounding, a safe annealing step, scale-free volesti constants
-- [ ] 8. Validate: unit suite + e2e suite, rebuild ttc, confirm no regressions on well-rounded bodies
+- [x] 6. Consolidate a root-cause diagnosis from the agent reports
+- [x] 7. Fix: scale normalisation (`6494cf2`), rounding + `--vol-oracle` (`882cf3f`), volesti rounding bugs
+- [~] 8. Validate: e2e 67/67 pass; unit suite running; syntheticLRA regression check pending
 - [ ] 9. **Sampling phase**: on the same polytopes, test that ttc's samples are uniform over each body
 - [ ] 10. Commit after every step
 
@@ -186,6 +186,40 @@ by rⁿ. Every scale then gives identical results, and only elongation failures 
 - `inscribed_ellipsoid_rounding` is a port of the MATLAB `preprocess.m`.
 - Max-ellipsoid or SVD rounding + ttc's oracle gives errors within ±4% for n up to 30.
 
+### shapes (`tests/volesti/test_standard_shapes.cpp`, ~70 s; slow set `-ts=slow --no-skip`)
+**Did:** 20 seeds plus the deterministic ttc call on:
+- cubes n=1..20
+- simplices n=2..15
+- cross-polytopes 2..8
+- rotated cubes, products of simplices, regular polygons
+- Birkhoff B₃
+- boxes with redundant rows and with row scales of 1e±6
+
+**Found:**
+- Everything passes except **standard simplices from n=7**. The failure is **spread, not bias**:
+  sd 0.104 at n=7 and 0.176 at n=15, against the 0.0667 target.
+- No shape is consistently low.
+- The cause is ball-walk correlation. A simplex has R/r ≈ n, and rounding cannot change that.
+- **GaussianCDHRWalk fixes every simplex and is 2.5–8× faster.** With it, simplex15 goes from sd
+  0.176 at 208 s to sd 0.064 at 27 s. In ttc this is `--vol-oracle cg-cdhr`.
+
+### rounding (`tests/volesti/test_rounding.cpp`, 9 cases, ~26 s; slow method comparison tagged `slow`)
+**Did:** round + ttc oracle on:
+- the long box
+- aspect 1..1e4 in d=2/5/10
+- rotated long boxes and long simplices
+- the slab [0,1e-4]×[0,1]^4
+- cubes, to check rounding does not hurt them
+
+**Found:**
+- Max-ellipsoid rounding fixes every hard case (max error 0.05).
+- On cubes rounding is the identity.
+- The rounding itself costs ≤ 0.01 s and makes the oracle 3–5× faster.
+- LOG_BARRIER, VOLUMETRIC and VAIDYA rounding are equally good.
+- **SVD rounding is bad:** −0.28/−0.90 on simplices, and it **hangs** on the slab because the
+  `svd_rounding.hpp` retry loop has no cap.
+- Confirmed vol(P) = |det T|·vol(P_rounded).
+
 ## Step 4: Theory
 **Did:** read [CV-PVA] (§2–4.2), [CV-GC] (Algorithm figure, assumptions), and the MATLAB
 `Volume.m`, `ConvexBody.m` and `preprocess.m`. Wrote `ttc-volume-vs-theory.md`.
@@ -203,3 +237,29 @@ by rⁿ. Every scale then gives identical results, and only elongation failures 
 were started detached or reset their affinity, so a watchdog
 (`scratchpad/cpu_guard.sh`) re-pins every 2 s any process under the Claude tree or with its
 cwd/exe in the repo or scratchpad. Told all agents to run one process at a time.
+
+## Step 7: Fix
+**Did:**
+1. `6494cf2` (volesti):
+   - Rescale to unit inner radius inside `volume_cooling_gaussians` and multiply by rⁿ.
+   - Relative a₀ bisection tolerance.
+   - Spectra → dense eigensolver fallback for d<3.
+2. `882cf3f` (ttc):
+   - New `src/volume/polytope_volume_oracle.hpp`, containing `roundForVolume` (max-inscribed-ellipsoid
+     rounding, falling back to the unrounded body on failure) and `runVolumeOracle`.
+   - `lra_volume.cpp` phase 1b rounds a copy, re-certifies its ball with `reliableInnerBall`, and
+     multiplies the oracle result by |det T|. The original body keeps its radii for clipping,
+     GetPrecision and sampling.
+   - New flags: `--vol-oracle {cg-ball (default), cg-cdhr, cb-billiard}` and `--no-round`.
+   - volesti preprocessing fixes:
+     - Catch Spectra's exception on round bodies.
+     - Make the `Computations failed` errors actually throw.
+     - Fix the swapped-arguments overload.
+3. Tests: `common.hpp` gains `ttcVolume` / `ttcVolumeSeeded`, which run ttc's real pipeline.
+   `ttcOracle` stays the raw volesti call.
+
+**Found:**
+- e2e: **67/67 pass** (was 32/67). Worst error 0.078. Wall time 22.5 s (was 76 s).
+- Long box: 7.78 → 2046.8 (+2.3%).
+- Side 1e-6: hang → +3%.
+- Side 1e6: inf → +3%.

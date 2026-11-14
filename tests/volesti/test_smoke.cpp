@@ -9,7 +9,7 @@ static double runTtc(const Body& B)
 {
   HPoly P = toHPoly(B);
   volestiBall(P);
-  return ttcOracle(P);
+  return ttcVolume(P);
 }
 
 TEST_CASE("smoke: unit cube dims 2..6 within eps/12-ish")
