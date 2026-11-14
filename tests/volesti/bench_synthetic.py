@@ -18,6 +18,11 @@ N, SEED, TIMEOUT = 10, int(sys.argv[3]) if len(sys.argv) > 3 else 20261114, 900
 
 files = sorted(f for f in os.listdir(INST) if f.endswith(".smt2.xz"))
 pick = random.Random(SEED).sample(files, N)
+# optional slice "i:j" of the picked instances (to run several benches in parallel)
+SLICE = sys.argv[4] if len(sys.argv) > 4 else ":"
+lo, hi = (int(v) if v else None for v in SLICE.split(":"))
+pick = pick[lo:hi]
+OUT = "results.csv" if SLICE == ":" else f"results_{SLICE.replace(':', '_')}.csv"
 archive = {r["instance"]: r for r in csv.DictReader(open(ARCHIVE))}
 
 def run(binary, path):
@@ -52,7 +57,7 @@ for f in pick:
     row["archived_ttc_correct_volume"] = a.get("ttc_correct_volume", "")
     rows.append(row)
     print(row, flush=True)
-    with open(os.path.join(HERE, "results.csv"), "w", newline="") as fh:
+    with open(os.path.join(HERE, OUT), "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)

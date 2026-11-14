@@ -14,10 +14,10 @@
 - [x] 11. Benchmark: 10 random syntheticLRA instances, now vs start (`update` @ `75e05e0`): **now is about 2× faster**, 3 more solved (step 11)
 - [ ] 12. **Sampling phase**: test ttc's single-polytope sampler for uniformity, the same way as volume (step 12; reproducer `e8a8b0a`; 5 agents running, 3 on hold)
   - [x] 12a. Harness helpers (`ttcProposals`, `ttcLatticeSamples`) + long-box reproducer (`e8a8b0a`)
-  - [ ] 12b. Agent tests: skinny, lattice, mixing, shapes (+boxes) running; theory done; boxes, walks, gmp on hold
+  - [~] 12b. Agent tests: skinny, lattice, mixing, theory done (`58d51ac`); shapes (+boxes) running; boxes, walks, gmp on hold
   - [x] 12c. Read the sampling theory → `text-for-agents/ttc-sampling-vs-theory.md`
-  - [ ] 12d. Fix the sampler (likely: round first and map back; walk-length rule), with `--no-round` parity
-  - [ ] 12e. Validate: sampling tests, e2e 67/67, bit-identical when sampling-fix is off, benchmark rerun
+  - [x] 12d. Fix the sampler: round + map back, exact lattice membership, ball-walk length ≥ 30 (`08026a2`)
+  - [~] 12e. Validate: default-walk sampling tests pass, e2e 67/67; benchmark rerun in progress; non-default walks open
 - [x] 13. Commit after every step (steps 9, 10 committed after the user pointed out the lapse)
 - [ ] 14. Follow-ups:
   - [ ] 14a. `build/` is in a mixed state (Ninja/clang cache, stale GCC Makefiles). You need to
@@ -437,4 +437,70 @@ cwd/exe in the repo or scratchpad. Told all agents to run one process at a time.
   unnormalised rows.
 - **Recommended fix:** round, map back before the lattice step, and switch to one burnt-in chain
   per polytope with thinning.
+
+### s-mixing (`tests/volesti/test_sampling_mixing.cpp`, ~21 s; slow suite ~55 s)
+**Did:**
+- Gauge-KS test (P(g ≤ t) = tⁿ about the centre), N=5000, α=0.001.
+- Searched for the smallest passing walk length L_min per walk and body.
+- Lag correlations within one call, and independence of the seed streams.
+
+**Found:**
+- Samples within a call are exactly independent; seed streams are independent too.
+- At the default L = 10+n², round bodies are uniform, but every walk fails at aspect ≥ 10
+  (box2x1000: D up to 0.24).
+- **L_min:**
+
+| Walk | cube10 | Rotated ×30 body, unrounded | After rounding |
+|---|---|---|---|
+| Billiard | 2 | 316 | 1–2 |
+| Ball | 42 | >3000 | — |
+
+- **Sampling in rounded coordinates passes on all 5 test bodies.**
+- One long chain with thinning keeps lag-1 correlation (z up to 7), so the restart design stays.
+
+### s-lattice (`tests/volesti/test_sampling_lattice.cpp`, 4 s; slow 6 s)
+**Did:** tested stochastic rounding, exact-uniform proposals → uniform law on P ∩ 10⁻ᵇℤⁿ (by
+enumerating the lattice points), κ and the rejection rate, the retry budget, composition with
+ttc's walks, and RNG seeding.
+**Found:**
+- **Correct:**
+  - Rounding is unbiased.
+  - The rounding kernel lies inside the inflated body (κ ≥ ‖A_j‖₁/‖A_j‖₂ up to n ≈ 22–28).
+  - The measured rejection rate matches theory, and is ≤ 5e-5 at ttc's precision.
+  - The retry budget is sound.
+- **Bug:** lattice points **exactly on a facet** were dropped by floating-point noise
+  (`A·(k/10ᵇ) ≤ b`). On a slab at b=3: p = 4.4e-9, with 24 points never produced.
+- **Fixed** (12d) by testing in lattice units.
+
+### s-skinny (`tests/volesti/test_sampling_skinny.cpp`, ~3 s; slow ~50 s)
+**Did:** swept 119 bodies (d=2–10, aspect 1–1e4, sizes 1e-6–1e6, rotated, stretched simplices),
+with KS in each body's own coordinates. Validated the rounding patch in an overlay.
+**Found:**
+- **Failing bodies, current sampler:** billiard 78/119, accelerated billiard 70, ball 76, RDHR 77,
+  CDHR 17.
+- **With rounding:** 0 for every walk.
+- Long-box lattice χ²: 18000 → 11.7.
+- **Tiny body at 1e6:** 1–25 samples per 1000 were *outside* P (slack cancellation); none after
+  rounding.
+- Rounding costs about 1.2 ms per body.
+
+## Step 12d: Sampler fix (`08026a2`)
+**Did:**
+- `roundPolytope()` exposes the volume oracle's rounding together with its affine map.
+- `sampleRestartWalk` and the `--fullgmp` GMP walks walk in the rounded body and map each point
+  back, x = shift + T·y. `--no-round` turns this off.
+- `sampleLattice` tests membership in lattice units: exact in GMP, ≤ 8 ulp in double.
+- Default sample walk length is max(30, 10+n²) for the ball walk, 10+n² otherwise.
+  The rule lives in `sampler_kind.hpp`, shared with the tests.
+
+**Found:**
+- **Passing now:** `test_sampling_smoke` (long-box slabs 0.098/0.102/0.106) and
+  `test_sampling_skinny`.
+- **e2e:** 67/67 in 17.1 s.
+- **Still failing, non-default walks only:**
+  - **Ball walk.** Its step is 4r/√n (volesti). That exceeds the rounded 2D body, so most
+    proposals are rejected, and with some probability a restart never moves (an atom at the
+    start point). The lattice test's ball cases fail (p ≈ 1e-86).
+  - **CDHR on 6–8D simplices.** The near-vertex regions are under-covered (KS p ≈ 1e-7).
+  - **Accelerated billiard.** One borderline gauge-KS result (D = 0.0292 vs critical 0.0276).
 
