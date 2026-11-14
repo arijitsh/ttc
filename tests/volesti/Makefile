@@ -14,13 +14,20 @@ LIBS     := /usr/lib/liblpsolve55.a -lcolamd -ldl -lm -lpthread
 SRCS     := $(wildcard test_*.cpp)
 BINS     := $(patsubst %.cpp,bin/%,$(SRCS))
 
+TTC_SRCS := $(ROOT)/src/volume/polytope_volume.cpp $(ROOT)/src/volume/polytope_sampler.cpp
+TTC_OBJS := bin/polytope_volume.o bin/polytope_sampler.o
+TTC_INCS := -I$(ROOT)/src/ddnnf
+
 all: $(BINS)
 bin/doctest_main.o: doctest_main.cpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) -I$(ROOT)/src/volesti/test -c $< -o $@
-bin/%: %.cpp common.hpp bin/doctest_main.o
+bin/polytope_%.o: $(ROOT)/src/volume/polytope_%.cpp $(ROOT)/src/volume/*.hpp
 	@mkdir -p bin
-	$(CXX) $(CXXFLAGS) $(INCS) $< bin/doctest_main.o -o $@ $(LIBS)
+	$(CXX) $(CXXFLAGS) $(INCS) $(TTC_INCS) -c $< -o $@
+bin/%: %.cpp common.hpp bin/doctest_main.o $(TTC_OBJS)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(INCS) $< bin/doctest_main.o $(TTC_OBJS) -o $@ $(LIBS)
 run: $(BINS)
 	@fail=0; for t in $(BINS); do echo "== $$t"; ./$$t || fail=1; done; exit $$fail
 clean:

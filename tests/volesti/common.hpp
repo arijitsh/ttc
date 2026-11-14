@@ -34,7 +34,8 @@
 #include "random_walks/uniform_rdhr_walk.hpp"
 #include "random_walks/uniform_accelerated_billiard_walk.hpp"
 #include "volume/volume_cooling_gaussians.hpp"
-#include "volume/polytope_volume_oracle.hpp"  // src/: ttc's rounding + oracle
+#include "volume/polytope_sampler.hpp"  // src/: ttc's sampler
+#include "volume/polytope_volume.hpp"   // src/: ttc's inner ball, rounding + oracle
 
 namespace vt
 {
@@ -171,33 +172,27 @@ inline double ttcOracle(HPoly P, double epsilon = 0.8)
                                                                   ttcWalkLength(n));
 }
 
-// ttc's full per-polytope pipeline (src/volume/lra_volume.cpp phase 1b):
-// round with the max inscribed ellipsoid, recompute the inner ball, run the
-// selected oracle and multiply by |det T|.  P must already hold its inner ball
-// (volestiBall / setBall).  ttc certifies the rounded ball with
-// reliableInnerBall; volesti's ComputeInnerBall is used here.
-inline double ttcVolume(HPoly P, double epsilon = 0.8,
-                        ttc::VolumeOracle oracle = ttc::VolumeOracle::CoolingGaussiansBall)
+// ttc's full per-polytope pipeline (src/volume/lra_volume.cpp phase 1b),
+// exactly as ttc runs it: certified inner ball, max-inscribed-ellipsoid
+// rounding, the selected oracle, times |det T|.
+inline ttc::RoundedPolytope ttcBody(const MT& A, const VT& b, bool round = true)
 {
-  const int n = static_cast<int>(P.dimension());
-  const ttc::RoundingResult rounding = ttc::roundForVolume(P, P.InnerBall().first);
-  if (rounding.applied) P.ComputeInnerBall();
-  TtcVolumeRNG rng(n);
-  return rounding.det * ttc::runVolumeOracle(P, oracle, epsilon / 12.0,
-                                             ttc::defaultOracleWalkLength(oracle, n), rng);
+  return ttc::RoundedPolytope(A, b, ttc::certifiedInnerBall(A, b), round);
 }
-
-// ttcVolume on an explicitly seeded RNG (for statistics across seeds).
-inline double ttcVolumeSeeded(HPoly P, unsigned seed, double epsilon = 0.8,
-                              ttc::VolumeOracle oracle = ttc::VolumeOracle::CoolingGaussiansBall)
+inline double ttcVolume(const HPoly& P, double epsilon = 0.8,
+                        ttc::VolumeOracle oracle = ttc::kDefaultVolumeOracle)
 {
   const int n = static_cast<int>(P.dimension());
-  const ttc::RoundingResult rounding = ttc::roundForVolume(P, P.InnerBall().first);
-  if (rounding.applied) P.ComputeInnerBall();
-  TtcSampleRNG rng(n);
-  rng.set_seed(seed);
-  return rounding.det * ttc::runVolumeOracle(P, oracle, epsilon / 12.0,
-                                             ttc::defaultOracleWalkLength(oracle, n), rng);
+  return ttcBody(P.get_mat(), P.get_vec())
+      .volume(oracle, epsilon / 12.0, ttc::defaultOracleWalkLength(oracle, n));
+}
+// ttcVolume on an explicitly seeded stream (for statistics across seeds).
+inline double ttcVolumeSeeded(const HPoly& P, unsigned seed, double epsilon = 0.8,
+                              ttc::VolumeOracle oracle = ttc::kDefaultVolumeOracle)
+{
+  const int n = static_cast<int>(P.dimension());
+  return ttcBody(P.get_mat(), P.get_vec())
+      .volumeWithSeed(oracle, epsilon / 12.0, ttc::defaultOracleWalkLength(oracle, n), seed);
 }
 
 // Same oracle on an explicitly seeded RNG (for statistics across seeds).

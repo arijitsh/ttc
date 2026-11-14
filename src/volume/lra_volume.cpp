@@ -16,7 +16,6 @@
 #include <vector>
 
 #include <Eigen/Dense>
-#include <lp_lib.h>
 
 #include <random>
 
@@ -27,22 +26,10 @@
 #include <boost/multiprecision/gmp.hpp>
 #include <boost/multiprecision/eigen.hpp>
 
-#include "cartesian_geom/cartesian_kernel.h"
-#include "convex_bodies/hpolytope.h"
-#include "generators/boost_random_number_generator.hpp"
 #include "logger.hpp"
-#include "sampling/sphere.hpp"
-#include "random_walks/uniform_billiard_walk.hpp"
-#include "random_walks/uniform_accelerated_billiard_walk.hpp"
-#include "random_walks/uniform_ball_walk.hpp"
-#include "random_walks/uniform_cdhr_walk.hpp"
-#include "random_walks/uniform_rdhr_walk.hpp"
-#include "random_walks/gaussian_ball_walk.hpp"
-#include "sampling/random_point_generators.hpp"
-#include "volume/sampling_policies.hpp"
-#include "volume/volume_cooling_gaussians.hpp"
 #include "volume/gmp_walks.hpp"
-#include "volume/polytope_volume_oracle.hpp"
+#include "volume/polytope_sampler.hpp"
+#include "volume/polytope_volume.hpp"
 
 // cddlib (double precision) for polytope canonicalization, mirroring the
 // Python prototype's use of pycddlib (src/polytope_operations.py::canonicalize).
@@ -663,275 +650,6 @@ int precisionFromCubes(std::size_t dimension, std::size_t facetCount,
   return static_cast<int>(prec);
 }
 
-using LpPtr = std::unique_ptr<lprec, decltype(&delete_lp)>;
-
-LpPtr makeLp(int columns)
-{
-  LpPtr lp(make_lp(0, columns), delete_lp);
-  if (!lp) throw std::runtime_error("outer-radius LP allocation failed");
-  set_verbose(lp.get(), CRITICAL);
-  return lp;
-}
-
-// max sign*y_j  s.t.  A y <= s, y free, on a fresh lp_solve model.
-int solvePrimalExtent(const Eigen::MatrixXd& A, const Eigen::VectorXd& s, int j,
-                      double sign, bool scaled, double& value)
-{
-  const int dim = static_cast<int>(A.cols());
-  LpPtr lp = makeLp(dim);
-  if (!scaled) set_scaling(lp.get(), SCALE_NONE);
-  for (int k = 1; k <= dim; ++k) set_unbounded(lp.get(), k);
-  std::vector<double> row(dim + 1, 0.0);
-  set_add_rowmode(lp.get(), TRUE);
-  for (Eigen::Index i = 0; i < A.rows(); ++i)
-  {
-    for (int k = 0; k < dim; ++k) row[k + 1] = A(i, k);
-    if (!add_constraint(lp.get(), row.data(), LE, s(i)))
-      throw std::runtime_error("outer-radius LP constraint failed");
-  }
-  set_add_rowmode(lp.get(), FALSE);
-  std::fill(row.begin(), row.end(), 0.0);
-  row[j + 1] = sign;
-  if (!set_obj_fn(lp.get(), row.data()))
-    throw std::runtime_error("outer-radius LP objective failed");
-  set_maxim(lp.get());
-  const int status = solve(lp.get());
-  value = get_objective(lp.get());
-  return status;
-}
-
-// The same extent via the LP dual  min s.lambda  s.t.  A^T lambda = sign*e_j,
-// lambda >= 0.  It has no free variables, and any dual-feasible lambda
-// certifies sign*y_j <= s.lambda on the whole polytope.
-int solveDualExtent(const Eigen::MatrixXd& A, const Eigen::VectorXd& s, int j,
-                    double sign, double& value)
-{
-  const int dim = static_cast<int>(A.cols());
-  const int rows = static_cast<int>(A.rows());
-  LpPtr lp = makeLp(rows);
-  std::vector<double> row(rows + 1, 0.0);
-  set_add_rowmode(lp.get(), TRUE);
-  for (int k = 0; k < dim; ++k)
-  {
-    for (int i = 0; i < rows; ++i) row[i + 1] = A(i, k);
-    if (!add_constraint(lp.get(), row.data(), EQ, k == j ? sign : 0.0))
-      throw std::runtime_error("outer-radius LP constraint failed");
-  }
-  set_add_rowmode(lp.get(), FALSE);
-  for (int i = 0; i < rows; ++i) row[i + 1] = s(i);
-  if (!set_obj_fn(lp.get(), row.data()))
-    throw std::runtime_error("outer-radius LP objective failed");
-  set_minim(lp.get());
-  const int status = solve(lp.get());
-  if (status != OPTIMAL) return status;
-  std::vector<double> raw(rows);
-  get_variables(lp.get(), raw.data());
-  const Eigen::VectorXd lambda = Eigen::Map<Eigen::VectorXd>(raw.data(), rows).cwiseMax(0.0);
-  Eigen::VectorXd target = Eigen::VectorXd::Zero(dim);
-  target(j) = sign;
-  if (!((A.transpose() * lambda - target).norm() <= 1e-7)) return NUMFAILURE;
-  value = s.dot(lambda);
-  return status;
-}
-
-// Coordinate extrema bound P by a box, hence by a ball about center.
-// Like the existing inner-ball LP, these bounds use practical double arithmetic.
-// The LPs are posed in y = x - center with unit-norm rows, so y = 0 is
-// strictly feasible, and every extent gets a fresh model: re-optimising one
-// lp_solve model under a new objective reported spurious UNBOUNDED on
-// ill-conditioned zonotopes (max y_j "unbounded" while min y_j = -229 on a
-// centrally symmetric parallelotope).  Rows are already equilibrated, so the
-// first solve is unscaled; a non-optimal status is retried with lp_solve's
-// default scaling and then through the dual before the polytope is rejected.
-double outerRadius(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
-                   const Eigen::VectorXd& center)
-{
-  const int dim = static_cast<int>(A.cols());
-  Eigen::MatrixXd unitA = A;
-  Eigen::VectorXd slack = b - A * center;
-  for (Eigen::Index i = 0; i < A.rows(); ++i)
-  {
-    const double norm = A.row(i).norm();
-    if (norm > 0.0)
-    {
-      unitA.row(i) /= norm;
-      slack(i) /= norm;
-    }
-  }
-  double radius = 0.0;
-  for (int j = 0; j < dim; ++j)
-  {
-    double extent = 0.0;
-    for (const double sign : {1.0, -1.0})
-    {
-      double value = 0.0;
-      int primal = solvePrimalExtent(unitA, slack, j, sign, false, value);
-      if (primal != OPTIMAL)
-        primal = solvePrimalExtent(unitA, slack, j, sign, true, value);
-      if (primal != OPTIMAL)
-      {
-        const int dual = solveDualExtent(unitA, slack, j, sign, value);
-        if (dual == INFEASIBLE && primal == UNBOUNDED)
-          throw std::runtime_error("polytope is unbounded");
-        if (dual != OPTIMAL)
-          throw std::runtime_error("outer-radius LP failed (lp_solve status "
-                                   + std::to_string(primal) + "/"
-                                   + std::to_string(dual) + ")");
-      }
-      extent = std::max(extent, std::abs(value));
-    }
-    radius = std::hypot(radius, extent);
-  }
-  if (!std::isfinite(radius) || radius <= 0.0)
-    throw std::runtime_error("invalid polytope outer radius");
-  return radius;
-}
-
-// Chebyshev ball  max r  s.t.  a_i.x + r <= b_i  (unit-norm rows, x free,
-// r >= 0) on a fresh lp_solve model; unscaled first, then default scaling.
-bool solveChebyshevBall(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
-                        Eigen::VectorXd& center, double& radius)
-{
-  const int dim = static_cast<int>(A.cols());
-  for (const bool scaled : {false, true})
-  {
-    LpPtr lp = makeLp(dim + 1);
-    if (!scaled) set_scaling(lp.get(), SCALE_NONE);
-    for (int k = 1; k <= dim; ++k) set_unbounded(lp.get(), k);
-    std::vector<double> row(dim + 2, 0.0);
-    row[dim + 1] = 1.0;
-    set_add_rowmode(lp.get(), TRUE);
-    for (Eigen::Index i = 0; i < A.rows(); ++i)
-    {
-      for (int k = 0; k < dim; ++k) row[k + 1] = A(i, k);
-      if (!add_constraint(lp.get(), row.data(), LE, b(i)))
-        throw std::runtime_error("Chebyshev-ball LP constraint failed");
-    }
-    set_add_rowmode(lp.get(), FALSE);
-    std::fill(row.begin(), row.end(), 0.0);
-    row[dim + 1] = 1.0;
-    if (!set_obj_fn(lp.get(), row.data()))
-      throw std::runtime_error("Chebyshev-ball LP objective failed");
-    set_maxim(lp.get());
-    if (solve(lp.get()) != OPTIMAL) continue;
-    std::vector<double> values(dim + 1);
-    get_variables(lp.get(), values.data());
-    center = Eigen::Map<Eigen::VectorXd>(values.data(), dim);
-    radius = values[dim];
-    return true;
-  }
-  return false;
-}
-
-// volesti's ComputeInnerBall returns the max_inscribed_ball IPM iterate without
-// checking that the IPM converged (it did not on 116 of 393 syntheticLRA1131
-// polytopes, and stalled at a ball 11x too small on a dim-27 simplex), and
-// its lp_solve fallback trusts any OPTIMAL status.  The radius is never checked
-// against the polytope, yet the oracle's walk step 4r/sqrt(a*n), the clipping
-// bounds and GetPrecision all scale with it.  An overestimated radius stalls the
-// Gaussian walk at the centre, the annealing schedule collapses to the single
-// value a = 0, and the oracle returns (pi/0)^(n/2) = inf.  An underestimated one
-// slows the walk and biases the estimate low.  So re-derive the radius from the
-// slacks at each candidate centre, compare against a fresh Chebyshev LP, and
-// keep the larger certified ball.  A valid volesti ball within 0.1% of the LP
-// optimum is returned untouched, so well-behaved inputs give bit-identical
-// results.  The result is stored in P, where volesti's walks read it.
-template <typename HPoly>
-std::pair<typename HPoly::PointType, double> reliableInnerBall(HPoly& P)
-{
-  using PointT = typename HPoly::PointType;
-  constexpr double kRelTol = 1e-6;       // claimed radius vs. certified slack
-  constexpr double kOptimalTol = 1e-3;   // valid but clearly suboptimal ball
-  const auto ball = P.ComputeInnerBall();  // also row-normalizes P
-  const Eigen::MatrixXd A = P.get_mat();
-  const Eigen::VectorXd b = P.get_vec();
-  const double none = -std::numeric_limits<double>::infinity();
-  auto slackRadius = [&](const Eigen::VectorXd& c) {
-    return c.size() == A.cols() && c.allFinite() ? (b - A * c).minCoeff() : none;
-  };
-
-  const Eigen::VectorXd volestiCenter = ball.first.getCoefficients();
-  const double volestiCert = slackRadius(volestiCenter);
-  Eigen::VectorXd lpCenter;
-  double lpRadius = 0.0;
-  double lpCert = none;
-  if (solveChebyshevBall(A, b, lpCenter, lpRadius))
-    lpCert = std::min(lpRadius, slackRadius(lpCenter));
-
-  const bool volestiValid = std::isfinite(ball.second) && ball.second > 0.0
-                            && ball.second <= volestiCert * (1.0 + kRelTol);
-  if (volestiValid && !(ball.second < lpCert * (1.0 - kOptimalTol)))
-    return ball;
-
-  std::pair<PointT, double> fixed{PointT(static_cast<unsigned>(A.cols())), -1.0};
-  if (lpCert >= volestiCert && lpCert > 0.0)
-    fixed = {PointT(lpCenter), lpCert};
-  else if (volestiCert > 0.0)
-    fixed = {ball.first, volestiCert};
-  Log(2) << "inner ball: volesti radius " << ball.second << " (certified "
-         << volestiCert << "), Chebyshev LP radius " << lpCert << "; using "
-         << fixed.second << std::endl;
-  if (fixed.second > 0.0) P.set_InnerBall(fixed);
-  return fixed;
-}
-
-// GenerateSamples: inflate facets, independently restart the selected walk,
-// stochastically round to 10^-b Z^n, and reject against the original body.
-// Walk length and Volesti convergence remain practical, uncertified oracles.
-template <typename Coord, typename GenFn>
-std::vector<Eigen::Matrix<Coord, Eigen::Dynamic, 1>> sampleLattice(
-    const Eigen::MatrixXd& A, const Eigen::VectorXd& b, long long n,
-    int precision, double epsilon, double delta, unsigned seed,
-    GenFn&& generate, double& samplingTime)
-{
-  using Vec = Eigen::Matrix<Coord, Eigen::Dynamic, 1>;
-  using std::floor;
-  using std::pow;
-  const Coord scale = pow(Coord(10), precision);
-  const double spacing = std::pow(10.0, -precision);
-  if (spacing == 0.0)
-    throw std::runtime_error("lattice spacing is below double geometry resolution");
-  const double kappa = std::sqrt(2.0 * std::log(16.0 / epsilon))
-                       + std::sqrt(2.0 * std::log(double(A.rows())));
-  Eigen::VectorXd inflated = b;
-  for (Eigen::Index i = 0; i < A.rows(); ++i)
-    inflated(i) += spacing * kappa * A.row(i).norm();
-  const auto Am = A.template cast<Coord>().eval();
-  const Vec bm = b.template cast<Coord>();
-  std::mt19937 rng(seed);
-  std::uniform_real_distribution<double> unit(0.0, 1.0);
-  std::vector<Vec> out;
-  out.reserve(static_cast<std::size_t>(n));
-  // Under the paper's oracle assumptions, rejection probability <= epsilon/3.
-  // Budget a failed sampling batch within delta; report failure, never fewer points.
-  const int maxBatches = std::max(1, static_cast<int>(std::ceil(
-      (std::log(delta) - std::log(double(std::max(1LL, n)))) / std::log(epsilon / 3.0))));
-  const double begun = Log.elapsed();
-  for (int batch = 0; out.size() < static_cast<std::size_t>(n); ++batch)
-  {
-    if (batch >= maxBatches)
-      throw std::runtime_error("lattice rejection sampler exceeded its retry budget");
-    double ignoredTime = 0.0;
-    auto points = generate(A, inflated, n - static_cast<long long>(out.size()), ignoredTime);
-    for (const auto& point : points)
-    {
-      Vec rounded(point.size());
-      for (Eigen::Index j = 0; j < point.size(); ++j)
-      {
-        const Coord raw = Coord(point(j)) * scale;
-        Coord base = floor(raw);
-        const Coord fraction = raw - base;
-        if (unit(rng) < static_cast<double>(fraction)) base += 1;
-        rounded(j) = base / scale;
-      }
-      if (((Am * rounded - bm).array() <= Coord(0)).all())
-        out.push_back(std::move(rounded));
-    }
-  }
-  samplingTime = Log.elapsed() - begun;
-  return out;
-}
-
 // A polytope kept after phase 1, with its (double) half-space matrices and the
 // volesti volume estimate.
 struct PolytopeVolume
@@ -1092,22 +810,6 @@ VolumeComputationResult computeLraVolume(
     index.emplace(uniqueVars[i], i);
   }
 
-  using Kernel = Cartesian<double>;
-  using Point = Kernel::Point;
-  using HPolytope = HPolytope<Point>;
-  // Volume RNG matches the volesti `volume` tool: a fixed compile-time seed (3),
-  // so the cooling-gaussians estimate is deterministic.
-  using VolumeRNG = BoostRandomNumberGenerator<boost::mt19937, double, 3>;
-  // Sampling RNG matches the volesti `sample` tool: explicitly seeded.
-  using SampleRNG = BoostRandomNumberGenerator<boost::mt19937, double>;
-  // Candidate sampling walks, selected at run time by options.samplerWalk.
-  using BilliardW = BilliardWalk::template Walk<HPolytope, SampleRNG>;
-  using AccelBilliardW =
-      AcceleratedBilliardWalk::template Walk<HPolytope, SampleRNG>;
-  using BallW = BallWalk::template Walk<HPolytope, SampleRNG>;
-  using RdhrW = RDHRWalk::template Walk<HPolytope, SampleRNG>;
-  using CdhrW = CDHRWalk::template Walk<HPolytope, SampleRNG>;
-
   // Algorithm 1 in the revised manuscript.
   const double kEpsilon = options.epsilon;
   const double kDelta = options.delta;
@@ -1159,7 +861,7 @@ VolumeComputationResult computeLraVolume(
   {
     Eigen::MatrixXd A;
     Eigen::VectorXd b;
-    HPolytope hpoly;  // row-normalized by reliableInnerBall, holds its ball
+    InnerBall ball;  // certified Chebyshev ball
     double innerRadius;
     double outerRadius;
     long rawFacets;
@@ -1200,24 +902,24 @@ VolumeComputationResult computeLraVolume(
       writePolytopeIne(path, matrices.A, matrices.b);
       Log(1) << "wrote polytope to " << path << std::endl;
     }
-    HPolytope hpoly(static_cast<unsigned>(dimension), matrices.A, matrices.b);
     const double ballStart = Log.elapsed();
-    const auto innerBall = reliableInnerBall(hpoly);
+    InnerBall innerBall = certifiedInnerBall(matrices.A, matrices.b);
     ballTime += Log.elapsed() - ballStart;
-    if (innerBall.second <= 0.0)
+    if (innerBall.radius <= 0.0)
     {
       ++numZeroVolume;
       continue;
     }
-    if (!std::isfinite(innerBall.second))
+    if (!std::isfinite(innerBall.radius))
       throw std::runtime_error("polytope has no finite inner radius");
     const double radiusStart = Log.elapsed();
-    const double radius = outerRadius(matrices.A, matrices.b, innerBall.first.getCoefficients());
+    const double radius = outerRadius(matrices.A, matrices.b, innerBall.center);
     ballTime += Log.elapsed() - radiusStart;
-    minRadius = std::min(minRadius, innerBall.second);
+    minRadius = std::min(minRadius, innerBall.radius);
     facetTotal += static_cast<std::size_t>(matrices.A.rows());
-    prepared.push_back({std::move(matrices.A), std::move(matrices.b), std::move(hpoly),
-                        innerBall.second, radius, rawFacets});
+    const double innerRadius = innerBall.radius;
+    prepared.push_back({std::move(matrices.A), std::move(matrices.b), std::move(innerBall),
+                        innerRadius, radius, rawFacets});
   }
 
   if (numZeroVolume > 0)
@@ -1255,36 +957,19 @@ VolumeComputationResult computeLraVolume(
   for (auto& entry : prepared)
   {
     double volumeComputeStart = Log.elapsed();
-    // Round a copy first (Cousins-Vempala, Fig. 2 step 1): every volesti walk
-    // steps in units of the inner radius, so on a skinny body it never crosses
-    // the body and the estimate collapses.  vol(P) = det * vol(rounded P).
-    // The original body keeps its ball/radii for clipping, GetPrecision and
-    // sampling.
-    HPolytope body = entry.hpoly;
-    double roundDet = 1.0;
-    if (options.roundPolytopes)
-    {
-      const RoundingResult rounding = roundForVolume(body, entry.hpoly.InnerBall().first);
-      const auto roundedBall =
-          rounding.applied ? reliableInnerBall(body) : std::pair<Point, double>{Point(1), -1.0};
-      if (rounding.applied && roundedBall.second > 0.0 && std::isfinite(roundedBall.second))
-      {
-        roundDet = rounding.det;
-        Log(2) << "rounded polytope: |det T| = " << roundDet << ", inner radius "
-               << entry.innerRadius << " -> " << roundedBall.second << std::endl;
-      }
-      else
-      {
-        Log(1) << "WARNING: polytope rounding skipped ("
-               << (rounding.applied ? std::string("no inner ball after rounding")
-                                    : rounding.failure)
-               << "); the volume estimate may be poor if the polytope is skinny" << std::endl;
-        body = entry.hpoly;
-      }
-    }
-    VolumeRNG volumeRng(static_cast<int>(dimension));
-    double volume = roundDet * runVolumeOracle(body, options.volumeOracle, mvcEps,
-                                               volumeWalkLength, volumeRng);
+    // Round first (Cousins-Vempala, Fig. 2 step 1): every volesti walk steps in
+    // units of the inner radius, so on a skinny body it never crosses the body
+    // and the estimate collapses.  vol(P) = det * vol(rounded P), folded into
+    // RoundedPolytope::volume.  The original body keeps its radii for clipping,
+    // GetPrecision and sampling.
+    const RoundedPolytope body(entry.A, entry.b, entry.ball, options.roundPolytopes);
+    if (body.rounded())
+      Log(2) << "rounded polytope: |det T| = " << body.det() << ", inner radius "
+             << entry.innerRadius << " -> " << body.innerRadius() << std::endl;
+    else if (options.roundPolytopes)
+      Log(1) << "WARNING: polytope rounding skipped (" << body.roundingFailure()
+             << "); the volume estimate may be poor if the polytope is skinny" << std::endl;
+    double volume = body.volume(options.volumeOracle, mvcEps, volumeWalkLength);
     // A practical oracle run can still end non-finite or non-positive, which is
     // a detected failure.  Rerun it on fresh independent streams before giving up.
     constexpr unsigned kOracleAttempts = 3;
@@ -1295,10 +980,8 @@ VolumeComputationResult computeLraVolume(
       Log(1) << "WARNING: volume oracle returned " << volume
              << " (inner radius " << entry.innerRadius << ", outer radius "
              << entry.outerRadius << "); retrying on a fresh random stream" << std::endl;
-      SampleRNG oracleRng(static_cast<unsigned>(dimension));
-      oracleRng.set_seed(kSeed + 0x51ED2701U * attempt);
-      volume = roundDet * runVolumeOracle(body, options.volumeOracle, mvcEps,
-                                          volumeWalkLength, oracleRng);
+      volume = body.volumeWithSeed(options.volumeOracle, mvcEps, volumeWalkLength,
+                                   kSeed + 0x51ED2701U * attempt);
     }
     double volumeComputeElapsed = Log.elapsed() - volumeComputeStart;
     totalVolumeTime += volumeComputeElapsed;
@@ -1323,55 +1006,16 @@ VolumeComputationResult computeLraVolume(
   if (kept.empty()) return result;
   const double log2Scale = std::log2(thresh) + double(precision) * double(dimension) * std::log2(10.0);
 
-  SampleRNG sampleRng(static_cast<int>(dimension));
-
-  // Restart the selected walk at one fixed center before every proposal.
+  // Restart the selected walk at the certified centre before every proposal.
   auto generateDouble =
       [&](const Eigen::MatrixXd& A, const Eigen::VectorXd& b, long long n,
           double& samplingTime) -> std::vector<Eigen::VectorXd> {
-    HPolytope hpoly(static_cast<unsigned>(dimension), A, b);
-    const double ballStart = Log.elapsed();
-    const Point center = reliableInnerBall(hpoly).first;
-    samplerBallTime += Log.elapsed() - ballStart;
-    PushBackWalkPolicy policy;
-    std::list<Point> samples;
-    sampleRng.set_seed(streamSeed());
+    double ballSeconds = 0.0;
     double samplingStart = Log.elapsed();
-    for (long long i = 0; i < n; ++i)
-    {
-      Point start = center;
-      switch (options.samplerWalk)
-      {
-        case SamplerWalk::AcceleratedBilliard:
-          RandomPointGenerator<AccelBilliardW>::apply(
-              hpoly, start, 1, sampleWalkLength, samples, policy, sampleRng);
-          break;
-        case SamplerWalk::Ball:
-          RandomPointGenerator<BallW>::apply(
-              hpoly, start, 1, sampleWalkLength, samples, policy, sampleRng);
-          break;
-        case SamplerWalk::RDHR:
-          RandomPointGenerator<RdhrW>::apply(
-              hpoly, start, 1, sampleWalkLength, samples, policy, sampleRng);
-          break;
-        case SamplerWalk::CDHR:
-          RandomPointGenerator<CdhrW>::apply(
-              hpoly, start, 1, sampleWalkLength, samples, policy, sampleRng);
-          break;
-        case SamplerWalk::Billiard:
-        default:
-          RandomPointGenerator<BilliardW>::apply(
-              hpoly, start, 1, sampleWalkLength, samples, policy, sampleRng);
-          break;
-      }
-    }
-    samplingTime = Log.elapsed() - samplingStart;
-    std::vector<Eigen::VectorXd> out;
-    out.reserve(samples.size());
-    for (const Point& sample : samples)
-    {
-      out.push_back(sample.getCoefficients());
-    }
+    auto out = sampleRestartWalk(A, b, n, options.samplerWalk, sampleWalkLength, streamSeed(),
+                                 ballSeconds);
+    samplerBallTime += ballSeconds;
+    samplingTime = Log.elapsed() - samplingStart - ballSeconds;
     return out;
   };
 
@@ -1418,12 +1062,11 @@ VolumeComputationResult computeLraVolume(
       auto generate =
           [&](const Eigen::MatrixXd& A, const Eigen::VectorXd& b, long long n,
               double& samplingTime) {
-            HPolytope hpoly(static_cast<unsigned>(dimension), A, b);
             const double ballStart = Log.elapsed();
-            auto ball = reliableInnerBall(hpoly);
+            const InnerBall ball = certifiedInnerBall(A, b);
             samplerBallTime += Log.elapsed() - ballStart;
-            Eigen::VectorXd center = ball.first.getCoefficients();
-            double radius = ball.second;
+            const Eigen::VectorXd& center = ball.center;
+            const double radius = ball.radius;
             double samplingStart = Log.elapsed();
             // One stream advance per polytope, drawn before the switch so the
             // sequence of seeds does not depend on which walk is selected.

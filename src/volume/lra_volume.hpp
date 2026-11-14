@@ -8,6 +8,7 @@
 #include <cvc5/cvc5.h>
 
 #include "volume/allsat_volume.hpp"
+#include "volume/sampler_kind.hpp"
 #include "volume/volume_oracle_kind.hpp"
 
 namespace ttc
@@ -53,23 +54,6 @@ enum class GmpMode
   PointRepr,
   None,
   Full
-};
-
-// Random-walk used by volesti to draw (approximately) uniform points from each
-// polytope during the union-volume estimation. Selected with --sampler.
-//   Billiard (default):    uniform_billiard_walk.hpp -- reflecting trajectories,
-//                          mixes fastest for H-polytopes.
-//   AcceleratedBilliard:   uniform_accelerated_billiard_walk.hpp.
-//   Ball:                  uniform_ball_walk.hpp -- classic ball walk.
-//   RDHR / CDHR:           random- / coordinate-directions hit-and-run.
-// Under --fullgmp, accelerated billiard falls back to GMP billiard.
-enum class SamplerWalk
-{
-  Billiard,
-  AcceleratedBilliard,
-  Ball,
-  RDHR,
-  CDHR
 };
 
 // Tunable knobs for the LRA volume engine. A negative walk length means "use

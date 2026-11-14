@@ -8,9 +8,12 @@
 - [x] 5. Keep all testing on ≤ 60% of the CPU (cores 0–11, nice 19; a watchdog enforces it)
 - [x] 6. Consolidate a root-cause diagnosis from the agent reports
 - [x] 7. Fix: scale normalisation (`6494cf2`), rounding + `--vol-oracle` (`882cf3f`), volesti rounding bugs
-- [~] 8. Validate: e2e 67/67 pass; unit suite running; syntheticLRA regression check pending
-- [ ] 9. **Sampling phase**: on the same polytopes, test that ttc's samples are uniform over each body
-- [ ] 10. Commit after every step
+- [x] 8. Validate the fix: e2e 67/67; unit suite updated to ttc's pipeline (`6857cad`); syntheticLRA dim10 spot check
+- [x] 9. Extra fixes chosen by the user: annealing step cap, batch-means stopping, `cg-cdhr` default (`233b9c2`, step 9)
+- [x] 10. Move our layer from headers to `.cpp` (`polytope_volume.{hpp,cpp}`, `polytope_sampler.{hpp,cpp}`); bit-identical (step 10, committed below)
+- [ ] 11. Benchmark: 10 random syntheticLRA instances, now vs start (`update` @ `75e05e0`): time + volume (in progress, step 11)
+- [ ] 12. **Sampling phase**: test ttc's single-polytope sampler for uniformity, the same way as volume (step 12)
+- [x] 13. Commit after every step (steps 9, 10 committed after the user pointed out the lapse)
 
 ---
 
@@ -263,3 +266,73 @@ cwd/exe in the repo or scratchpad. Told all agents to run one process at a time.
 - Long box: 7.78 → 2046.8 (+2.3%).
 - Side 1e-6: hang → +3%.
 - Side 1e6: inf → +3%.
+
+## Step 8: Validate
+**Did:**
+- Ran e2e and the full unit suite on the fixed tree.
+- Added `ttcVolume` (ttc's pipeline) to `tests/volesti/common.hpp`.
+- Synced the annealing replica with the rescale.
+- Spot-checked two syntheticLRA dim10 union instances, with rounding and with `--no-round`.
+
+**Found:**
+- **e2e:** 67/67.
+- **Unit suite:** the remaining failures were the raw unrounded schedule on the long box, plus the
+  ratio-accuracy tests.
+- **syntheticLRA spot check:**
+  - All 20 polytopes were rounded, with no warnings.
+  - Totals were within 3% of the archived `ttc_correct` volumes: 3.998e22 vs 4.13e22, and 2.72e22 vs 2.65e22.
+  - Rounded runs were 9–12% faster than `--no-round`.
+- One redundant-facet box was a single 3σ draw (+0.142 against a 0.133 limit). Over 20 seeds it
+  shows no bias: mean +0.006, sd 0.046.
+
+## Step 9: Extra fixes (user chose all three)
+**Did:** applied, in volesti's `volume_cooling_gaussians.hpp`:
+- **Annealing step cap** (annealing agent): `get_next_gaussian` never shrinks a by more than
+  1−α_max, where ((1−α)²/(1−2α))ⁿ ≤ 1+C, from the log-concavity of aⁿZ(a).
+- **Batch-means stopping** (ratios agent): a phase stops only when the window test passes *and* the
+  batch-means relative standard error is ≤ ε'/2. The check is repeated every 1.2× samples.
+- **Default oracle `cg-cdhr`** (shapes agent): `kDefaultVolumeOracle` in `volume_oracle_kind.hpp`.
+  The test helpers use the same constant.
+- Synced the annealing replica with the batch-means rule.
+
+**Found:**
+- **e2e:** 67/67. Worst error 0.078 → 0.048. Wall time 22.5 s → 19.8 s. The 10D box took 5.8 s
+  (was 7.8 s) and the 8D simplex 3.2 s (was 4.4 s).
+- **Unit suite, now passing:**
+  - `gaussian_walk`, `ratio_convergence`, `standard_shapes`
+  - every annealing variance-condition test
+- **Unit suite, still failing:**
+  - The raw unrounded long box: 7.78 → 399, still −80%. This is ball-walk mixing, which ttc avoids
+    by rounding.
+- **Cost on the raw ball walk (`cg-ball`):** unit cube10 needs 40 phases instead of 5.
+  `test_rounding` now exceeds 900 s (was 26 s), and `test_standard_shapes` takes 206 s (was 49 s).
+  **The runtime cost for `--vol-oracle cg-ball` users is significant**; the default `cg-cdhr` is
+  measured in step 11.
+
+## Step 10: Header → .cpp refactor (user approved)
+**Did:**
+- `src/volume/polytope_volume.{hpp,cpp}`:
+  - `certifiedInnerBall`, `outerRadius`, and `RoundedPolytope` (round once, then
+    `volume()` / `volumeWithSeed()`).
+  - The LP helpers and `reliableInnerBall` moved here verbatim from `lra_volume.cpp`.
+- `src/volume/polytope_sampler.{hpp,cpp}`:
+  - `sampleRestartWalk(A, b, n, walk, walkLength, seed, ballSeconds)`.
+  - `sampleLattice` stays a header template: it is Eigen-only and needs both double and GMP
+    coordinates.
+- `sampler_kind.hpp` and `volume_oracle_kind.hpp` are tiny enum headers for `lra_volume.hpp` and
+  `main.cpp`.
+- `lra_volume.cpp` no longer includes any volesti or lp_solve header.
+- Tests link the two objects and call exactly what ttc calls.
+
+**Found:**
+- **Bit-identical:** all 16 runs (4 files × default/`--nogmp`/`--fullgmp`/`--sampler cdhr`)
+  give the same `s volume`.
+- **Build-directory problem:**
+  - `build/`'s CMake cache is configured for Ninja + clang + anaconda Boost, but `make` had kept
+    using stale Unix-Makefiles files from 4 Nov (GCC, static). So `cmake .` did not pick up the
+    new sources, and the failed link deleted `build/ttc`.
+  - I configured a separate **`build-gcc/`** (the `configure.sh` Linux arguments: static, d-DNNF,
+    GCC, Unix Makefiles) and copied its binary to `build/ttc`.
+  - **`build/` itself still needs a reconfigure**:
+    `CMAKE_GENERATOR="Unix Makefiles" ./configure.sh --skip-deps --ddnnf` after `rm -rf build`.
+
