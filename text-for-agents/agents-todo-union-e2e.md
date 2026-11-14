@@ -14,7 +14,7 @@ Single-polytope volume and sampling work: `agent-todo.md`.
   - [ ] u-robust: T2 error injection (volume ±ε′, sampler TV η) → `test_union_robust.cpp`
   - [x] u-params: T3 lattice count vs volume + T4 Thresh/ε′/δ′/clipping →
     `test_union_lattice.cpp`, `test_union_params.cpp`
-  - [ ] u-decomp: T6 decomposition soundness/completeness via `--dump-ine` →
+  - [x] u-decomp: T6 decomposition soundness/completeness via `--dump-ine` →
     `tests/volesti/union_decomp/`, `run_union_decomp.py`
   - [ ] u-e2e: T7 SMT formulas with exactly known union volumes, 20 seeds, all modes, current vs
     start binary → `tests/volesti/union_smt2/`, `run_union_e2e.py`
@@ -87,4 +87,47 @@ niced processes.
 - **GetPrecision is conservative:** ttc's b is 2–4 digits above the smallest η-accurate b.
   - It costs almost nothing: C is tracked in logs, and the extra halvings run on an empty store.
   - Exception: with `--nogmp`, double coordinates resolve 10⁻ᵇ only while |x|·10ᵇ < 2⁵³.
+
+### u-decomp (T6): `run_union_decomp.py` + `union_decomp/d01–d21.smt2` (`4529f24`)
+**Did:**
+- Dumped the polytopes with `--dump-ine` and checked F(x) ⇔ ∃i: x ∈ P_i using its own QF_LRA
+  evaluator.
+- Points: uniform in a bounding box, inside each P_i, inside each DNF region, and just across every
+  facet. Interior mismatches were confirmed with cvc5.
+- Inputs: 21 formulas plus 5 syntheticLRA instances.
+
+**Found:**
+- **No unsound polytope anywhere** (no P_i ⊄ sol(F)).
+- **Overlap ratio** Σvol(P_i)/vol(Q) ranges from 1.0 to 1.48. That overlap is what the union loop
+  has to handle.
+- **Three completeness bugs, all pre-existing** (the start binary behaves the same):
+  1. **`distinct` / ≠:** a negated equality threw, and `parser.cpp:805-807` swallowed the
+     exception, so ttc printed **`s volume 0` with exit 0** (true volume 1).
+  2. **Tiny bodies dropped:** cddlib's absolute tolerances (about 1e-7) reported full-dimensional
+     polytopes of width about 1e-7 as flat, and they were dropped (volume 0).
+  3. **Real-valued `ite`** inside an arithmetic atom is unsupported.
+- The `.ine` dump has no variable names, and its column order is the DFS first-occurrence order.
+
+## U5a. Decomposition fixes (`33c8be4`)
+**Did:**
+- a ≠ b now adds no constraint (it removes only a hyperplane, which has measure zero).
+- `canonicalizePolytope` runs cdd in the certified Chebyshev frame x = c + r·y with unit-norm rows,
+  then maps back.
+- `parser.cpp` rethrows if both decomposition attempts fail, instead of returning an empty cover.
+
+**Found:**
+
+| Input | Exact | Before | After |
+|---|---|---|---|
+| d09 `distinct` | 1 | 0 | 1.037 |
+| d19 frame at 1e-7 scale | 1.2e-13 | 0 | 1.229e-13 |
+| d20 thin union | 1.5e-7 | 0 | 1.535e-7 |
+| d07 Real-valued `ite` | 2 | 0 (exit 0) | explicit error |
+
+- `run_union_decomp`: **19/21 pass**. d07 fails by design (explicit error); d14 (free Bools) is
+  report-only.
+- `run_smt2`: 67/67, and the equality inputs still give 0.
+- **Open, for the user:**
+  - lifting a Real-valued `ite` into Boolean structure;
+  - writing the variable names into the `.ine` header.
 
