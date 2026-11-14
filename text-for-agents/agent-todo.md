@@ -119,6 +119,36 @@ Guard against a non-finite transform or a centre outside P.
 - Small cubes (side 1e-3): −0.93 → −0.017.
 - Runtime drops from 11.5 s to 3.6 s.
 
+### altoracles (`tests/volesti/test_alt_oracles.cpp`, ~19 s; full sweep tagged `slow`, env ALT_*)
+**Did:** compared volesti's volume oracles, 10 seeds each, with and without
+max-inscribed-ellipsoid rounding (R+):
+- CG (cooling Gaussians) with the Ball walk (ttc) and with CDHR
+- CB (cooling balls) with the Billiard, Accelerated Billiard and CDHR walks
+- SOB (sequence of balls)
+
+**Found — mean relative error:**
+
+| Body | CG-Ball (ttc) | R+CG-Ball | R+CB-Bill |
+|---|---|---|---|
+| [0,2]×[0,1000] | −0.87 | +0.002 | +0.007 |
+| rot-box5-asp100 | −0.72 | +0.011 | +0.001 |
+
+- **Without rounding no oracle is reliable** on rotated or skinny bodies. CDHR only looks fine on
+  axis-aligned boxes; rotated, it gives −0.89.
+- AcceleratedBilliard without rounding **overshoots by up to 1e13**.
+- **Root cause:** every walk's step size scales with the inner radius r, not with the body size.
+  - Ball walk: 4r/√(max(1,a)n).
+  - Billiard walk: L = 2√n·r (`compute_diameter.hpp:39`).
+
+**Found — speed:**
+- After rounding, CB-Billiard is about 100–2000× faster than ttc's CG-Ball (cube20: 0.024 s vs
+  47 s) with sd about 0.05–0.07.
+- R+CG-CDHR: sd about 0.04, about 100× faster.
+
+**Found — bug:** volesti's own rounding throws in **d=2** (Spectra `nev` must be ≤ n−1) at
+`inscribed_ellipsoid_rounding.hpp:94` and `max_inscribed_ellipsoid.hpp:132`. Patched in an
+overlay: use the Eigen eigensolver when d < 3 or when Spectra fails.
+
 ## Step 4: Theory
 **Did:** read [CV-PVA] (§2–4.2), [CV-GC] (Algorithm figure, assumptions), and the MATLAB
 `Volume.m`, `ConvexBody.m` and `preprocess.m`. Wrote `ttc-volume-vs-theory.md`.
