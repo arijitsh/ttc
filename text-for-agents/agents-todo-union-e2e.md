@@ -24,7 +24,7 @@ Single-polytope volume and sampling work: `agent-todo.md`.
     edits)
   - [x] U5c. Volume-oracle seed derived from `--seed` and the polytope index (`92395cf`)
   - [x] U5d. Variable names in the `--dump-ine` header (`3fe72b1`)
-  - [ ] U5e. Lift a Real-valued `ite` inside arithmetic atoms
+  - [x] U5e. Lift a Real-valued `ite` inside arithmetic atoms (`23befd1`)
 - [~] U8. New requests: tiny-formula syntax fuzzing (agent u-fuzz), general speed-ups (agent
   u-perf, own git worktree)
 - [~] U9. Overnight campaign (≤ 10 jobs), started 23:42; read it in the morning with
@@ -198,4 +198,8 @@ Syntax-fuzz and union-e2e jobs are to be added when the u-fuzz and u-e2e agents 
 runners.
 
 **Morning:** `python3 tests/volesti/night_summary.py --root <night dir>`.
+- **U5e** (`23befd1`): after simplification, A[ite(c, a, b)] → (c ∧ A[a]) ∨ (¬c ∧ A[b]), recursively.
+  - d07: error → 1.990 (exact 2).
+  - `run_union_decomp`: **21/21**; e2e 67/67.
+  - This is not in the frozen night binary (`3fe72b1`).
 
