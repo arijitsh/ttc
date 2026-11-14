@@ -804,7 +804,11 @@ void TTCParser::computePolytopes()
         }
         catch (const std::exception&)
         {
+            // Do not silently report an empty decomposition (that printed
+            // "s volume 0" with exit 0 for formulas ttc cannot decompose,
+            // e.g. a Real-valued ite inside an arithmetic atom).
             d_polytopes.clear();
+            throw;
         }
     }
 }

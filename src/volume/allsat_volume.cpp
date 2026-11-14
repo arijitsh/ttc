@@ -657,8 +657,9 @@ bool appendComparisonConstraints(const cvc5::Term& atom,
         kind = cvc5::Kind::LT;
         break;
       case cvc5::Kind::EQUAL:
-        throw std::runtime_error(
-            "negated equality is not supported during polytope simplification");
+        // a != b removes only the hyperplane a = b: measure zero, so the
+        // literal adds no constraint to the (closed) polytope.
+        return true;
       default:
         break;
     }

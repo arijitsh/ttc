@@ -354,7 +354,8 @@ bool appendComparisonConstraints(const cvc5::Term& atom,
         kind = cvc5::Kind::LT;
         break;
       case cvc5::Kind::EQUAL:
-        throw std::runtime_error("negated equality is not supported for LRA volume computation");
+        // a != b excludes a hyperplane only (measure zero): no constraint.
+        return true;
       default:
         break;
     }
@@ -482,6 +483,8 @@ PolytopeMatrices buildPolytopeMatrices(const Polytope& poly,
   return matrices;
 }
 
+bool canonicalizePolytopeRaw(Eigen::MatrixXd& A, Eigen::VectorXd& b);
+
 // Canonicalizes the polytope {x : A x <= b} with cddlib, mirroring the Python
 // prototype (src/polytope_operations.py::canonicalize -> cdd.matrix_canonicalize).
 // Redundant inequalities are removed in place.  Returns false when the polytope
@@ -490,6 +493,55 @@ PolytopeMatrices buildPolytopeMatrices(const Polytope& poly,
 // returns -1 / skips the polytope.  On any cddlib error the matrices are left
 // unchanged and true is returned (fall back to the raw representation).
 bool canonicalizePolytope(Eigen::MatrixXd& A, Eigen::VectorXd& b)
+{
+  const long m = A.rows();
+  const long n = A.cols();
+  if (m == 0)
+  {
+    return true;
+  }
+
+  // cddlib (double) decides redundancy and implicit equalities with absolute
+  // tolerances (~1e-7), so a full-dimensional polytope of width ~1e-7 was
+  // reported as flat and dropped.  Canonicalize in the frame x = c + r y of
+  // the certified Chebyshev ball (inner radius 1, unit-norm rows) and map
+  // back; the verdicts are then independent of the formula's units.
+  const InnerBall frame = certifiedInnerBall(A, b);
+  if (!(frame.radius > 0.0) || !std::isfinite(frame.radius))
+  {
+    return frame.radius > 0.0;  // flat or empty: zero volume; unbounded: keep raw
+  }
+  Eigen::MatrixXd Ay = A * frame.radius;
+  Eigen::VectorXd by = b - A * frame.center;
+  for (long i = 0; i < m; ++i)
+  {
+    const double nrm = Ay.row(i).norm();
+    if (nrm > 0.0)
+    {
+      Ay.row(i) /= nrm;
+      by(i) /= nrm;
+    }
+  }
+  Eigen::MatrixXd Aorig = A;
+  Eigen::VectorXd borig = b;
+  A = Ay;
+  b = by;
+  const bool keepY = canonicalizePolytopeRaw(A, b);
+  if (!keepY)
+  {
+    A = std::move(Aorig);
+    b = std::move(borig);
+    return false;
+  }
+  // alpha . y <= beta  with  y = (x - c)/r   <=>   (alpha/r) . x <= beta + (alpha/r) . c
+  Eigen::MatrixXd Ax = A / frame.radius;
+  Eigen::VectorXd bx = b + Ax * frame.center;
+  A = std::move(Ax);
+  b = std::move(bx);
+  return true;
+}
+
+bool canonicalizePolytopeRaw(Eigen::MatrixXd& A, Eigen::VectorXd& b)
 {
   const long m = A.rows();
   const long n = A.cols();
