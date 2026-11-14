@@ -12,7 +12,7 @@
 - [x] 9. Extra fixes chosen by the user: annealing step cap, batch-means stopping, `cg-cdhr` default (`233b9c2`, step 9)
 - [x] 10. Move our layer from headers to `.cpp` (`polytope_volume.{hpp,cpp}`, `polytope_sampler.{hpp,cpp}`); bit-identical (step 10, committed below)
 - [ ] 11. Benchmark: 10 random syntheticLRA instances, now vs start (`update` @ `75e05e0`): time + volume (in progress, step 11)
-- [ ] 12. **Sampling phase**: test ttc's single-polytope sampler for uniformity, the same way as volume (step 12)
+- [ ] 12. **Sampling phase**: test ttc's single-polytope sampler for uniformity, the same way as volume (step 12; reproducer `e8a8b0a`, 8 agents running)
 - [x] 13. Commit after every step (steps 9, 10 committed after the user pointed out the lapse)
 
 ---
@@ -335,4 +335,27 @@ cwd/exe in the repo or scratchpad. Told all agents to run one process at a time.
     GCC, Unix Makefiles) and copied its binary to `build/ttc`.
   - **`build/` itself still needs a reconfigure**:
     `CMAKE_GENERATOR="Unix Makefiles" ./configure.sh --skip-deps --ddnnf` after `rm -rf build`.
+
+## Step 11: Benchmark, now vs start (in progress)
+**Did:**
+- Built the start commit (`update` @ `75e05e0`) in a git worktree with the identical static GCC
+  configuration (`scratchpad/ttc-start/build-gcc/ttc`).
+- `scratchpad/bench/bench.py` draws 10 random syntheticLRA1131 instances (seed 20261114) and runs
+  both binaries concurrently on each one (default options, nice 19, 900 s timeout).
+
+**Found:** pending.
+
+## Step 12: Sampling phase
+**Did:**
+- Added `ttcProposals` and `ttcLatticeSamples` to `tests/volesti/common.hpp`. They are exactly
+  ttc's sampler (`sampleRestartWalk`, and `sampleLattice` over it).
+- Added `test_sampling_smoke.cpp` (`e8a8b0a`).
+
+**Found:**
+- **Unit square:** billiard proposals are uniform (0.500 / 0.500 per half).
+- **Long box [0,2]×[0,1000]: 100% of the samples land in y ∈ [900,1000]** (uniform: 10%).
+  - Every sample restarts at the certified Chebyshev centre (1,999), and the billiard trajectory
+    length is 2√n·r ≈ 2.8.
+  - Like the oracle, the sampler runs on the *unrounded* body.
+- Launched 8 sampling agents: boxes, skinny, shapes, lattice, mixing, gmp, walks, theory.
 
