@@ -10,10 +10,25 @@
 - [x] 7. Fix: scale normalisation (`6494cf2`), rounding + `--vol-oracle` (`882cf3f`), volesti rounding bugs
 - [x] 8. Validate the fix: e2e 67/67; unit suite updated to ttc's pipeline (`6857cad`); syntheticLRA dim10 spot check
 - [x] 9. Extra fixes chosen by the user: annealing step cap, batch-means stopping, `cg-cdhr` default (`233b9c2`, step 9)
-- [x] 10. Move our layer from headers to `.cpp` (`polytope_volume.{hpp,cpp}`, `polytope_sampler.{hpp,cpp}`); bit-identical (step 10, committed below)
+- [x] 10. Move our layer from headers to `.cpp` (`polytope_volume.{hpp,cpp}`, `polytope_sampler.{hpp,cpp}`); bit-identical (`d70d13b`, step 10)
 - [x] 11. Benchmark: 10 random syntheticLRA instances, now vs start (`update` @ `75e05e0`): **now is about 2× faster**, 3 more solved (step 11)
 - [ ] 12. **Sampling phase**: test ttc's single-polytope sampler for uniformity, the same way as volume (step 12; reproducer `e8a8b0a`; 5 agents running, 3 on hold)
+  - [x] 12a. Harness helpers (`ttcProposals`, `ttcLatticeSamples`) + long-box reproducer (`e8a8b0a`)
+  - [ ] 12b. Agent tests: skinny, lattice, mixing, shapes (+boxes), theory running; boxes, walks, gmp on hold
+  - [ ] 12c. Read the sampling theory → `text-for-agents/ttc-sampling-vs-theory.md`
+  - [ ] 12d. Fix the sampler (likely: round first and map back; walk-length rule), with `--no-round` parity
+  - [ ] 12e. Validate: sampling tests, e2e 67/67, bit-identical when sampling-fix is off, benchmark rerun
 - [x] 13. Commit after every step (steps 9, 10 committed after the user pointed out the lapse)
+- [ ] 14. Follow-ups:
+  - [ ] 14a. `build/` is in a mixed state (Ninja/clang cache, stale GCC Makefiles). You need to
+    run `rm -rf build && CMAKE_GENERATOR="Unix Makefiles" ./configure.sh --skip-deps --ddnnf`;
+    meanwhile `build-gcc/` is the working build.
+  - [ ] 14b. `--vol-oracle cg-ball` got much slower after the step cap + batch-means
+    (`test_rounding` > 900 s): reduce its test sizes, or note the cost in the help text.
+  - [ ] 14c. Remove the baseline worktree (`scratchpad/ttc-start`, `git worktree remove`) when
+    benchmarking is done.
+  - [ ] 14d. Save the durable facts to memory: build-dir state, rounding fix, the new
+    `polytope_*` files.
 
 ---
 
