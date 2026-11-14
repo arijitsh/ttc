@@ -149,6 +149,43 @@ max-inscribed-ellipsoid rounding (R+):
 `inscribed_ellipsoid_rounding.hpp:94` and `max_inscribed_ellipsoid.hpp:132`. Patched in an
 overlay: use the Eigen eigensolver when d < 3 or when Spectra fails.
 
+### invariance (`tests/volesti/test_invariance.cpp`, ~43 s; full size grid tagged `slow`)
+**Did:**
+- Scale s ∈ {1e-6..1e6}, translation |t| up to 1e9, rotations.
+- Inner balls ×0.1..×10 and off-centre.
+- Each oracle call runs in a forked child with a CPU cap, so hangs count as timeouts.
+
+**Found:**
+- **62 of 94 grid cells fail:**
+  - s=1e-6: timeout
+  - s=1e-3: −0.82 to −1
+  - s=1e6: `inf`
+- Translation and rotation are fine when the oracle gets an exact ball.
+- An inner radius ×0.1 gives −0.947 on simplex5.
+
+**Causes:**
+- (1) The `get_first_gaussian` bisection is absolute: it starts at `upper=1` with `tol=1e-7`.
+  - small bodies: it never terminates
+  - large bodies: a₀ gets stuck near 1e-7
+- (2) The step 4r/√(max(1,a)n) is not unit-consistent.
+  - small s: the step shrinks like s²
+  - large s: every proposal is rejected, `a_vals[0]=0`, and the result is `(π/0)^{n/2}=inf`
+- volesti's `ComputeInnerBall` also has absolute tolerances. ttc's `reliableInnerBall` already
+  guards against them.
+
+**Validated patch:** rescale to unit inner radius inside `volume_cooling_gaussians`, then multiply
+by rⁿ. Every scale then gives identical results, and only elongation failures remain (26/94).
+
+### theory (notes: `scratchpad/theory/notes.md`)
+**Found:**
+- Reproduced 7.78395 bit-exactly.
+- Volesti stops cooling at a=7.4e-3 instead of the a ≲ 1/(2R²) = 2e-6 the theory needs. The last
+  ratio's true value is 48.6, the estimate is 3.01, and the true Var/E² is about 10^800.
+- volesti's own `rounding_test.cpp` rounds skinny bodies first, and none of its volume routines
+  rounds internally.
+- `inscribed_ellipsoid_rounding` is a port of the MATLAB `preprocess.m`.
+- Max-ellipsoid or SVD rounding + ttc's oracle gives errors within ±4% for n up to 30.
+
 ## Step 4: Theory
 **Did:** read [CV-PVA] (§2–4.2), [CV-GC] (Algorithm figure, assumptions), and the MATLAB
 `Volume.m`, `ConvexBody.m` and `preprocess.m`. Wrote `ttc-volume-vs-theory.md`.
