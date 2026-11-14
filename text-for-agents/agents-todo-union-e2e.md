@@ -9,7 +9,7 @@ Single-polytope volume and sampling work: `agent-todo.md`.
 - [x] U2. Bit-identical refactor: union loop + store + Thresh/GetPrecision →
   `src/volume/union_estimator.{hpp,cpp}`, result structs → `volume_result.hpp` (`200276c`)
 - [x] U3. Test harness links `union_estimator.o` + GMP (`tests/volesti/Makefile`)
-- [ ] U4. Fan out 5 agents (CPU cap: 12 cores, nice 19, ≤ 2 processes each):
+- [~] U4. Fan out 5 agents (CPU cap: 12 cores, nice 19, ≤ 2 processes each) — all 5 launched:
   - [ ] u-core: T1 estimator with exact components + T5 store mechanics → `test_union_core.cpp`
   - [ ] u-robust: T2 error injection (volume ±ε′, sampler TV η) → `test_union_robust.cpp`
   - [ ] u-params: T3 lattice count vs volume + T4 Thresh/ε′/δ′/clipping →
@@ -54,3 +54,8 @@ code against both algorithms.
 ## U3. Test harness
 **Did:** `tests/volesti/Makefile` now compiles `union_estimator.o`, adds `-I src/ddnnf` for
 `logger.hpp`, and links `-lgmpxx -lgmp`. `test_smoke` still passes.
+
+## U4. Agents
+**Did:** launched u-core (T1+T5), u-robust (T2), u-params (T3+T4), u-decomp (T6) and u-e2e (T7).
+Each owns its own test files, makes no edits under `src/`, makes no commits, and runs at most 2
+niced processes.
