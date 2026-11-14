@@ -29,13 +29,25 @@ enum class SamplerWalk
 
 
 // Default number of walk steps per sample (each sample restarts at the centre
-// of the rounded body): 10 + dim^2, but at least 30 for the ball walk, whose
-// step 4r/sqrt(n) is too short in low dimension (2-D cube needs ~28 steps;
-// tests/volesti/test_sampling_mixing.cpp).
+// of the rounded body), from the uniformity tests in tests/volesti/:
+//   billiard / accelerated billiard: 10 + dim^2 (passes from 1-2 steps once
+//     the body is rounded; test_sampling_mixing.cpp);
+//   ball walk: at least 100 -- its step 4r/sqrt(n) overshoots a rounded
+//     low-dimensional body, most proposals are rejected and a short restart
+//     can stay at the centre (atom; test_sampling_lattice.cpp failed at 30);
+//   hit-and-run (RDHR, CDHR): 8 (10 + dim^2) -- rounded simplices' and
+//     cross-polytopes' sharp vertices are under/over-covered at 4x
+//     (test_sampling_shapes.cpp).
 inline unsigned defaultSampleWalkLength(SamplerWalk walk, std::size_t dimension)
 {
   const unsigned base = static_cast<unsigned>(10 + dimension * dimension);
-  return walk == SamplerWalk::Ball ? std::max(base, 30u) : base;
+  switch (walk)
+  {
+    case SamplerWalk::Ball: return std::max(base, 100u);
+    case SamplerWalk::RDHR:
+    case SamplerWalk::CDHR: return 8 * base;
+    default: return base;
+  }
 }
 
 }  // namespace ttc

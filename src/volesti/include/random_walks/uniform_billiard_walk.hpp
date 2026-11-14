@@ -95,7 +95,7 @@ struct Walk
     {
         unsigned int n = P.dimension();
         NT T = rng.sample_urdist() * _Len;
-        const NT dl = 0.995;
+        const NT dl = 0.999999;  // ttc: was 0.995, which skipped a layer at every facet (sample bias toward the centre)
 
         for (auto j=0u; j<walk_length; ++j)
         {
@@ -146,7 +146,7 @@ private :
                            RandomNumberGenerator &rng)
     {
         unsigned int n = P.dimension();
-        const NT dl = 0.995;
+        const NT dl = 0.999999;  // ttc: was 0.995, which skipped a layer at every facet (sample bias toward the centre)
         _lambdas.setZero(P.num_of_hyperplanes());
         _Av.setZero(P.num_of_hyperplanes());
         _p = p;

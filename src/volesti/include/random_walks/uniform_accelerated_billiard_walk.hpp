@@ -117,7 +117,7 @@ struct AcceleratedBilliardWalk
         {
             unsigned int n = P.dimension();
             NT T;
-            const NT dl = 0.995;
+            const NT dl = 0.999999;  // ttc: was 0.995, which skipped a layer at every facet (sample bias toward the centre)
             int it;
             typename Point::Coeff b;
             NT* b_data;
@@ -289,7 +289,7 @@ struct AcceleratedBilliardWalk
                                RandomNumberGenerator &rng)
         {
             unsigned int n = P.dimension();
-            const NT dl = 0.995;
+            const NT dl = 0.999999;  // ttc: was 0.995, which skipped a layer at every facet (sample bias toward the centre)
             _lambdas.setZero(P.num_of_hyperplanes());
             _Av.setZero(P.num_of_hyperplanes());
             _p = p;

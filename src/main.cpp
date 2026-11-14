@@ -1263,7 +1263,7 @@ int main(int argc, char *argv[]) {
        "the volume oracle. Unrounded skinny polytopes are badly underestimated")
       ("walklen-samp", po::value<int>(),
        "Random-walk length for volesti point sampling; default 10 + dim^2 "
-       "(at least 30 for the ball walk)")
+       "(at least 100 for the ball walk, 8 (10 + dim^2) for rdhr/cdhr)")
       ("sampler", po::value<std::string>(),
        "Random walk used to sample uniform points from each polytope: "
        "'billiard' (default), 'accel-billiard', 'ball', 'rdhr' "
@@ -2619,7 +2619,10 @@ int main(int argc, char *argv[]) {
                   << walkLength(volumeOptions.sampleWalkLength,
                                 setup.sampleWalkLength,
                                 volumeOptions.samplerWalk == ttc::SamplerWalk::Ball
-                                    ? "max(30, 10 + dim^2)"
+                                    ? "max(100, 10 + dim^2)"
+                                : volumeOptions.samplerWalk == ttc::SamplerWalk::RDHR
+                                        || volumeOptions.samplerWalk == ttc::SamplerWalk::CDHR
+                                    ? "8 (10 + dim^2)"
                                     : "10 + dim^2")
                   << std::endl;
         std::cout << "c lattice precision (b): " << setup.latticePrecision
