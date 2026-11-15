@@ -363,9 +363,13 @@ public:
                 //std::cout<<"div0"<<std::endl;
                 ;
             } else {
+                // ttc: bound by the sign of the denominator, clamping the
+                // slack at 0.  The old test on the sign of lamda ignored a
+                // facet the point lies on (slack 0 -> lamda 0), so the chord
+                // could become unbounded and the walk left the polytope.
                 lamda = *sum_nom_data / *sum_denom_data;
-                if (lamda < min_plus && lamda > 0) min_plus = lamda;
-                if (lamda > max_minus && lamda < 0) max_minus = lamda;
+                if (*sum_denom_data > NT(0)) min_plus = std::min(min_plus, std::max(lamda, NT(0)));
+                else max_minus = std::max(max_minus, std::min(lamda, NT(0)));
             }
 
             sum_nom_data++;
@@ -698,10 +702,11 @@ public:
                 //std::cout<<"div0"<<sum_denom<<std::endl;
                 ;
             } else {
+                // ttc: sign of the denominator, slack clamped at 0 (see
+                // line_intersect): a facet through the point bounds the chord.
                 lamda = *lamda_data * (1 / *sum_denom_data);
-                if (lamda < min_plus && lamda > 0) min_plus = lamda;
-                if (lamda > max_minus && lamda < 0) max_minus = lamda;
-
+                if (*sum_denom_data > NT(0)) min_plus = std::min(min_plus, std::max(lamda, NT(0)));
+                else max_minus = std::max(max_minus, std::min(lamda, NT(0)));
             }
             lamda_data++;
             sum_denom_data++;
@@ -734,10 +739,11 @@ public:
                 //std::cout<<"div0"<<std::endl;
                 ;
             } else {
+                // ttc: sign of the denominator, slack clamped at 0 (see
+                // line_intersect): a facet through the point bounds the chord.
                 lamda = *data / a;
-                if (lamda < min_plus && lamda > 0) min_plus = lamda;
-                if (lamda > max_minus && lamda < 0) max_minus = lamda;
-
+                if (a > NT(0)) min_plus = std::min(min_plus, std::max(lamda, NT(0)));
+                else max_minus = std::max(max_minus, std::min(lamda, NT(0)));
             }
             data++;
         }

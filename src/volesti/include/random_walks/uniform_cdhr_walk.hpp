@@ -56,11 +56,12 @@ struct Walk
             auto rand_coord_prev = _rand_coord;
             _rand_coord = rng.sample_uidist();
             NT kapa = rng.sample_urdist();
-            std::pair<NT, NT> bpair = P.line_intersect_coord(_p,
-                                                             _p_prev,
-                                                             _rand_coord,
-                                                             rand_coord_prev,
-                                                             _lamdas);
+            // ttc: recompute the slacks b - A p from scratch every 256 steps
+            // (the incremental update drifts over long chains).
+            std::pair<NT, NT> bpair = (++_steps % 256 == 0)
+                    ? P.line_intersect_coord(_p, _rand_coord, _lamdas)
+                    : P.line_intersect_coord(_p, _p_prev, _rand_coord,
+                                             rand_coord_prev, _lamdas);
             _p_prev = _p;
             _p.set_coord(_rand_coord, _p[_rand_coord] + bpair.first + kapa
                          * (bpair.second - bpair.first));
@@ -86,6 +87,7 @@ private :
     }
 
     unsigned int _rand_coord;
+    unsigned long _steps = 0;
     Point _p;
     Point _p_prev;
     typename Point::Coeff _lamdas;

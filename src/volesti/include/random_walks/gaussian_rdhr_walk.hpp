@@ -30,20 +30,21 @@ void chord_random_point_generator_exp(Point &lower,
     NT r, r_val, fn;
     Point bef = upper - lower;
     // pick from 1-dimensional gaussian if enough weight is inside polytope P
-    if (a_i > EXP_CHORD_TOLERENCE && std::sqrt(bef.squared_length()) >= (2.0 / std::sqrt(2.0 * a_i)))
+    if (a_i > EXP_CHORD_TOLERENCE && bef.squared_length() > NT(0))
     {
+        // Exact truncated normal for every chord (ttc): the rectangle branch's
+        // bound underflows to 0 on far-tail chords and then never accepts.
         Point a = -1.0 * lower;
         Point b = (1.0 / std::sqrt(bef.squared_length())) * bef;
         Point z = (a.dot(b) * b) + lower;
-        NT low_bd = (lower[0] - z[0]) / b[0];
-        NT up_bd = (upper[0] - z[0]) / b[0];
-        while (true) {
-            r = rng.sample_ndist();//rdist(rng2);
-            r = r / std::sqrt(2.0 * a_i);
-            if (r >= low_bd && r <= up_bd) {
-                break;
-            }
-        }
+        // Signed positions of the chord ends along the unit direction b from
+        // z (was (lower[0]-z[0])/b[0]: undefined when b[0] ~ 0), then an exact
+        // truncated normal (the old rejection loop hung on far-tail chords).
+        NT low_bd = (lower - z).dot(b);
+        NT up_bd = (upper - z).dot(b);
+        if (low_bd > up_bd) std::swap(low_bd, up_bd);
+        const NT sd = NT(1) / std::sqrt(2.0 * a_i);
+        r = sd * sample_truncated_std_normal(low_bd / sd, up_bd / sd, rng);
         p = (r * b) + z;
 
     // select using rejection sampling from a bounding rectangle
