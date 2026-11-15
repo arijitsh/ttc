@@ -29,7 +29,8 @@ Single-polytope volume and sampling work: `agent-todo.md`.
   u-perf, own git worktree)
 - [x] U9. Overnight campaign (≤ 10 jobs), 23:42–04:37, all 126 jobs ran; read it with
   `python3 tests/volesti/night_summary.py --root <night dir>`
-- [ ] U10. Morning campaign `night2` (06:48–10:00, binary `31d7eff`): see U10 below
+- [x] U10. Morning campaign `night2` (06:48–08:50, binary `31d7eff`; stopped early at the user's request): results below
+- [ ] U11. Fix the syntax-fuzz findings (define-fun, parse-error abort) — awaiting go-ahead
 - [ ] U6. Validate (all suites, e2e single + union, benchmark), report in
   `ttc-union-vs-theory.md`
 - [ ] U7. Commit after every step
@@ -285,4 +286,79 @@ the code. Three causes, all fixed:
 
 **Read with:** `night_summary.py --root <night2>` for the bu part; `night2/fuzz_*.json`,
 `night2/union_e2e_100*.json`, `night2/bench/results_*.csv`; and the logs in `night2/results/`.
+
+## U10 results: night2 (stopped 08:50 at the user's request)
+
+### Before vs now on syntheticLRA
+Before = `update` @ `75e05e0`, now = `31d7eff`. 10 random instances (seed 20261115), both
+binaries run side by side, 900 s timeout:
+
+| Instance | Before (s) | Now (s) | Now/before | Volume now/before |
+|---|---|---|---|---|
+| dim11_numpol21 | 255.4 | 143.0 | 0.56 | 1.011 |
+| dim3_numpol3 | 2.7 | 2.9 | 1.08 | 0.983 |
+| dim14_numpol8 | 247.1 | 157.4 | 0.64 | 1.000 |
+| dim12_numpol25 | 352.0 | 175.4 | 0.50 | 0.973 |
+| dim18_numpol27 | timeout | 628.0 | <0.70 | — |
+| dim19_numpol21 | timeout | 660.0 | <0.73 | — |
+| dim20_numpol12 | timeout | 396.8 | <0.44 | — |
+| dim25_numpol41, dim28_numpol28, dim33_numpol40 | timeout | timeout | — | — |
+
+- **There is no slowdown against the `update` branch; ttc is faster.**
+  - Real instances: now/before = 0.50–0.64.
+  - The geometric mean over the 4 instances both finished is 0.66 (median 0.60).
+  - The trivial dim-3 instance is 8% slower, from fixed overhead: rounding plus the extra LPs.
+- **Solved within 900 s:** 7/10 now vs 4/10 before.
+- **Total wall time:** 6258 s → 4864 s, counting each timeout as 900 s.
+- **Volumes** agree within −2.7% to +1.1% where both finished.
+- **The 5–15× gap against the archived times** (night 1) comes from the archive being cluster runs
+  on an unloaded machine. The `update` branch is just as slow here side by side.
+
+### Exact-volume Boolean unions, `--nogmp` / `--fullgmp` (night-1 rerun, 900 runs)
+
+| Mode | Runs | OK | Accuracy failures | Mean err | sd | Worst \|err\| | Median time | Timeouts |
+|---|---|---|---|---|---|---|---|---|
+| `--nogmp` | 450 | 450 | 0 | +0.69% | 1.4% | 5.3% | 1.6 s | 0 |
+| `--fullgmp` | 450 | 438 | 0 | +0.37% | 1.3% | 4.1% | 23.5 s | 12 (240 s) |
+
+Together with night 1, **3600 exact-union runs in every mode, with 0 accuracy failures.**
+`--fullgmp` is about 15× slower.
+
+### Union e2e at 100 seeds (cut short when stopped)
+- ε=0.8: 29/38 formulas done, all PASS with 0 failing runs (e.g. skinny_rot2_2d 0/30 fails,
+  mean +0.59%).
+- ε=0.3/δ=0.1: 4 done, all PASS.
+
+### Syntax fuzz: 3000 tiny random satisfiable QF_LRA formulas (`run_fuzz_lra.py`, 4 × 750)
+**Totals:** OK 2187 (73%), UNSUPPORTED 556, WRONG 150, CRASH 89, TIMEOUT 18.
+
+**Without the three culprits** below, **1992/2007 are OK and 15 time out, with 0 WRONG/CRASH/
+UNSUPPORTED.**
+- Every other feature is fine: let (parallel, shadowing), Bool and Real ite, xor, =>, distinct
+  (n-ary), = n-ary and negated, comparison chains, `:named`, push/pop (even unclosed),
+  `get-model`/`get-value`, quoted and special symbols, rationals and decimals, unary/n-ary −,
+  constant atoms, duplicate asserts.
+
+**Failure classes, with root causes** (the fuzz agent's analysis is in `fuzz_lra/suggested_fixes.diff`):
+1. **`define-fun`: any use, even unused.** This accounts for all 150 WRONG, 556 UNSUPPORTED and
+   28+11 CRASH results.
+   - Cause: cvc5 stores each `define-fun` as an *assertion* `(= f body)` (or a lambda), with f a
+     fresh constant (`SolverEngine::defineFunction`). ttc conjoins `getAssertions()` into the
+     formula (`parser.cpp` ~505) and `collect` registers f, and the lambda's bound parameters, as
+     counting variables.
+   - 0-ary Real → an extra dimension pinned by `=` → **`s volume 0`** (150/200 cases).
+   - 0-ary Bool → a Bool variable → routed to the PACT engine → "logic doesn't include
+     THEORY_BV", or `s mc 1` when there is no `set-logic`.
+   - With arguments → "unsupported literal", or THEORY_UF.
+   - **Fix:** take the definitions out of the assertions, substitute them to a fixpoint
+     (`simplify` beta-reduces the lambdas), and count only free `CONSTANT`s.
+2. **Parse errors abort:** rc −6, "terminate called". `parser.parseFormula` (`main.cpp` ~1868) is
+   outside any try block. It is triggered by `to_real` under `(set-logic QF_LRA)` (63 cases;
+   cvc5 rejects it, since `to_real` belongs to Reals_Ints and not QF_LRA), and by Int-vs-Real
+   argument mismatches when there is no `set-logic` (numerals are Int in logic ALL).
+   - **Fix:** catch, and print `Error: parse error: ...`.
+   - **Optional, user decision:** be lenient, i.e. treat a missing `set-logic` as QF_LRA, or allow
+     `to_real` by switching to QF_LIRA.
+3. **TIMEOUT** (18, at the fuzzer's 20 s limit): heavy Boolean/ite structure gives 12–78
+   overlapping polytopes. This is performance, not correctness.
 
