@@ -18,7 +18,7 @@
 // vol = get<2>(res) * volume(P_rounded).)
 //
 // roundedVolume(Body, method) = round, recompute the inner ball of the rounded
-// body, then run the oracle exactly as ttc does (ttcOracle).
+// body, then run ttc's default oracle (ttcDefaultOracle, cg-cdhr).
 //
 // Tolerance: ttc's oracle target is epsilon/12 = 0.0667; assertions use
 // 3 x 0.0667 = 0.2 relative error.
@@ -37,6 +37,17 @@
 #include "preprocess/svd_rounding.hpp"
 
 using namespace vt;
+
+// ttc's default per-polytope oracle (--vol-oracle cg-cdhr): Gaussian cooling
+// with coordinate hit-and-run, walk length 10 + n/10, deterministic stream.
+// (common.hpp's ttcOracle is the Gaussian-ball-walk call, which after the safe
+// annealing step is too slow for this suite's many oracle runs.)
+static double ttcDefaultOracle(HPoly P, double epsilon = 0.8)
+{
+  const int n = static_cast<int>(P.dimension());
+  return volume_cooling_gaussians<GaussianCDHRWalk, TtcVolumeRNG>(
+      P, epsilon / 12.0, ttc::defaultOracleWalkLength(ttc::VolumeOracle::CoolingGaussiansCdhr, n));
+}
 
 namespace
 {
@@ -240,7 +251,7 @@ VolRun roundedVolume(const Body& B, RM m = RM::MaxEll, int maxIter = 20)
     return V;
   }
   const double t0 = now();
-  V.vol = R.roundVal * ttcOracle(R.P);
+  V.vol = R.roundVal * ttcDefaultOracle(R.P);
   V.oracleSecs = now() - t0;
   V.ok = std::isfinite(V.vol) && V.vol > 0;
   return V;
@@ -395,12 +406,20 @@ TEST_CASE("rounding: long simplices (stretched 1e3, rotated)")
 TEST_CASE("rounding: near-degenerate slab [0,1e-4]x[0,1]^4")
 {
   Body B = slab();
-  VolRun raw = roundedVolume(B, RM::None);
   VolRun V = roundedVolume(B, kRec);
-  report(B, RM::None, raw);
   report(B, kRec, V);
   CHECK(V.ok);
   CHECK(std::abs(V.rel(B)) < kTol);
+}
+
+// The unrounded comparison is informational only, and with the safe
+// annealing step the raw CG-ball oracle on this aspect-1e4 slab takes far
+// longer than the default suite's budget (killed after 1500 s).
+TEST_CASE("rounding: near-degenerate slab, unrounded comparison" * doctest::test_suite("slow"))
+{
+  Body B = slab();
+  VolRun raw = roundedVolume(B, RM::None);
+  report(B, RM::None, raw);
 }
 
 TEST_CASE("rounding: does not hurt well-rounded cubes n=2..10")
