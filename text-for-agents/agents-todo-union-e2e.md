@@ -16,7 +16,7 @@ Single-polytope volume and sampling work: `agent-todo.md`.
     `test_union_lattice.cpp`, `test_union_params.cpp`
   - [x] u-decomp: T6 decomposition soundness/completeness via `--dump-ine` →
     `tests/volesti/union_decomp/`, `run_union_decomp.py`
-  - [ ] u-e2e: T7 SMT formulas with exactly known union volumes, 20 seeds, all modes, current vs
+  - [x] u-e2e: T7 SMT formulas with exactly known union volumes, 20 seeds, all modes, current vs
     start binary → `tests/volesti/union_smt2/`, `run_union_e2e.py`
 - [~] U5. Consolidate the diagnosis; fix what is wrong. Changes the user approved on 2026-11-14:
   - [x] U5b. GetPrecision 4r/η → 8r/η in code (`01ac059`) and in the paper (kr25-ssm algo/analysis/
@@ -27,8 +27,9 @@ Single-polytope volume and sampling work: `agent-todo.md`.
   - [x] U5e. Lift a Real-valued `ite` inside arithmetic atoms (`23befd1`)
 - [~] U8. New requests: tiny-formula syntax fuzzing (agent u-fuzz), general speed-ups (agent
   u-perf, own git worktree)
-- [~] U9. Overnight campaign (≤ 10 jobs), started 23:42; read it in the morning with
+- [x] U9. Overnight campaign (≤ 10 jobs), 23:42–04:37, all 126 jobs ran; read it with
   `python3 tests/volesti/night_summary.py --root <night dir>`
+- [ ] U10. Morning campaign `night2` (06:48–10:00, binary `31d7eff`): see U10 below
 - [ ] U6. Validate (all suites, e2e single + union, benchmark), report in
   `ttc-union-vs-theory.md`
 - [ ] U7. Commit after every step
@@ -202,4 +203,86 @@ runners.
   - d07: error → 1.990 (exact 2).
   - `run_union_decomp`: **21/21**; e2e 67/67.
   - This is not in the frozen night binary (`3fe72b1`).
+
+### u-e2e (T7): `union_smt2/` (38 formulas in 8 families, `gen_union.py`) + `run_union_e2e.py` (`904309e`)
+**Did:** wrote 38 union formulas with exact rational volumes, each Monte-Carlo cross-checked.
+Ran 20 seeds per formula, in every mode, with the start binary and the current one.
+
+**Found:**
+- **Start binary (`75e05e0`): 30/38.** Skinny unions 0/6 (ratio down to 0.068); scale family 1/3.
+  At ε=0.3/δ=0.1, 7 formulas fail on 20/20 seeds, plainly violating the 1−δ guarantee.
+- **Current binary: 38/38, 0 failing runs out of 760**, at both ε=0.8 and ε=0.3/δ=0.1. Also
+  38/38 with `--nogmp` and `--sampler cdhr`.
+  - `--fullgmp` times out on 3 formulas (6–8D). That is a performance problem, not a correctness
+    one.
+- **The residual bias equals the single-box oracle bias** (C4, within ε/12); unions add no
+  detectable bias. Disjoint and nested unions give bit-identical estimates for every sampler.
+
+### Agents stopped by the 5-hour usage limit at about 01:00 (work saved; resume them)
+- u-core (T1+T5).
+- u-fuzz: its runner and generator exist (`tests/volesti/run_fuzz_lra.py`, `fuzz_lra/`); the final
+  report is missing.
+- u-perf: worktree `.claude/worktrees/agent-ae67b8a6f44b0d65f`, branch
+  `worktree-agent-ae67b8a6f44b0d65f`. It was writing a double pre-filter for
+  `SampleStore::removeInside`.
+
+## U9 results: overnight campaign (night 1, binary `3fe72b1`)
+- **Exact-volume Boolean unions: 2700 runs, 0 accuracy failures.**
+  - Every variant/dimension has |mean err| < 0.8% and sd ≤ 1.6%.
+  - Worst |err| is 6.5%, against ε=0.8. At ε=0.3 the worst is 2.3%.
+  - Some runs hit the 240 s timeout, mostly in 6D.
+  - The 12 `--nogmp`/`--fullgmp` batches **did not run**: `--extra-args '--nogmp'` was read as a
+    flag (my bug). Rerun in night2.
+- **syntheticLRA (60 random):**
+  - Volumes agree with the archived `ttc_correct` within −11% to +14%. The archive is not ground
+    truth.
+  - Wall times are 5–15× the archived times, and 22 instances (mostly dim ≥ 25) timed out at
+    1500 s.
+  - The archive comes from a cluster, and night 1 ran 10 jobs on 12 cores, so this needs a
+    side-by-side recheck: night2 `bench_*`.
+- **Single-polytope e2e at 20 seeds: 1334 pass, 6 TIMEOUT.** Every timeout was **seed 10 on a
+  2D/3D simplex**: a hang (U5f below).
+- **Slow unit sweeps:**
+  - `alt_oracles`, `elongated`, `rounding` and `standard_shapes` hit the 3 h limit (CG-ball sweeps,
+    slow since the step cap).
+  - `invariance`: 1 failure, expected (its slow grid uses the raw unrounded oracle on elongated
+    cells).
+  - `union_robust`: 1 failure, expected (its `--no-round` test fails by design).
+  - Everything else passed.
+
+## U5f. Hangs of the CDHR volume oracle (`31d7eff`)
+**Did:** reproduced the hang (`simplex_2d_s1 --seed 10`), backtraced it under gdb, and instrumented
+the code. Three causes, all fixed:
+1. **Facets the point lies on were ignored.** `hpolytope` `line_intersect`/`line_intersect_coord`
+   bounded the chord by the sign of λ = slack/a, so a facet through the point (slack 0) was skipped.
+   The chord became unbounded (u = DBL_MAX) and the chain left the polytope (coordinate −3552 in a
+   rounded unit-radius simplex).
+   - **Fix:** bound by the sign of a, clamping at 0.
+2. **Slack drift.** CDHR updated the slacks incrementally only.
+   - **Fix:** recompute them from scratch every 256 steps, in both the Gaussian and the uniform
+     CDHR walks.
+3. **Gaussian chord samplers could loop forever** on far-tail chords:
+   - the N(0,1)-until-inside loop has acceptance equal to the tail mass;
+   - the rectangle rejection's bound exp(−a·l²) underflows to 0, so `0 < 0` never accepts.
+   - **Fix:** an exact `sample_truncated_std_normal` (N(0,1) / uniform / Robert exponential
+     proposal, each with acceptance bounded away from 0). Gaussian RDHR also computes chord
+     positions by dot product now.
+
+**Found:**
+- All 12 former hang cases finish.
+- `run_smt2 --seeds 20`: **1340/1340**.
+- `run_union_e2e --seeds 10`: **38/38**, 0 failing runs, |mean err| 0.3–1.0% (was 1.3–2.7%, thanks
+  to the decorrelated oracle seeds plus these fixes).
+
+## U10. Morning campaign night2 (06:48–10:00, 10 workers, frozen binary `31d7eff`)
+**Root:** `<scratchpad>/night2`.
+
+**20 jobs:**
+- the 12 `--nogmp`/`--fullgmp` union batches;
+- syntax fuzz: 4 × 750 formulas (`run_fuzz_lra.py`);
+- union e2e at 100 seeds, at ε=0.8 and ε=0.3/δ=0.1;
+- a side-by-side start-vs-now timing on 10 syntheticLRA instances (`bench_*`).
+
+**Read with:** `night_summary.py --root <night2>` for the bu part; `night2/fuzz_*.json`,
+`night2/union_e2e_100*.json`, `night2/bench/results_*.csv`; and the logs in `night2/results/`.
 
