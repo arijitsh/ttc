@@ -27,8 +27,9 @@
   - [ ] 14a. `build/` is in a mixed state (Ninja/clang cache, stale GCC Makefiles). You need to
     run `rm -rf build && CMAKE_GENERATOR="Unix Makefiles" ./configure.sh --skip-deps --ddnnf`;
     meanwhile `build-gcc/` is the working build.
-  - [ ] 14b. `--vol-oracle cg-ball` got much slower after the step cap + batch-means
-    (`test_rounding` > 900 s): reduce its test sizes, or note the cost in the help text.
+  - [~] 14b. `--vol-oracle cg-ball` got much slower after the step cap + batch-means.
+    `test_rounding` now uses the default `cg-cdhr` oracle (45 s, 10/10). Still to do: note the cost
+    of `cg-ball` in the `--vol-oracle` help text.
   - [ ] 14c. Remove the baseline worktree (`scratchpad/ttc-start`, `git worktree remove`) when
     benchmarking is done.
   - [ ] 14d. Save the durable facts to memory: build-dir state, rounding fix, the new
