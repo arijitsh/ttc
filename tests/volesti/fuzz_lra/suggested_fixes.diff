@@ -1,0 +1,91 @@
+# Suggested fixes for the failure classes found by tests/volesti/run_fuzz_lra.py.
+# Not applied (the fuzzer must not edit src/).  Line numbers: src/parser.cpp and
+# src/main.cpp as of 2026-11-14 (parser.cpp with the ite-lifting work in progress).
+#
+# (1) define-fun.  cvc5 records every define-fun as an *assertion*
+#     (= f body) or (= f (lambda (params) body)) with f a fresh CONSTANT
+#     (cvc5 smt/solver_engine.cpp SolverEngine::defineFunction ->
+#     Assertions::addDefineFunDefinition), and getAssertions() returns it.
+#     ttc conjoins it into the formula (parser.cpp:505, 602) and `collect`
+#     (parser.cpp:622) registers f -- and the lambda's bound parameters, which
+#     also carry symbols -- as counting variables:
+#       0-ary Real  -> extra dimension pinned by (= K c): `s volume 0`
+#       0-ary Bool  -> Bool variable: engine 2 (PACT) -> "logic ... doesn't
+#                      include THEORY_BV" error, or `s mc` without set-logic
+#       with args   -> params become Real vars and (= f (lambda ..)) reaches
+#                      appendComparisonConstraints: "unsupported literal"
+#     Even an UNUSED define-fun triggers all three.
+#     Fix: drop the definitions from the assertion list and substitute them;
+#     simplify() (UF rewriter) beta-reduces the lambda applications.  Only
+#     free constants are counting variables (bound VARIABLEs are not).
+--- a/src/parser.cpp
++++ b/src/parser.cpp
+@@ void TTCParser::parseFormula(const std::string &smtFormula) {
+     Log(3) << "Commands processed" << std::endl;
+-    auto assertions = d_solver.getAssertions();
+-    d_assertions = assertions;
+     d_declaredVars.clear();
+     if (d_parser != nullptr)
+     {
+         cvc5::parser::SymbolManager* sm = d_parser->getSymbolManager();
+         if (sm != nullptr)
+         {
+             d_declaredVars = sm->getDeclaredTerms();
+         }
+     }
++    // cvc5 keeps each define-fun as an assertion (= f def); inline instead.
++    std::unordered_set<cvc5::Term> declared(d_declaredVars.begin(),
++                                            d_declaredVars.end());
++    std::vector<cvc5::Term> assertions, defs, bodies;
++    for (const cvc5::Term& a : d_solver.getAssertions())
++    {
++        if (a.getKind() == cvc5::Kind::EQUAL
++            && a[0].getKind() == cvc5::Kind::CONSTANT && declared.count(a[0]) == 0)
++        {
++            defs.push_back(a[0]);
++            bodies.push_back(a[1]);
++        }
++        else
++        {
++            assertions.push_back(a);
++        }
++    }
++    for (cvc5::Term& a : assertions)
++    {
++        // a definition may use earlier ones: substitute to a fixpoint
++        for (std::size_t k = 0; k < defs.size(); ++k)
++        {
++            cvc5::Term b = a.substitute(defs, bodies);
++            if (b == a) break;
++            a = b;
++        }
++    }
++    d_assertions = assertions;
+@@
+         std::function<void(const cvc5::Term&)> collect = [&](const cvc5::Term& t) {
+-            if (t.getNumChildren() == 0 && t.hasSymbol())
++            // free constants only: bound variables of let/lambda are not
++            // counting variables
++            if (t.getNumChildren() == 0 && t.hasSymbol()
++                && t.getKind() == cvc5::Kind::CONSTANT)
+             {
+#
+# (2) Parse errors abort.  parser.parseFormula (main.cpp:1868) is outside any
+#     try block, so a cvc5::parser::ParserException (e.g. `to_real` under
+#     (set-logic QF_LRA), a duplicate :named label) terminates the process
+#     ("terminate called ...", rc 134) instead of printing `Error:`.
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@
+   double parseStart = Log.elapsed();
+-  parser.parseFormula(smtFormula);
++  try
++  {
++    parser.parseFormula(smtFormula);
++  }
++  catch (const std::exception& ex)  // cvc5::parser::ParserException, CVC5ApiException
++  {
++    std::cerr << "Error: parse error: " << ex.what() << std::endl;
++    return 1;
++  }
+   double parseEnd = Log.elapsed();
