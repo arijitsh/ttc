@@ -38,7 +38,8 @@
 #if defined(TTC_ENABLE_DDNNF)
 #include "var_order.hpp"
 #endif
-#include "volume/lra_volume.hpp"
+#include "volume/union_parameters.hpp"
+#include "volume/unionvolume.hpp"
 #include "tdd/tdd.hpp"
 
 namespace po = boost::program_options;
@@ -2458,11 +2459,11 @@ int main(int argc, char *argv[]) {
       std::cout << "c" << std::endl;
 
       double dnfStart = Log.elapsed();
-      parser.computePolytopes();
+      parser.computeCubes();
       double dnfEnd = Log.elapsed();
       Profile.addDnfization(dnfEnd - dnfStart);
 
-      const auto& polytopes = parser.polytopes();
+      const auto& polytopes = parser.cubes();
       auto realVars = parser.realVariables();
 
       ttc::VolumeOptions volumeOptions;

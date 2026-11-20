@@ -310,11 +310,26 @@ set(SOURCES
     src/tocnf/tocnf.cpp
     src/eager/bvcnf.cpp
     src/weighted/tounweighted.cpp
-    src/volume/allsat_volume.cpp
-    src/volume/lra_volume.cpp
+)
+
+# The LRA volume engine (Algorithm 1 of the manuscript, src/volume/README.md)
+# and the AllSAT solver behind its ToDNF step.  Built once as an OBJECT
+# library and linked into ttc and into the lra_unit_tests binary.
+set(LRA_VOLUME_SOURCES
+    src/volume/aig_allsat.cpp
+    src/volume/boolean_abstraction.cpp
+    src/volume/canonicalize.cpp
+    src/volume/dnf_enumeration.cpp
+    src/volume/get_precision.cpp
+    src/volume/ine_writer.cpp
+    src/volume/linear_constraints.cpp
+    src/volume/polytope_balls.cpp
     src/volume/polytope_sampler.cpp
     src/volume/polytope_volume.cpp
-    src/volume/union_estimator.cpp
+    src/volume/prepared_polytope.cpp
+    src/volume/union_parameters.cpp
+    src/volume/unionvolume.cpp
+    src/volume/vol_est.cpp
     src/allsat-circuits/src/AllSatAlgo/AllSatAlgoBase.cpp
     src/allsat-circuits/src/AllSatAlgo/Blocking/AllSatAlgoBlockingBase.cpp
     src/allsat-circuits/src/AllSatAlgo/Blocking/TseitinEnc/AllSatAlgoTseitinEnc.cpp
@@ -432,7 +447,8 @@ else()
     set(STP_LIB "")
 endif()
 
-add_executable(ttc ${SOURCES})
+add_library(ttc_lra_volume OBJECT ${LRA_VOLUME_SOURCES})
+add_executable(ttc ${SOURCES} $<TARGET_OBJECTS:ttc_lra_volume>)
 add_dependencies(ttc ttc_git_version)
 
 if(NOT BUILD_STATIC AND UNIX AND NOT APPLE)
@@ -541,6 +557,30 @@ if(ENABLE_DDNNF)
 endif()
 
 if(BUILD_TESTING)
+    # Unit tests of the LRA volume engine, one file per step of Algorithm 1
+    # (src/volume/README.md).  Linked exactly like ttc, minus ttc's own sources.
+    file(GLOB LRA_UNIT_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/lra/*.cpp)
+    add_executable(lra_unit_tests ${LRA_UNIT_TEST_SOURCES} $<TARGET_OBJECTS:ttc_lra_volume>)
+    target_include_directories(lra_unit_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/volesti/test)
+    get_target_property(TTC_LINK_LIBRARIES ttc LINK_LIBRARIES)
+    target_link_libraries(lra_unit_tests ${TTC_LINK_LIBRARIES})
+    get_target_property(TTC_LINK_OPTIONS ttc LINK_OPTIONS)
+    if(TTC_LINK_OPTIONS)
+        target_link_options(lra_unit_tests PRIVATE ${TTC_LINK_OPTIONS})
+    endif()
+    foreach(rpath_property BUILD_RPATH INSTALL_RPATH)
+        get_target_property(TTC_RPATH ttc ${rpath_property})
+        if(TTC_RPATH)
+            set_target_properties(lra_unit_tests PROPERTIES ${rpath_property} "${TTC_RPATH}")
+        endif()
+    endforeach()
+    foreach(dep lpsolve_patched cadiback_xor d4lib)
+        if(TARGET ${dep})
+            add_dependencies(lra_unit_tests ${dep})
+        endif()
+    endforeach()
+    add_test(NAME lra_unit COMMAND lra_unit_tests)
+
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(LRA_VOLUME_TEST_DIR ${CMAKE_SOURCE_DIR}/example/tests)
     set(LRA_VOLUME_TEST_SCRIPT ${LRA_VOLUME_TEST_DIR}/test_lra_volume.py)

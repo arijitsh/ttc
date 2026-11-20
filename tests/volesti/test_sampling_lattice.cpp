@@ -1,4 +1,4 @@
-// Audit of ttc::sampleLattice (src/volume/polytope_sampler.hpp): GenerateSamples
+// Audit of ttc::generateSamples (src/volume/generate_samples.hpp): GenerateSamples
 // of the manuscript -- inflate every facet by 10^-b * kappa * |A_j|, draw
 // proposals from the inflated body, round each coordinate stochastically to
 // the lattice h Z (h = 10^-b), reject against P.
@@ -136,7 +136,7 @@ std::pair<VT, VT> bbox(const MT& A, const VT& b)
 }
 
 // Exact uniform sampler for the body it is handed (the inflated body inside
-// sampleLattice), by rejection from its bounding box.  Records the volume of
+// generateSamples), by rejection from its bounding box.  Records the volume of
 // the body it was asked for (estimated from the acceptance rate).
 struct ExactUniform
 {
@@ -352,7 +352,7 @@ TEST_CASE("lattice [rounding]: fixed proposal -> two neighbours, unbiased")
       return std::vector<VT>(size_t(k), x);
     };
     double time = 0;
-    auto out = ttc::sampleLattice<double>(B.A, B.b, N, p, kEps, kDelta, 12345u, gen, time);
+    auto out = ttc::generateSamples<double>(B.A, B.b, N, p, kEps, kDelta, 12345u, gen, time);
     REQUIRE((long long)out.size() == N);
     for (int j = 0; j < 3; ++j)
     {
@@ -396,7 +396,7 @@ TEST_CASE("lattice [rounding]: exact lattice proposals are returned unchanged")
       return std::vector<VT>(size_t(k), x);
     };
     double time = 0;
-    auto out = ttc::sampleLattice<double>(B.A, B.b, 2000, p, kEps, kDelta, 7u, gen, time);
+    auto out = ttc::generateSamples<double>(B.A, B.b, 2000, p, kEps, kDelta, 7u, gen, time);
     long long moved = 0;
     for (const VT& z : out) moved += (toLattice(z, p) != toLattice(x, p));
     INFO("p=" << p);
@@ -423,7 +423,7 @@ TEST_CASE("lattice [exact]: exact-uniform proposals give the uniform law on P ca
   {
     ExactUniform gen(1000u + c.p);
     double time = 0;
-    auto out = ttc::sampleLattice<double>(c.P.Ad(), c.P.bd(), c.N, c.p, kEps, kNoBudget, 99u,
+    auto out = ttc::generateSamples<double>(c.P.Ad(), c.P.bd(), c.N, c.p, kEps, kNoBudget, 99u,
                                           std::ref(gen), time);
     REQUIRE((long long)out.size() == c.N);
     auto U = uniformity(c.P, c.p, out);
@@ -437,7 +437,7 @@ TEST_CASE("lattice [exact]: exact-uniform proposals give the uniform law on P ca
 namespace
 {
 // GetPrecision of the revised manuscript, as ttc computes it
-// (lra_volume.cpp precisionFromCubes): eta = eps/96.
+// (src/volume/get_precision.hpp): eta = eps/96.
 int ttcPrecision(int dim, int facets, int cubes, double minRadius, double epsilon)
 {
   const double eta = epsilon / 96.0;
@@ -453,7 +453,7 @@ Rejection rejection(const IBody& P, int p, long long N, bool lattice)
 {
   ExactUniform gen(5u);
   double time = 0;
-  auto out = ttc::sampleLattice<double>(P.Ad(), P.bd(), N, p, kEps, kNoBudget, 3u,
+  auto out = ttc::generateSamples<double>(P.Ad(), P.bd(), N, p, kEps, kNoBudget, 3u,
                                         std::ref(gen), time);
   Rejection R;
   R.measured = 1.0 - double(out.size()) / double(gen.proposals);
@@ -511,7 +511,7 @@ TEST_CASE("lattice [budget]: kappa covers the rounding kernel; rejection rate vs
       double t = 0;
       try
       {
-        auto out = ttc::sampleLattice<double>(P.Ad(), P.bd(), 1 + s % 50, p, kEps, kDelta, s,
+        auto out = ttc::generateSamples<double>(P.Ad(), P.bd(), 1 + s % 50, p, kEps, kDelta, s,
                                               std::ref(gen), t);
         CHECK(out.size() == 1 + s % 50);
       }
@@ -527,7 +527,7 @@ TEST_CASE("lattice [budget]: n = 0, n = 1, and bodies of width ~ h")
   {
     ExactUniform gen(1u);
     double t = 0;
-    auto out = ttc::sampleLattice<double>(P.Ad(), P.bd(), 0, 2, kEps, kDelta, 1u, std::ref(gen), t);
+    auto out = ttc::generateSamples<double>(P.Ad(), P.bd(), 0, 2, kEps, kDelta, 1u, std::ref(gen), t);
     CHECK(out.empty());
     CHECK(gen.calls == 0);
   }
@@ -539,7 +539,7 @@ TEST_CASE("lattice [budget]: n = 0, n = 1, and bodies of width ~ h")
       ExactUniform gen(s + 77777u);
       double t = 0;
       auto out =
-          ttc::sampleLattice<double>(P.Ad(), P.bd(), 1, 1, kEps, kNoBudget, s, std::ref(gen), t);
+          ttc::generateSamples<double>(P.Ad(), P.bd(), 1, 1, kEps, kNoBudget, s, std::ref(gen), t);
       REQUIRE(out.size() == 1);
       all.push_back(out[0]);
     }
@@ -559,7 +559,7 @@ TEST_CASE("lattice [budget]: n = 0, n = 1, and bodies of width ~ h")
       double t = 0;
       try
       {
-        auto out = ttc::sampleLattice<double>(P.Ad(), P.bd(), 1, 2, kEps, kDelta, s,
+        auto out = ttc::generateSamples<double>(P.Ad(), P.bd(), 1, 2, kEps, kDelta, s,
                                               std::ref(gen), t);
         shortRuns += out.size() != 1;
       }
@@ -578,7 +578,7 @@ TEST_CASE("lattice [budget]: n = 0, n = 1, and bodies of width ~ h")
       double t = 0;
       try
       {
-        auto out = ttc::sampleLattice<double>(S.Ad(), S.bd(), 1000, 2, kEps, kDelta, s,
+        auto out = ttc::generateSamples<double>(S.Ad(), S.bd(), 1000, 2, kEps, kDelta, s,
                                               std::ref(gen), t);
         shortRuns += out.size() != 1000u;
       }
@@ -591,7 +591,7 @@ TEST_CASE("lattice [budget]: n = 0, n = 1, and bodies of width ~ h")
     // Uniform over the 101 x 2 lattice points when the budget is lifted:
     ExactUniform gen(9u);
     double t = 0;
-    auto out = ttc::sampleLattice<double>(S.Ad(), S.bd(), 20000, 2, kEps, kNoBudget, 9u,
+    auto out = ttc::generateSamples<double>(S.Ad(), S.bd(), 20000, 2, kEps, kNoBudget, 9u,
                                           std::ref(gen), t);
     auto U = uniformity(S, 2, out);
     print("exact strip", S, 2, U);
@@ -674,7 +674,7 @@ TEST_CASE("lattice [walks]: every ttc walk, square/rect/triangle/slab" * doctest
 TEST_CASE("lattice [seeding]: rounding seed equal to the walk seed")
 {
   // ttc derives the rounding seed and every walk seed from distinct splitmix64
-  // stream draws (lra_volume.cpp streamSeed); the test helper uses seed and
+  // stream draws (ttc::SeedStream); the test helper uses seed and
   // seed*2654435761+1.  Worst case: identical seeds, so std::mt19937 (rounding)
   // and boost::mt19937 (walk) emit the same raw stream.
   IBody P = squareOffLattice();
@@ -691,7 +691,7 @@ TEST_CASE("lattice [seeding]: rounding seed equal to the walk seed")
                                   ttcWalkLength(int(A.cols())), walkSeed++, bs);
   };
   double time = 0;
-  auto out = ttc::sampleLattice<double>(P.Ad(), P.bd(), N, p, kEps, kNoBudget, seed, gen, time);
+  auto out = ttc::generateSamples<double>(P.Ad(), P.bd(), N, p, kEps, kNoBudget, seed, gen, time);
   auto U = uniformity(P, p, out);
   print("same-seed billiard", P, p, U);
   checkUniform(U);

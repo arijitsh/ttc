@@ -1,8 +1,8 @@
 #pragma once
 
 // The single-polytope volume oracle selectable with --vol-oracle.  Kept free
-// of volesti includes so lra_volume.hpp / main.cpp stay light; the oracle
-// itself lives in polytope_volume_oracle.hpp.
+// of volesti includes so volume_options.hpp / main.cpp stay light; the oracle
+// itself lives in polytope_volume.hpp (run by vol_est.hpp).
 
 #include <cstddef>
 

@@ -13,7 +13,8 @@
 #include "features.hpp"
 #include "logger.hpp"
 #include "stp_sat.hpp"
-#include "volume/allsat_volume.hpp"
+#include "volume/boolean_abstraction.hpp"
+#include "volume/dnf_enumeration.hpp"
 
 #include "arjun.hpp"
 #ifdef TTC_ENABLE_DDNNF
@@ -467,7 +468,7 @@ TTCParser::TTCParser()
       d_intVars(),
       d_realVars(),
       d_numConstraints(0),
-      d_polytopes()
+      d_cubes()
 {
     d_solver.setOption("print-success", "false");
     d_solver.setOption("incremental", "true");
@@ -519,7 +520,7 @@ void TTCParser::parseFormula(const std::string &smtFormula) {
     d_intVars.clear();
     d_realVars.clear();
     d_bvVars.clear();
-    d_polytopes.clear();
+    d_cubes.clear();
     d_literalWeights.clear();
     if (d_hasExplicitProjectionVars)
     {
@@ -878,36 +879,24 @@ std::optional<bool> TTCParser::checkSatWithSTP(const std::string& smtFormula)
     return csb::stpCheckSat(smtFormula);
 }
 
-void TTCParser::computePolytopes()
+void TTCParser::computeCubes()
 {
-    d_polytopes.clear();
+    d_cubes.clear();
     if (d_formula.isNull())
     {
         return;
     }
-
+    // BoolAbs from the instrumented cvc5, or by walking the formula when that
+    // fails; either way ToDNF runs AllSAT on the AIG.  If both fail the error
+    // propagates: an empty decomposition would print "s volume 0" for a
+    // formula ttc cannot decompose (e.g. a Real-valued ite inside an atom).
     try
     {
-        auto abstraction = ttc::getBooleanAbstractionAig(d_solver, d_formula);
-        auto result = ttc::enumeratePolytopes(abstraction, d_solver);
-        d_polytopes = std::move(result.polytopes);
+        d_cubes = ttc::enumerateCubes(ttc::getBooleanAbstractionAig(d_solver, d_formula));
     }
     catch (const std::exception&)
     {
-        try
-        {
-            auto manual = ttc::buildBooleanAigFromTerm(d_formula);
-            auto result = ttc::enumeratePolytopes(manual, d_solver);
-            d_polytopes = std::move(result.polytopes);
-        }
-        catch (const std::exception&)
-        {
-            // Do not silently report an empty decomposition (that printed
-            // "s volume 0" with exit 0 for formulas ttc cannot decompose,
-            // e.g. a Real-valued ite inside an arithmetic atom).
-            d_polytopes.clear();
-            throw;
-        }
+        d_cubes = ttc::enumerateCubes(ttc::buildBooleanAigFromTerm(d_formula));
     }
 }
 

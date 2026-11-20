@@ -1,10 +1,10 @@
 // T3 of text-for-agents/ttc-union-test-plan.md: GetPrecision (KR25 manuscript,
 // Alg. 2) and the lattice-count lemmas lem:nonconv / lem:lattice
-// (sections/analysis.tex), against ttc::precisionFromCubes
-// (src/volume/union_estimator.cpp) and the (m, r, gamma_min) that
-// src/volume/lra_volume.cpp passes to it.
+// (sections/analysis.tex), against ttc::latticePrecision
+// (src/volume/get_precision.cpp) and the (m, r, gamma_min) that
+// getPrecision passes to it.
 //
-//   [alg2]     precisionFromCubes(n, r, m, gamma_min, eps) == ceil(log10(max(1, gamma/gamma_min))),
+//   [alg2]     latticePrecision(n, r, m, gamma_min, eps/96) == ceil(log10(max(1, gamma/gamma_min))),
 //              gamma = 64 m n / eta * sqrt(ln(4 r / eta)), eta = eps/96, recomputed in
 //              long double on a grid.  The log must be natural: the Azuma step of
 //              lem:nonconv (claim cl, part a) needs 2 exp(-kappa^2/2) <= eta/(4r) with
@@ -19,16 +19,18 @@
 //              inclusion-exclusion, Ehrhart polynomials of simplices).
 //   [lattice]  lem:lattice on small 2D/3D unions (boxes, L-shapes, frame, staircase,
 //              skinny L, triangles tiling a square / a hexagon, overlapping triangles,
-//              thin triangles, simplex, cube u simplex): with b from precisionFromCubes
+//              thin triangles, simplex, cube u simplex): with b from latticePrecision
 //              and ttc's certified inner balls, |10^{-bn} |Q cap L| / vol Q - 1| <= eta.
 //              Also reports the smallest b* that already gives eta-accuracy and what the
 //              extra b_ttc - b* digits cost (C = Thresh 10^{bn}, halvings, GMP digits).
-//   [cost]     GMP membership (SampleStore<MpFloat>::removeInside) time at b + 32 digits.
+//   [cost]     GMP membership (SampleMultiset<MpFloat>::removeInside) time at b + 32 digits.
 #include "doctest.h"
 #include "common.hpp"
 
 #include "volume/gmp_walks.hpp"
-#include "volume/union_estimator.hpp"
+#include "volume/get_precision.hpp"
+#include "volume/sample_multiset.hpp"
+#include "volume/union_parameters.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -358,7 +360,7 @@ void toDouble(const IPoly& P, int n, Eigen::MatrixXd& A, Eigen::VectorXd& b)
 
 // Alg. 2 by hand, natural log (long double).  kAlg2RFactor is the manuscript's
 // factor in sqrt(ln(8r/eta)).  It was 4, but the [proof] tests showed
-// lem:nonconv needs 8; the paper and union_estimator.cpp were changed to 8.
+// lem:nonconv needs 8; the paper and get_precision.cpp were changed to 8.
 constexpr long double kAlg2RFactor = 8.0L;
 long double alg2Gamma(long double n, long double r, long double m, long double eps)
 {
@@ -389,7 +391,7 @@ std::string i128str(i128 v)
 }  // namespace
 
 // ============================================================================
-TEST_CASE("[T3][alg2] precisionFromCubes equals Alg. 2 (natural log) on a grid")
+TEST_CASE("[T3][alg2] latticePrecision equals Alg. 2 (natural log) on a grid")
 {
   int checked = 0, bad = 0, skipped = 0, diffLog10 = 0, diffLog2 = 0;
   for (double n : {1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 40.0})
@@ -405,8 +407,8 @@ TEST_CASE("[T3][alg2] precisionFromCubes equals Alg. 2 (natural log) on a grid")
               continue;
             }
             const int want = int(std::ceil(lr));
-            const int got = ttc::precisionFromCubes(std::size_t(n), std::size_t(r),
-                                                    std::size_t(m), g, eps);
+            const int got = ttc::latticePrecision(std::size_t(n), std::size_t(r),
+                                                    std::size_t(m), g, eps / 96.0);
             ++checked;
             if (got != want)
             {
@@ -429,7 +431,7 @@ TEST_CASE("[T3][alg2] precisionFromCubes equals Alg. 2 (natural log) on a grid")
                   << ", with log2 at " << diffLog2);
   CHECK(bad == 0);
   // b = 0 when the inner radius already exceeds gamma (Alg. 2 starts at maxratio = 1).
-  CHECK(ttc::precisionFromCubes(2, 4, 1, 1e12, 0.8) == 0);
+  CHECK(ttc::latticePrecision(2, 4, 1, 1e12, 0.8 / 96.0) == 0);
 
   // Natural log is what the Azuma step of claim cl needs:
   // 2 exp(-kappa^2/2) <= eta/(4r), kappa = sqrt(2 ln(8/eta)) + sqrt(2 ln r).
@@ -512,8 +514,8 @@ TEST_CASE("[T3][proof] ttc's b meets lem:nonconv's kappa/(10^b gamma_min) <= eta
             const long double eta = eps / 96.0L;
             const long double kappa =
                 std::sqrt(2 * std::log(8 / eta)) + std::sqrt(2 * std::log(r));
-            const int b = ttc::precisionFromCubes(std::size_t(n), std::size_t(r), std::size_t(m),
-                                                  gHat, eps);
+            const int b = ttc::latticePrecision(std::size_t(n), std::size_t(r), std::size_t(m),
+                                                  gHat, eps / 96.0);
             const long double radius = std::pow(10.0L, (long double)b) * gHat;
             ++points;
             if (kappa / radius > eta / (32 * m * n) * (1 + 1e-12L))
@@ -612,7 +614,7 @@ TEST_CASE("[T3][lattice] lem:lattice at ttc's b on small 2D/3D unions; slack of 
         gMin = std::min(gMin, ball.radius);
         r += std::size_t(A.rows());
       }
-      const int bTtc = ttc::precisionFromCubes(n, r, m, gMin, eps);
+      const int bTtc = ttc::latticePrecision(n, r, m, gMin, eps / 96.0);
       CHECK(bTtc == int(std::ceil(alg2LogRatio(n, r, m, gMin, eps))));
 
       // Relative error of the lattice count for b = 0..bTtc.
@@ -668,7 +670,7 @@ TEST_CASE("[T3][lattice] lem:lattice at ttc's b on small 2D/3D unions; slack of 
 
 TEST_CASE("[T3][cost] GMP membership test time vs digits b + 32")
 {
-  // SampleStore<MpFloat>::removeInside over Thresh(0.8, 0.2) 2D points, as
+  // SampleMultiset<MpFloat>::removeInside over Thresh(0.8, 0.2) 2D points, as
   // phase 2 runs it once per polytope; digits for b = 5..20.
   const double T = ttc::lraSampleThreshold(0.8, 0.2, 2);
   Eigen::MatrixXd A(4, 2);
@@ -679,7 +681,7 @@ TEST_CASE("[T3][cost] GMP membership test time vs digits b + 32")
   for (int b : {5, 7, 10, 15, 20, 40})
   {
     ttc::MpFloat::default_precision(unsigned(b + 32));
-    ttc::SampleStore<ttc::MpFloat> store(0.0);
+    ttc::SampleMultiset<ttc::MpFloat> store;
     std::mt19937 g(5);
     std::uniform_real_distribution<double> U(0, 1);
     const ttc::MpFloat scale = pow(ttc::MpFloat(10), b);
@@ -688,7 +690,7 @@ TEST_CASE("[T3][cost] GMP membership test time vs digits b + 32")
       Eigen::Matrix<ttc::MpFloat, Eigen::Dynamic, 1> v(2);
       v(0) = floor(ttc::MpFloat(U(g)) * scale) / scale;
       v(1) = floor(ttc::MpFloat(U(g)) * scale) / scale;
-      store.addSample(v);
+      store.add(v);
     }
     const auto t0 = std::chrono::steady_clock::now();
     const std::size_t removed = store.removeInside(A, bb);

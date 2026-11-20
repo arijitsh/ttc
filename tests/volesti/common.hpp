@@ -3,7 +3,7 @@
 // Each test_*.cpp in this directory is compiled into its own doctest binary by
 // tests/volesti/Makefile.  The helpers below build H-polytopes with known
 // exact volumes and run the volesti volume oracle in exactly the configuration
-// ttc's LRA engine uses (src/volume/lra_volume.cpp):
+// ttc's LRA engine uses (src/volume/vol_est.cpp):
 //
 //   volume_cooling_gaussians<GaussianBallWalk,
 //                            BoostRandomNumberGenerator<boost::mt19937,double,3>>
@@ -34,7 +34,8 @@
 #include "random_walks/uniform_rdhr_walk.hpp"
 #include "random_walks/uniform_accelerated_billiard_walk.hpp"
 #include "volume/volume_cooling_gaussians.hpp"
-#include "volume/polytope_sampler.hpp"  // src/: ttc's sampler
+#include "volume/generate_samples.hpp"  // src/: ttc's GenerateSamples (line 19)
+#include "volume/polytope_sampler.hpp"  // src/: ttc's restart walks
 #include "volume/polytope_volume.hpp"   // src/: ttc's inner ball, rounding + oracle
 
 namespace vt
@@ -172,7 +173,7 @@ inline double ttcOracle(HPoly P, double epsilon = 0.8)
                                                                   ttcWalkLength(n));
 }
 
-// ttc's full per-polytope pipeline (src/volume/lra_volume.cpp phase 1b),
+// ttc's full per-polytope pipeline (src/volume/vol_est.cpp, VolEst),
 // exactly as ttc runs it: certified inner ball, max-inscribed-ellipsoid
 // rounding, the selected oracle, times |det T|.
 inline ttc::RoundedPolytope ttcBody(const MT& A, const VT& b, bool round = true)
@@ -197,10 +198,10 @@ inline double ttcVolumeSeeded(const HPoly& P, unsigned seed, double epsilon = 0.
 
 // ------------------------------------------------------------------ sampling
 // ttc's single-polytope sampler (src/volume/polytope_sampler.cpp), exactly as
-// lra_volume.cpp calls it.
+// VolEst (src/volume/vol_est.cpp) calls it.
 //   ttcProposals: n points, each the endpoint of a fresh walk of walkLength
 //                 steps started at the certified Chebyshev centre (default
-//                 walk length 10 + n^2, ttc's lraDefaultWalkLength).
+//                 walk length 10 + n^2, ttc's default before 2026-11).
 //   ttcLatticeSamples: GenerateSamples -- proposals from the facet-inflated
 //                 body, stochastic rounding to 10^-b Z^n, rejection against P.
 inline std::vector<VT> ttcProposals(const MT& A, const VT& b, long long n, unsigned seed,
@@ -228,7 +229,7 @@ inline std::vector<VT> ttcLatticeSamples(const MT& A, const VT& b, long long n, 
     return ttc::sampleRestartWalk(Ai, bi, k, walk, wl, walkSeed++, ballSeconds);
   };
   double samplingTime = 0;
-  return ttc::sampleLattice<double>(A, b, n, precision, epsilon / 12.0, delta, seed, generate,
+  return ttc::generateSamples<double>(A, b, n, precision, epsilon / 12.0, delta, seed, generate,
                                     samplingTime);
 }
 

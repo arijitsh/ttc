@@ -282,7 +282,7 @@ TEST_CASE("inner ball sensitivity (valid balls must not matter)")
 // Known upstream issue: volesti's max_inscribed_ball IPM uses absolute
 // tolerances and its lp_solve fallback returns invalid balls at extreme
 // scales/offsets.  ttc never uses this ball unchecked (reliableInnerBall in
-// src/volume/lra_volume.cpp certifies it against a Chebyshev LP), so this
+// src/volume/polytope_balls.cpp certifies it against a Chebyshev LP), so this
 // documents the library behaviour rather than gating the suite.
 TEST_CASE("volesti ComputeInnerBall / max_inscribed_ball across scales"
           * doctest::may_fail())

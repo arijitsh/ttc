@@ -8,9 +8,9 @@
 //              (4 exp(-(1-e')e'^2 T/24) <= delta/6, exp(-T/15) <= delta/(6m)), and the
 //              constant inequalities of that proof and of thm:volumettc hold for eps in (0,1].
 //   [wiring]   ./build/ttc reports e' = eps/12, delta' = delta/(4m), Thresh(eps, delta, m)
-//              and b = precisionFromCubes(n, r, m, gamma_min, eps) with m = all cubes of the
+//              and b = latticePrecision(n, r, m, gamma_min, eps/96) with m = all cubes of the
 //              DNF (including the zero-volume one it drops), r = facets of the kept ones.
-//   [clip]     the clip of lra_volume.cpp:802-807,
+//   [clip]     the clip of src/volume/vol_est.cpp (ballVolumeBounds),
 //              volume <- clamp(volume, (1-e')(2 gamma/sqrt n)^n, (1+e')(2R)^n),
 //              is sound: certifiedInnerBall's ball lies in P, gamma <= the true inradius,
 //              outerRadius R >= max_v |v - centre| over the true vertices, and
@@ -19,12 +19,14 @@
 //              (1 +- e') oracle value stays in (1 +- e') vol.
 //   [scale]    dims up to 40 and sides 1e-7..1e7: the clip bounds computed in double never
 //              produce NaN / lower > upper / a wrong finite value while vol is a normal
-//              double, and runUnionAlgorithm's log2Scale = log2 T + b n log2 10 bookkeeping
+//              double, and estimateUnionVolume's log2Scale = log2 T + b n log2 10 bookkeeping
 //              returns vol(P) (Poisson z-test, |z| <= 5) for volumes 1e-300..1e300.
 #include "doctest.h"
 #include "common.hpp"
 
+#include "volume/get_precision.hpp"
 #include "volume/union_estimator.hpp"
+#include "volume/union_parameters.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -54,8 +56,8 @@ const std::vector<double> kEps = {0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 0.95, 1.0
 const std::vector<double> kDelta = {1e-9, 1e-4, 0.01, 0.05, 0.1, 0.2, 0.5, 0.9, 0.999};
 const std::vector<double> kM = {1, 2, 3, 10, 100, 1e4, 1e6, 1e9, 1e12, 1e15};
 
-// ------------------------------------------------------- clip of lra_volume.cpp
-// Mirror of src/volume/lra_volume.cpp:802-808 (phase 1b): returns false where
+// ------------------------------------------------------- clip of vol_est.cpp
+// Mirror of src/volume/vol_est.cpp (VolEst clipping): returns false where
 // ttc throws.
 bool ttcClip(double volume, double eps, int n, double gamma, double R, double& out,
              double* lowerOut = nullptr, double* upperOut = nullptr)
@@ -311,7 +313,7 @@ TEST_CASE("[T4][wiring] ttc uses eps' = eps/12, delta' = delta/(4m), Thresh(eps,
          "            (and (= x 7) (>= y 0) (<= y 1))))\n(check-sat)\n";
   }
   // eps = 0.3 separates m = 4 (b = 7) from m = 3 (b = 6).
-  REQUIRE(ttc::precisionFromCubes(2, 12, 4, 0.5, 0.3) != ttc::precisionFromCubes(2, 12, 3, 0.5, 0.3));
+  REQUIRE(ttc::latticePrecision(2, 12, 4, 0.5, 0.3 / 96.0) != ttc::latticePrecision(2, 12, 3, 0.5, 0.3 / 96.0));
   for (auto [eps, delta] : std::vector<std::pair<double, double>>{{0.3, 0.2}, {0.8, 0.05}})
   {
     const std::string out = runCapture(ttcBin + " " + path.string() + " -v 2 --seed 1 -e "
@@ -331,7 +333,7 @@ TEST_CASE("[T4][wiring] ttc uses eps' = eps/12, delta' = delta/(4m), Thresh(eps,
     CHECK(std::abs(thresh / ttc::lraSampleThreshold(eps, delta, 4) - 1) < 1e-5);
     CHECK(std::abs(ePrime / (eps / 12) - 1) < 1e-5);
     CHECK(std::abs(dPrime / (delta / (4 * 4)) - 1) < 1e-5);
-    CHECK(b == ttc::precisionFromCubes(2, 12, 4, 0.5, eps));
+    CHECK(b == ttc::latticePrecision(2, 12, 4, 0.5, eps / 96.0));
     CHECK(digits >= b + 32);
   }
   std::filesystem::remove(path);
@@ -493,7 +495,7 @@ TEST_CASE("[T4][scale] clip bounds in double for dims up to 40 and extreme sides
   CHECK(bad == 0);
 }
 
-TEST_CASE("[T4][scale] log2Scale bookkeeping of runUnionAlgorithm for vol 1e-300..1e300, n <= 40")
+TEST_CASE("[T4][scale] log2Scale bookkeeping of estimateUnionVolume for vol 1e-300..1e300, n <= 40")
 {
   // One polytope (or two disjoint ones), exact volumes, a generator that
   // returns the polytope's centre: the estimator reduces to N ~ Pois(t p),
@@ -506,7 +508,7 @@ TEST_CASE("[T4][scale] log2Scale bookkeeping of runUnionAlgorithm for vol 1e-300
       // Side of the cube with this volume, and ttc's b for it (gamma = s/2).
       const double s = std::pow(10.0, logVol10 / n);
       if (!std::isfinite(s) || s <= 0) continue;
-      const int b = ttc::precisionFromCubes(n, 2 * n, 1, s / 2, eps);
+      const int b = ttc::latticePrecision(n, 2 * n, 1, s / 2, eps / 96.0);
       const double thresh = ttc::lraSampleThreshold(eps, delta, 2);
       const double log2Scale = std::log2(thresh) + double(b) * n * std::log2(10.0);
       REQUIRE(std::isfinite(log2Scale));
@@ -531,7 +533,7 @@ TEST_CASE("[T4][scale] log2Scale bookkeeping of runUnionAlgorithm for vol 1e-300
           return std::vector<Eigen::VectorXd>(std::size_t(cnt), c);
         };
         ttc::VolumeComputationResult res;
-        ttc::runUnionAlgorithm<double>(kept, thresh, 17u + unsigned(runs), log2Scale, generate,
+        ttc::estimateUnionVolume<double>(kept, thresh, log2Scale, 17u + unsigned(runs), ttc::storedVolumes(kept), generate,
                                        res, {});
         const double exact = kept[0].volume + kept[1].volume;
         const double rel = res.volumeEstimate / exact - 1;

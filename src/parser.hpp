@@ -11,7 +11,7 @@
 #include <optional>
 #include "cache_mode.hpp"
 #include "features.hpp"
-#include "volume/allsat_volume.hpp"
+#include "volume/cube.hpp"
 
 class TTCParser {
 public:
@@ -45,8 +45,9 @@ public:
 
     void printTreeDecomposition(bool contract, bool netrel);
 
-    void computePolytopes();
-    const std::vector<ttc::Polytope>& polytopes() const { return d_polytopes; }
+    // Lines 1-2 of the LRA volume algorithm: BoolAbs and ToDNF of the formula.
+    void computeCubes();
+    const std::vector<ttc::Cube>& cubes() const { return d_cubes; }
     std::vector<cvc5::Term> realVariables() const;
 
     // Accessors for variable counts.
@@ -141,7 +142,7 @@ private:
     // Number of top-level constraints in the formula.
     std::size_t d_numConstraints = 0;
 
-    std::vector<ttc::Polytope> d_polytopes;
+    std::vector<ttc::Cube> d_cubes;
 
 };
 

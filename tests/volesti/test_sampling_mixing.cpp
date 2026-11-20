@@ -247,7 +247,7 @@ std::vector<VT> roundedProposals(const Body& B, long long n, unsigned seed, Samp
   return xs;
 }
 
-// splitmix64 per-polytope stream seeds exactly as lra_volume.cpp streamSeed().
+// splitmix64 per-polytope stream seeds exactly as ttc::SeedStream (src/volume/seed_streams.hpp).
 unsigned streamSeed(unsigned base, unsigned index)
 {
   std::uint64_t z = base + 0x9E3779B97F4A7C15ULL * index;
@@ -378,7 +378,7 @@ TEST_CASE("mixing: consecutive samples of one call are uncorrelated")
 }
 
 // Per-polytope seed streams: the same seed reproduces the sample set; two
-// different streams (lra_volume's splitmix seeds, and adjacent raw seeds as
+// different streams (ttc::SeedStream's splitmix seeds, and adjacent raw seeds as
 // in tests' ttcLatticeSamples) give sample sets whose index-aligned pairs are
 // uncorrelated (|z| < 3.29) and share no point.
 TEST_CASE("mixing: per-polytope seed streams give independent sample sets")

@@ -1,5 +1,5 @@
 // T2 of text-for-agents/ttc-union-test-plan.md: error injection into the
-// union estimator (Alg. 1 lines 6-22, ttc::runUnionAlgorithm).
+// union estimator (Alg. 1 lines 6-22, ttc::estimateUnionVolume).
 //
 // Exact components: every test union is a list of 2D parallelotopes
 // P = {M u + t : lo <= u <= hi}.  The exact lattice sampler draws u uniform on
@@ -30,13 +30,16 @@
 // numlattice) with rate <= delta: one-sided binomial test, alpha = 0.01.
 //
 // (c) ttc's real components (RoundedPolytope oracle + clipping,
-// sampleLattice over sampleRestartWalk, b from precisionFromCubes) exactly as
-// computeLraVolume wires them (src/volume/lra_volume.cpp), on the same unions.
+// generateSamples over sampleRestartWalk, b from latticePrecision) exactly as
+// computeLraVolume wires them (src/volume/unionvolume.cpp), on the same unions.
 //
 // Slow sweeps:  bin/test_union_robust -ts=slow --no-skip
 #include "doctest.h"
 #include "common.hpp"
+#include "volume/generate_samples.hpp"
+#include "volume/get_precision.hpp"
 #include "volume/union_estimator.hpp"
+#include "volume/union_parameters.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -109,7 +112,7 @@ Para box2(double x0, double x1, double y0, double y1)
   return makePara(Mat::Identity(2, 2), Vec::Zero(2), v2(x0, y0), v2(x1, y1));
 }
 
-// Membership exactly as SampleStore::removeInside evaluates it (tolerance 0).
+// Membership exactly as SampleMultiset::removeInside evaluates it (tolerance 0).
 inline bool inside(const Mat& A, const Vec& b, const Vec& x)
 {
   Vec diff = A * x - b;
@@ -528,7 +531,7 @@ Summary runStudy(const Study& St, const LawSet& L, const VolFn& volFn, double ep
       return out;
     };
     ttc::VolumeComputationResult result;
-    ttc::runUnionAlgorithm<double>(kept, thresh, seed, log2Scale, gen, result, nullptr);
+    ttc::estimateUnionVolume<double>(kept, thresh, log2Scale, seed, ttc::storedVolumes(kept), gen, result, nullptr);
     rel.push_back(result.volumeEstimate / St.exact() - 1.0);
     res.push_back(result.volumeEstimate / pred - 1.0);
   }
@@ -776,7 +779,7 @@ TEST_CASE("robust [sampler]: short-walk (central sub-box) laws on large overlaps
 // ===========================================================================
 namespace
 {
-// ttc's streamSeed (lra_volume.cpp computeLraVolume).
+// ttc's SeedStream (src/volume/seed_streams.hpp).
 struct StreamSeed
 {
   unsigned base, index = 0;
@@ -842,7 +845,7 @@ RealSetup realSetup(const Union& U, double eps)
     vol = std::clamp(vol, lower, upper);
     R.kept.push_back({P.A, P.b, vol});
   }
-  R.precision = ttc::precisionFromCubes(n, facets, U.P.size(), minRadius, eps);
+  R.precision = ttc::latticePrecision(n, facets, U.P.size(), minRadius, eps / 96.0);
   R.exact = continuousUnionVolume(U, R.uD, R.uDse);
   return R;
 }
@@ -861,7 +864,7 @@ auto ttcGenerator(int precision, double eps, double delta, std::size_t m, Stream
       return ttc::sampleRestartWalk(Ai, bi, k, ttc::SamplerWalk::Billiard, wl, ss(), ballSeconds,
                                     round);
     };
-    return ttc::sampleLattice<double>(A, b, n, precision, epsP, oracleDelta, ss(), inner, time);
+    return ttc::generateSamples<double>(A, b, n, precision, epsP, oracleDelta, ss(), inner, time);
   };
 }
 }  // namespace
@@ -958,7 +961,7 @@ void samplerMass(const std::vector<Union>& unions, bool round)
 }
 }  // namespace
 
-TEST_CASE("robust [ttc]: sampleLattice o sampleRestartWalk mass on D_i within eps'")
+TEST_CASE("robust [ttc]: generateSamples o sampleRestartWalk mass on D_i within eps'")
 {
   std::printf("== (c) ttc sampler mass on D_i (N=20000 per polytope)\n");
   samplerMass({pair90(), chain8(), nestedBigFirst(), slabs3(), crossX(), slabsThin(), chain5d(),
@@ -994,7 +997,7 @@ void realUnion(const Union& U, double eps, double delta, int R)
     StreamSeed ss{seed};
     auto gen = ttcGenerator(Rs.precision, eps, delta, U.P.size(), ss, int(U.P[0].A.cols()));
     ttc::VolumeComputationResult result;
-    ttc::runUnionAlgorithm<double>(Rs.kept, thresh, seed, log2Scale, gen, result, nullptr);
+    ttc::estimateUnionVolume<double>(Rs.kept, thresh, log2Scale, seed, ttc::storedVolumes(Rs.kept), gen, result, nullptr);
     rel.push_back(result.volumeEstimate / Rs.exact - 1.0);
     res.push_back(result.volumeEstimate / pred - 1.0);
   }

@@ -1,7 +1,7 @@
 #pragma once
 
 // The sampling walk selectable with --sampler.  Kept free of volesti includes
-// so lra_volume.hpp / main.cpp stay light; the sampler itself lives in
+// so volume_options.hpp / main.cpp stay light; the sampler itself lives in
 // polytope_sampler.hpp.
 
 #include <algorithm>

@@ -16,16 +16,11 @@
 #include <vector>
 
 #include <Eigen/Dense>
-#include <boost/multiprecision/eigen.hpp>
-#include <boost/multiprecision/gmp.hpp>
+
+#include "volume/mp_float.hpp"
 
 namespace ttc
 {
-
-// GMP float for the sampling / union bookkeeping.  Runtime precision is set
-// globally via MpFloat::default_precision(digits) before sampling starts.
-using MpFloat = boost::multiprecision::mpf_float;
-using MpVector = Eigen::Matrix<MpFloat, Eigen::Dynamic, 1>;
 
 // Draws `n` points from the billiard walk inside {x : A x <= b}, each `n`
 // separated by `walkLength` reflection steps, starting from `startCenter` (the

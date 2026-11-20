@@ -109,7 +109,7 @@ std::vector<VT> roundedLatticeSamples(const MT& A, const VT& b, long long n, int
     return roundedProposals(Ai, bi, k, walkSeed++, walk);
   };
   double samplingTime = 0;
-  return ttc::sampleLattice<double>(A, b, n, precision, epsilon / 12.0, delta, seed, generate,
+  return ttc::generateSamples<double>(A, b, n, precision, epsilon / 12.0, delta, seed, generate,
                                     samplingTime);
 }
 
