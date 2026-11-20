@@ -1262,8 +1262,9 @@ int main(int argc, char *argv[]) {
        "Do not round polytopes (max inscribed ellipsoid -> unit ball) before "
        "the volume oracle. Unrounded skinny polytopes are badly underestimated")
       ("walklen-samp", po::value<int>(),
-       "Random-walk length for volesti point sampling; default 10 + dim^2 "
-       "(at least 100 for the ball walk, 8 (10 + dim^2) for rdhr/cdhr)")
+       "Random-walk length for volesti point sampling; default dim for "
+       "billiard/accel-billiard, max(100, 10 + dim^2) for the ball walk, "
+       "8 (10 + dim^2) for rdhr/cdhr")
       ("sampler", po::value<std::string>(),
        "Random walk used to sample uniform points from each polytope: "
        "'billiard' (default), 'accel-billiard', 'ball', 'rdhr' "
@@ -1273,11 +1274,15 @@ int main(int argc, char *argv[]) {
        "Skip cddlib polytope canonicalization (redundant-constraint removal / "
        "implicit-equality detection) before volume and sampling")
       ("nogmp",
-       "Disable GMP: store sample points and run the union membership tests in "
-       "double. Default: store/test lattice points in GMP")
+       "Store sample points and run the union membership tests in double. "
+       "Default: double while the lattice coordinates fit (b + log10 max|x| "
+       "<= 15), GMP point store otherwise")
+      ("gmp",
+       "Store sample points and run the union membership tests in GMP even "
+       "when double would suffice (the double walk is unchanged)")
       ("fullgmp",
        "Run the selected walk itself in GMP at the sampling precision (not just "
-       "the point bookkeeping). Slower; mutually exclusive with --nogmp")
+       "the point bookkeeping). Slower; mutually exclusive with --nogmp/--gmp")
       ("precision", po::value<int>(),
        "Minimum GMP arithmetic precision (decimal digits). Default: lattice "
        "precision b + 32; independent of lattice spacing")
@@ -2530,18 +2535,20 @@ int main(int argc, char *argv[]) {
       }
       volumeOptions.roundPolytopes = vm.count("no-round") == 0;
       volumeOptions.cddSimplify = vm.count("no-cdd-simp") == 0;
-      if (vm.count("nogmp") && vm.count("fullgmp"))
+      if (vm.count("nogmp") + vm.count("gmp") + vm.count("fullgmp") > 1)
       {
-        std::cerr << "Error: --nogmp and --fullgmp are mutually exclusive"
+        std::cerr << "Error: --nogmp, --gmp and --fullgmp are mutually exclusive"
                   << std::endl;
         return 1;
       }
       if (vm.count("nogmp"))
         volumeOptions.gmpMode = ttc::GmpMode::None;
+      else if (vm.count("gmp"))
+        volumeOptions.gmpMode = ttc::GmpMode::PointRepr;
       else if (vm.count("fullgmp"))
         volumeOptions.gmpMode = ttc::GmpMode::Full;
       else
-        volumeOptions.gmpMode = ttc::GmpMode::PointRepr;
+        volumeOptions.gmpMode = ttc::GmpMode::Auto;
       if (vm.count("precision"))
       {
         int prec = vm["precision"].as<int>();
@@ -2569,9 +2576,10 @@ int main(int argc, char *argv[]) {
                 << std::endl;
       std::cout << "c sampling arithmetic: "
                 << (volumeOptions.gmpMode == ttc::GmpMode::None ? "double"
-                    : volumeOptions.gmpMode == ttc::GmpMode::Full
-                        ? "gmp (full walk)"
-                        : "gmp (point repr)")
+                    : volumeOptions.gmpMode == ttc::GmpMode::Full ? "gmp (full walk)"
+                    : volumeOptions.gmpMode == ttc::GmpMode::PointRepr
+                        ? "gmp (point repr)"
+                        : "auto (double if b + log10 max|x| <= 15)")
                 << std::endl;
       std::cout << "c sampler walk: ";
       switch (volumeOptions.samplerWalk)
@@ -2623,11 +2631,19 @@ int main(int argc, char *argv[]) {
                                 : volumeOptions.samplerWalk == ttc::SamplerWalk::RDHR
                                         || volumeOptions.samplerWalk == ttc::SamplerWalk::CDHR
                                     ? "8 (10 + dim^2)"
-                                    : "10 + dim^2")
+                                    : "dim")
                   << std::endl;
         std::cout << "c lattice precision (b): " << setup.latticePrecision
                   << std::endl;
-        if (volumeOptions.gmpMode != ttc::GmpMode::None)
+        if (volumeOptions.gmpMode == ttc::GmpMode::Auto)
+        {
+          char digits[32];
+          std::snprintf(digits, sizeof digits, "%.1f", setup.latticeDigits);
+          std::cout << "c sampling arithmetic (auto): "
+                    << (setup.gmpMode == ttc::GmpMode::None ? "double" : "gmp (point repr)")
+                    << " (b + log10 max|x| = " << digits << ")" << std::endl;
+        }
+        if (setup.gmpMode != ttc::GmpMode::None)
         {
           std::cout << "c gmp sampling precision (digits): "
                     << setup.samplingPrecision << std::endl;

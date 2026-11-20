@@ -28,8 +28,6 @@ struct Polytope
   std::vector<BooleanLiteral> booleanLiterals;
   std::vector<TermLiteral> termLiterals;
   cvc5::Term formula;
-  bool islChecked = false;
-  bool islNonEmpty = true;
 };
 
 struct AllSatVolumeResult

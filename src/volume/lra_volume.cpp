@@ -704,10 +704,10 @@ VolumeComputationResult computeLraVolume(
       || oracleDelta <= 0.0)
     throw std::invalid_argument("epsilon/delta require an unsupported sample threshold");
 
-  // The oracle walk defaults per oracle (defaultOracleWalkLength: 10 + dim^2
-  // for the Gaussian ball walk) and the sampling walk to 10 + dim^2
-  // (lraDefaultWalkLength); --walklen-vol / --walklen-samp override them (a
-  // negative option value keeps the default).
+  // The oracle walk defaults per oracle (defaultOracleWalkLength) and the
+  // sampling walk per sampler (defaultSampleWalkLength: dim for the billiard
+  // walks); --walklen-vol / --walklen-samp override them (a negative option
+  // value keeps the default).
   const unsigned volumeWalkLength =
       options.volumeWalkLength >= 0
           ? static_cast<unsigned>(options.volumeWalkLength)
@@ -744,6 +744,7 @@ VolumeComputationResult computeLraVolume(
   double samplerBallTime = 0.0;  // phase 2: inner ball per sampler restart
   std::size_t facetTotal = 0;
   double minRadius = std::numeric_limits<double>::infinity();
+  double maxAbsCoord = 0.0;  // bound on |x_i| over every kept polytope (GmpMode::Auto)
   std::size_t dumpIndex = 0;  // running counter for --dump-ine file names
   for (const auto& poly : polytopes)
   {
@@ -785,6 +786,7 @@ VolumeComputationResult computeLraVolume(
     const double radius = outerRadius(matrices.A, matrices.b, innerBall.center);
     ballTime += Log.elapsed() - radiusStart;
     minRadius = std::min(minRadius, innerBall.radius);
+    maxAbsCoord = std::max(maxAbsCoord, innerBall.center.cwiseAbs().maxCoeff() + radius);
     facetTotal += static_cast<std::size_t>(matrices.A.rows());
     const double innerRadius = innerBall.radius;
     prepared.push_back({std::move(matrices.A), std::move(matrices.b), std::move(innerBall),
@@ -803,7 +805,22 @@ VolumeComputationResult computeLraVolume(
                        : precisionFromCubes(dimension, facetTotal, polytopes.size(),
                                             minRadius, kEpsilon);
   result.latticePrecision = precision;
-  if (options.gmpMode != GmpMode::None && !prepared.empty())
+  // Digits of the largest lattice coordinate |k| = |x| 10^b.  GmpMode::Auto
+  // samples in double while they fit (kAutoDoubleDigits); the coefficients of
+  // A and b are double from parsing on, so GMP would only re-derive the same
+  // classification.  Past ~15.9 digits even the double walk's proposals are
+  // coarser than the lattice; only --fullgmp samples the lattice faithfully.
+  const double latticeDigits =
+      double(precision) + std::log10(std::max(1.0, maxAbsCoord));
+  const GmpMode gmpMode =
+      options.gmpMode != GmpMode::Auto ? options.gmpMode
+      : latticeDigits <= kAutoDoubleDigits ? GmpMode::None
+                                           : GmpMode::PointRepr;
+  if (gmpMode != GmpMode::Full && latticeDigits > 15.9)
+    Log(1) << "WARNING: lattice coordinates need " << latticeDigits
+           << " digits; the double walk cannot resolve the 10^-" << precision
+           << " lattice (use --fullgmp for a faithful lattice sampler)" << std::endl;
+  if (gmpMode != GmpMode::None && !prepared.empty())
   {
     result.samplingPrecision = std::max(options.precision, precision + 32);
     MpFloat::default_precision(static_cast<unsigned>(result.samplingPrecision));
@@ -817,6 +834,8 @@ VolumeComputationResult computeLraVolume(
     setup.sampleWalkLength = sampleWalkLength;
     setup.latticePrecision = result.latticePrecision;
     setup.samplingPrecision = result.samplingPrecision;
+    setup.gmpMode = gmpMode;
+    setup.latticeDigits = latticeDigits;
     onSetup(setup);
   }
 
@@ -903,7 +922,7 @@ VolumeComputationResult computeLraVolume(
     return out;
   };
 
-  if (options.gmpMode == GmpMode::Full &&
+  if (gmpMode == GmpMode::Full &&
       options.samplerWalk == SamplerWalk::AcceleratedBilliard)
   {
     Log(0) << "WARNING: --fullgmp has no accelerated-billiard implementation; "
@@ -911,7 +930,7 @@ VolumeComputationResult computeLraVolume(
            << std::endl;
   }
 
-  switch (options.gmpMode)
+  switch (gmpMode)
   {
     case GmpMode::None:
     {
@@ -999,6 +1018,8 @@ VolumeComputationResult computeLraVolume(
       runUnionAlgorithm<MpFloat>(kept, thresh, kSeed, log2Scale, latticeGenerate, result, onRow);
       break;
     }
+    case GmpMode::Auto:
+      throw std::logic_error("GmpMode::Auto must be resolved before sampling");
   }
 
   // sampleLattice times its whole call, including the sampler's inner-ball

@@ -16,7 +16,11 @@ namespace ttc
 {
 
 // Arithmetic backend for the sampling / union-volume bookkeeping.
-//   PointRepr (default): the selected walk runs in double, but sampled points
+//   Auto (default):      None when the lattice coordinates k = x * 10^b fit
+//     comfortably in a double (b + log10 max|x| <= kAutoDoubleDigits), else
+//     PointRepr.  The polytope coefficients are double from parsing on, so
+//     within that range GMP adds no exactness (bit-identical estimates).
+//   PointRepr (--gmp):   the selected walk runs in double, but sampled points
 //     are stored and the membership tests (A x <= b) are evaluated in GMP
 //     (boost mpf_float) at `samplingPrecision` decimal digits.
 //   None (--nogmp):      walk, lattice points and membership tests in double.
@@ -24,14 +28,22 @@ namespace ttc
 //     then lattice points are stored in GMP.
 enum class GmpMode
 {
+  Auto,
   PointRepr,
   None,
   Full
 };
 
+// Auto picks double while b + log10(max |x_i|) <= 15: the integer lattice
+// coordinates are then exact (|k| <= 10^15 < 2^53 / 9).  Rounding x * 10^b in
+// double perturbs the fractional part that drives the stochastic rounding by
+// at most 10^15 * 2^-53 ~ 0.1 lattice spacing, half the resolution of the
+// double walk's own proposals (ulp(x) 10^b), which GMP point storage shares.
+constexpr double kAutoDoubleDigits = 15.0;
+
 // Tunable knobs for the LRA volume engine. A negative walk length means "use
-// the default": defaultOracleWalkLength for the volume oracle, 10 + dim^2 for
-// the sampling walk.
+// the default": defaultOracleWalkLength for the volume oracle,
+// defaultSampleWalkLength (dim for the billiard walks) for the sampling walk.
 struct VolumeOptions
 {
   int volumeWalkLength = -1;  // --walklen-vol N
@@ -50,7 +62,7 @@ struct VolumeOptions
   // Round each polytope (max inscribed ellipsoid -> unit ball) before the
   // volume oracle, as in Cousins-Vempala; cleared by --no-round.
   bool roundPolytopes = true;
-  GmpMode gmpMode = GmpMode::PointRepr;
+  GmpMode gmpMode = GmpMode::Auto;
   // Minimum GMP arithmetic precision, separate from lattice precision b.
   // 0 => auto (b + 32 decimal digits).
   int precision = 0;  // --precision N
@@ -79,7 +91,9 @@ struct VolumeSetup
   unsigned volumeWalkLength = 0;
   unsigned sampleWalkLength = 0;
   int latticePrecision = 0;   // b: lattice spacing is 10^-b
-  int samplingPrecision = 0;  // GMP decimal digits (0 under --nogmp)
+  int samplingPrecision = 0;  // GMP decimal digits (0 when sampling in double)
+  GmpMode gmpMode = GmpMode::PointRepr;  // resolved backend (never Auto)
+  double latticeDigits = 0.0;            // b + log10(max |x_i| over all polytopes)
 };
 
 VolumeComputationResult computeLraVolume(
